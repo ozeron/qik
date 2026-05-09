@@ -1,0 +1,17 @@
+[project]
+name = "qik-synthetic"
+version = "0.1.0"
+description = "Synthetic data utilities for the Quant Infrastructure Kit."
+readme = "README.md"
+authors = [
+    { name = "Alex Lapchenko", email = "ozeron@me.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+qik-synthetic = "qik.synthetic.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
