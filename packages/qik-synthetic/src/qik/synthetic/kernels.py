@@ -89,6 +89,68 @@ def build_ohlcv(
     }
 
 
+def build_ohlcv_from_features(
+    start_price: float,
+    *,
+    open_gap_returns: np.ndarray,
+    intrabar_returns: np.ndarray,
+    upper_wick_rel: np.ndarray,
+    lower_wick_rel: np.ndarray,
+    volume: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Build OHLCV arrays from explicit candle feature vectors."""
+
+    n = len(intrabar_returns)
+    if not all(len(values) == n for values in (open_gap_returns, upper_wick_rel, lower_wick_rel, volume)):
+        raise ValueError("feature arrays must have identical length")
+    if n == 0:
+        empty = np.array([], dtype=float)
+        return {"open": empty, "high": empty, "low": empty, "close": empty, "volume": empty}
+    open_price = np.empty(n, dtype=float)
+    close = np.empty(n, dtype=float)
+    previous_close = float(start_price)
+    for idx in range(n):
+        open_price[idx] = previous_close * np.exp(float(open_gap_returns[idx]))
+        close[idx] = open_price[idx] * np.exp(float(intrabar_returns[idx]))
+        previous_close = close[idx]
+    high = np.maximum(open_price, close) * (1.0 + np.maximum(upper_wick_rel, 0.0))
+    low = np.minimum(open_price, close) / (1.0 + np.maximum(lower_wick_rel, 0.0))
+    low = np.maximum(low, 1e-12)
+    return {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": np.maximum(volume.astype(float), 0.0),
+    }
+
+
+def stationary_bootstrap_indices(
+    source_n: int,
+    output_n: int,
+    *,
+    mean_block_size: float = 48.0,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Return stationary-bootstrap sample indices for dependent feature rows."""
+
+    if source_n <= 0:
+        raise ValueError("source_n must be positive")
+    if output_n <= 0:
+        return np.zeros(0, dtype=int)
+    rng = np.random.default_rng(seed)
+    indices = np.empty(output_n, dtype=int)
+    restart_probability = 1.0 / max(float(mean_block_size), 1.0)
+    cursor = int(rng.integers(0, source_n))
+    for idx in range(output_n):
+        if idx == 0 or rng.random() < restart_probability:
+            cursor = int(rng.integers(0, source_n))
+        else:
+            cursor = (cursor + 1) % source_n
+        indices[idx] = cursor
+    return indices
+
+
 def bars_to_rows(
     timestamps: tuple[datetime, ...],
     ohlcv: dict[str, np.ndarray],

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ..errors import SyntheticValidationError
-from ..kernels import build_ohlcv, simulate_returns_ar1
+from ..kernels import build_ohlcv, build_ohlcv_from_features, stationary_bootstrap_indices, simulate_returns_ar1
 from ..types import SyntheticContext
 
 
@@ -54,6 +54,22 @@ class AR1Model:
             raise SyntheticValidationError("simulate_batch requires start_price")
         start_price = float(params["start_price"])
         returns = self.simulate_returns(ctx, n, seed=seed, params=params)
+        features = params.get("ohlcv_features")
+        if features is not None and params.get("use_feature_candles", True):
+            indices = stationary_bootstrap_indices(
+                len(features["volume"]),
+                n,
+                mean_block_size=float(params.get("bootstrap_mean_block_size", 48.0)),
+                seed=seed,
+            )
+            return build_ohlcv_from_features(
+                start_price,
+                open_gap_returns=np.zeros(n, dtype=float),
+                intrabar_returns=returns,
+                upper_wick_rel=np.asarray(features["upper_wick_rel"])[indices],
+                lower_wick_rel=np.asarray(features["lower_wick_rel"])[indices],
+                volume=np.asarray(features["volume"])[indices],
+            )
         return build_ohlcv(
             start_price,
             returns,

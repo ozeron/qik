@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from hashlib import blake2b
 from typing import Iterator
 
+import numpy as np
+
 from .context import DefaultMarketContextProvider
 from .errors import SyntheticContextError, SyntheticValidationError
 from .horizon import bars_from_span, generate_timestamps, parse_interval
@@ -48,7 +50,7 @@ def _seed_to_int(seed_data: bytes) -> int:
 
 
 def _stable_id(*parts: object) -> str:
-    return blake2b(repr(tuple(parts)).encode("utf-8"), digest_size=8).hexdigest()
+    return blake2b(repr(tuple(_stable_param_repr(part) for part in parts)).encode("utf-8"), digest_size=8).hexdigest()
 
 
 @dataclass
@@ -71,6 +73,16 @@ class SyntheticEngine:
     def fit(self, history: Sequence[Mapping[str, object]] | None = None) -> "SyntheticEngine":
         """Fit the model on historical rows before generation."""
         self.model.fit(history, context=None)
+        return self
+
+    def fit_frame(self, frame) -> "SyntheticEngine":
+        """Fit the model from an OHLCV dataframe when supported."""
+        self.model.fit(frame, context=None)
+        return self
+
+    def fit_profile(self, profile) -> "SyntheticEngine":
+        """Fit the model from an OHLCV calibration profile when supported."""
+        self.model.fit(profile, context=None)
         return self
 
     def generate(self, request: SyntheticRequest) -> SyntheticBatch:
@@ -496,5 +508,25 @@ class SyntheticEngine:
         )
 
 
-def _normalized_model_params(request: SyntheticRequest) -> tuple[tuple[str, str], ...]:
-    return tuple(sorted((str(key), repr(value)) for key, value in request.model_params.items()))
+def _normalized_model_params(request: SyntheticRequest) -> tuple[tuple[str, object], ...]:
+    return tuple(sorted((str(key), _stable_param_repr(value)) for key, value in request.model_params.items()))
+
+
+def _stable_param_repr(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            return ("ndarray", str(value.dtype), tuple(value.shape), tuple(_stable_param_repr(item) for item in value.ravel(order="C")))
+        array = np.ascontiguousarray(value)
+        digest = blake2b(array.view(np.uint8), digest_size=16).hexdigest()
+        return ("ndarray", str(array.dtype), tuple(array.shape), digest)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _stable_param_repr(item)) for key, item in value.items()))
+    if isinstance(value, tuple):
+        return tuple(_stable_param_repr(item) for item in value)
+    if isinstance(value, list):
+        return ("list", tuple(_stable_param_repr(item) for item in value))
+    if isinstance(value, set):
+        return ("set", tuple(sorted((_stable_param_repr(item) for item in value), key=repr)))
+    return repr(value)

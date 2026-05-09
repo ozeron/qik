@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .errors import SyntheticDependencyError, SyntheticValidationError
-from .models import AR1Model, GaussianRandomWalkModel
+from .models import AR1Model, GaussianRandomWalkModel, StationaryBootstrapModel, StudentTRandomWalkModel
 
 
 def _model_from_name(name: str):
@@ -12,10 +12,13 @@ def _model_from_name(name: str):
         return GaussianRandomWalkModel
     if key == "ar1":
         return AR1Model
+    if key in {"stationary_bootstrap", "empirical_bootstrap"}:
+        return StationaryBootstrapModel
+    if key in {"student_t_rw", "student_t"}:
+        return StudentTRandomWalkModel
     if key == "garch":
         try:
             from .models.garch import GARCHModel
-            # Validate optional dependencies only when model is selected.
             from .models.garch import _require_arch
 
             _require_arch()
@@ -33,4 +36,4 @@ def resolve_model(name: str):
 
 
 def list_models() -> tuple[str, ...]:
-    return ("gaussian_rw", "ar1", "garch")
+    return ("gaussian_rw", "ar1", "garch", "stationary_bootstrap", "student_t_rw")

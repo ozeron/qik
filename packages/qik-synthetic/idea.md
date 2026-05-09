@@ -250,3 +250,46 @@ Remaining realism/modeling tasks:
   than speed.
 - Decide whether `compact_identity=True` should become the default only for the
   new frame APIs after downstream adapter compatibility is confirmed.
+
+## Synthetic realism architecture
+
+The next realism layer separates speed from market similarity. Fast frame
+creation remains useful for adapter and benchmark workloads, while realism is
+measured through explicit calibration profiles, feature-based candle generation,
+and categorized diagnostics.
+
+Diagnostic modes:
+
+- `price_mode="ignore"`: compare distribution, candle, and volume behavior
+  without path-level price checks.
+- `price_mode="normalized"`: compare normalized price path behavior and return
+  features; this is the default for unanchored stochastic simulations.
+- `price_mode="anchored"`: include raw price-level checks when a synthetic path
+  is intentionally conditioned on historical price levels or endpoints.
+
+Realism model taxonomy:
+
+- Baselines: `gaussian_rw`, `ar1`.
+- Fat-tail baseline: `student_t_rw`.
+- Feature bootstrap baseline: `stationary_bootstrap` / `empirical_bootstrap`.
+- Optional parametric volatility: `garch` through `qik-synthetic[models]`.
+
+Calibration/profile workflow:
+
+1. Fit `OhlcvCalibrationProfile` from a single-identity OHLCV frame.
+2. Use profile features for feature-driven candles or stationary bootstrap.
+3. Use scalar `calibrate_ohlcv_params` as a compatibility projection for older
+   baseline models.
+4. Evaluate with many seeds over chronological train/validation/test splits.
+
+Cache-backed realism benchmark:
+
+- Script: `packages/qik-synthetic/benchmarks/evaluate_btc_1h_realism.py`.
+- Env var: `QIK_SYNTHETIC_OHLCV_CACHE_PATH`.
+- Normal package tests skip cache-backed checks when the env var is unset.
+
+Bootstrap overfitting policy:
+
+- Block-overlap and memorization signals are warning-only initially.
+- Chronological train/validation/test splits are required for benchmark output.
+- Hard failure thresholds should only be added after benchmark output is stable.

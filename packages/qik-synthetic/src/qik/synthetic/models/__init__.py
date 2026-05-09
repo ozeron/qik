@@ -2,5 +2,12 @@
 
 from .gaussian import GaussianRandomWalkModel
 from .ar1 import AR1Model
+from .bootstrap import StationaryBootstrapModel
+from .student_t import StudentTRandomWalkModel
 
-__all__ = ["GaussianRandomWalkModel", "AR1Model"]
+__all__ = [
+    "GaussianRandomWalkModel",
+    "AR1Model",
+    "StationaryBootstrapModel",
+    "StudentTRandomWalkModel",
+]

@@ -1,18 +1,16 @@
-"""Optional GARCH-family model path.
-
-The module keeps imports of optional statistical dependencies lazy to keep the
-core package install lightweight.
-"""
+"""Optional GARCH-family model path."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
+from ..calibration import OhlcvCalibrationProfile
 from ..errors import SyntheticDependencyError, SyntheticValidationError
-from ..kernels import build_ohlcv
+from ..kernels import build_ohlcv, build_ohlcv_from_features, stationary_bootstrap_indices
 from ..types import SyntheticContext
 
 
@@ -34,25 +32,44 @@ def _require_arch() -> None:
 class GARCHModel:
     model_name: str = "garch"
     required_trading_hours: tuple[str, ...] | None = None
+    max_abs_log_return: float = 0.25
     _volatility: float = 0.01
+    _drift: float = 0.0
+    _result: Any | None = None
+    _dropped_return_count: int = 0
+    _scale: float = 100.0
 
     def fit(
         self,
-        data: Sequence[Mapping[str, object]] | None = None,
+        data: Sequence[Mapping[str, object]] | Any | None = None,
         *,
         context: SyntheticContext | None = None,
     ):
         _require_arch()
-        if data:
-            closes = np.asarray([float(item.get("close")) for item in data if "close" in item], dtype=float)
-            if closes.size > 1:
-                rets = np.diff(np.log(np.maximum(1e-12, closes)))
-                if rets.size > 1:
-                    self._volatility = float(np.std(rets, ddof=1) + 1e-12)
-                else:
-                    self._volatility = float(np.abs(rets[0]) + 1e-12)
-            elif closes.size == 1:
-                self._volatility = 0.01
+        raw_returns = _log_returns_from_data(data)
+        returns = _clean_fit_returns(raw_returns, max_abs_log_return=self.max_abs_log_return)
+        self._dropped_return_count = int(raw_returns.size - returns.size)
+        if returns.size == 0:
+            return self
+        self._drift = float(np.mean(returns))
+        self._volatility = float(np.std(returns, ddof=1 if returns.size > 1 else 0) + 1e-12)
+        try:
+            model = arch_model(
+                returns * self._scale,
+                mean="Constant",
+                vol="GARCH",
+                p=1,
+                q=1,
+                dist="t",
+                rescale=False,
+            )
+            self._result = model.fit(disp="off")
+            _validate_garch_stationarity(self._result)
+        except Exception as exc:
+            self._result = None
+            if isinstance(exc, SyntheticValidationError):
+                raise
+            raise SyntheticValidationError("GARCH fit failed") from exc
         return self
 
     def simulate_returns(
@@ -67,10 +84,28 @@ class GARCHModel:
             raise SyntheticValidationError("n must be positive")
         _require_arch()
         params = params or {}
-        drift = float(params.get("drift", 0.0))
-        volatility = float(params.get("volatility", self._volatility))
-        rng = np.random.default_rng(seed)
-        return drift + volatility * rng.normal(size=n)
+        if self._result is None:
+            raise SyntheticValidationError("GARCH model must be fit before simulation")
+        random_state = np.random.get_state()
+        try:
+            if seed is not None:
+                np.random.seed(int(seed) % (2**32 - 1))
+            sim_model = arch_model(
+                None,
+                mean="Constant",
+                vol="GARCH",
+                p=1,
+                q=1,
+                dist="t",
+                rescale=False,
+            )
+            sim = sim_model.simulate(self._result.params, nobs=n, burn=100)
+            values = np.asarray(sim["data"], dtype=float) / self._scale
+            return values[:n]
+        except Exception as exc:
+            raise SyntheticValidationError("GARCH simulation failed") from exc
+        finally:
+            np.random.set_state(random_state)
 
     def simulate_batch(
         self,
@@ -81,20 +116,30 @@ class GARCHModel:
         params: Mapping[str, object] | None = None,
     ) -> dict[str, np.ndarray]:
         if n <= 0:
-            return {
-                "open": np.array([], dtype=float),
-                "high": np.array([], dtype=float),
-                "low": np.array([], dtype=float),
-                "close": np.array([], dtype=float),
-                "volume": np.array([], dtype=float),
-            }
-
+            empty = np.array([], dtype=float)
+            return {"open": empty, "high": empty, "low": empty, "close": empty, "volume": empty}
         _require_arch()
         params = params or {}
         start_price = params.get("start_price")
         if start_price is None:
             raise SyntheticValidationError("simulate_batch requires start_price")
         returns = self.simulate_returns(ctx, n, seed=seed, params=params)
+        features = params.get("ohlcv_features")
+        if features is not None and params.get("use_feature_candles", True):
+            indices = stationary_bootstrap_indices(
+                len(features["volume"]),
+                n,
+                mean_block_size=float(params.get("bootstrap_mean_block_size", 48.0)),
+                seed=seed,
+            )
+            return build_ohlcv_from_features(
+                float(start_price),
+                open_gap_returns=np.zeros(n, dtype=float),
+                intrabar_returns=returns,
+                upper_wick_rel=np.asarray(features["upper_wick_rel"])[indices],
+                lower_wick_rel=np.asarray(features["lower_wick_rel"])[indices],
+                volume=np.asarray(features["volume"])[indices],
+            )
         return build_ohlcv(
             float(start_price),
             returns,
@@ -103,3 +148,65 @@ class GARCHModel:
             volume_loc=float(params.get("volume_loc", 12.0)),
             volume_scale=float(params.get("volume_scale", 0.35)),
         )
+
+
+def _log_returns_from_data(data: object) -> np.ndarray:
+    if data is None:
+        return np.zeros(0, dtype=float)
+    if isinstance(data, OhlcvCalibrationProfile):
+        returns = data.features.get("close_to_close_return")
+        if returns is None:
+            return np.zeros(0, dtype=float)
+        return _finite_returns(np.asarray(returns, dtype=float))
+    if hasattr(data, "columns") and "close" in data.columns:
+        closes = np.asarray(data["close"], dtype=float)
+        if closes.size <= 1:
+            return np.zeros(0, dtype=float)
+        return _finite_returns(np.diff(np.log(np.maximum(1e-12, closes))))
+    rows = list(data) if data is not None else []
+    closes = np.asarray([float(item.get("close")) for item in rows if "close" in item], dtype=float)
+    if closes.size <= 1:
+        return np.zeros(0, dtype=float)
+    return _finite_returns(np.diff(np.log(np.maximum(1e-12, closes))))
+
+
+def _finite_returns(returns: np.ndarray) -> np.ndarray:
+    returns = np.asarray(returns, dtype=float)
+    returns = returns[np.isfinite(returns)]
+    return returns
+
+
+def _clean_fit_returns(returns: np.ndarray, *, max_abs_log_return: float) -> np.ndarray:
+    returns = _finite_returns(returns)
+    if max_abs_log_return <= 0:
+        return returns
+    return returns[np.abs(returns) <= float(max_abs_log_return)]
+
+
+def _validate_garch_stationarity(result: Any) -> None:
+    persistence = _garch_persistence(getattr(result, "params", None))
+    if persistence is not None and persistence >= 1.0:
+        raise SyntheticValidationError(f"GARCH fit is non-stationary: alpha + beta = {persistence:.6f}")
+
+
+def _garch_persistence(params: object) -> float | None:
+    if params is None:
+        return None
+    alpha = _param_value(params, "alpha[1]")
+    beta = _param_value(params, "beta[1]")
+    if alpha is None or beta is None:
+        return None
+    return float(alpha) + float(beta)
+
+
+def _param_value(params: object, name: str) -> float | None:
+    if hasattr(params, "get"):
+        value = params.get(name)
+        if value is not None:
+            return float(value)
+    if hasattr(params, "index"):
+        try:
+            return float(params[name])
+        except Exception:
+            return None
+    return None
