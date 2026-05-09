@@ -1,4 +1,6 @@
-Alex, build **Synthetic Data Generator** as a small, model-agnostic candle simulation library where the simulator is treated as a research instrument, not as evidence of profitability. The first serious MVP should be: **validated OHLCV input → log-return transforms → simple linear return model / bootstrap baseline → empirical OHLCV reconstruction → real-vs-synthetic diagnostics → strategy robustness runner**. Then add **GARCH(1,1) with Student-t innovations** as the second major model, because BTC’s volatility clustering and fat tails will make simple linear models look fake very quickly. 🚀
+Alex, build **qik-synthetic** as a small, model-agnostic candle simulation library where the simulator is treated as a research instrument, not as evidence of profitability. The first serious MVP should be: **validated OHLCV input → log-return transforms → simple linear return model / bootstrap baseline → empirical OHLCV reconstruction → real-vs-synthetic diagnostics**. Then add **GARCH(1,1) with Student-t innovations** as the second major model, because BTC’s volatility clustering and fat tails will make simple linear models look fake very quickly.
+
+Keep the package import path in the QIK namespace (`qik.synthetic`) for direct integration with `~/code/backtesting` and other QIK consumers.
 
 ## 1. Restate the goal clearly
 
@@ -60,75 +62,68 @@ Use a real package structure from day one. Not a notebook blob. The notebooks sh
 A practical initial layout:
 
 ```text
-synthetic_data_generator/
+qik-synthetic/
   pyproject.toml
   README.md
 
   src/
-    synthetic_data_generator/
+    qik/
       __init__.py
-
-      schema.py
-      config.py
-      exceptions.py
-
-      data/
+      synthetic/
         __init__.py
-        validation.py
-        calendar.py
-        loaders.py
-        splitting.py
+        schema.py
+        config.py
+        exceptions.py
 
-      transforms/
-        __init__.py
-        returns.py
-        candle_shapes.py
-        volume.py
-        scaling.py
+        data/
+          __init__.py
+          validation.py
+          calendar.py
+          loaders.py
+          splitting.py
 
-      models/
-        __init__.py
-        base.py
-        iid_bootstrap.py
-        block_bootstrap.py
-        linear_returns.py
-        gbm.py
-        garch.py
-        jumps.py
-        regimes.py
+        transforms/
+          __init__.py
+          returns.py
+          candle_shapes.py
+          volume.py
+          scaling.py
 
-      simulation/
-        __init__.py
-        engine.py
-        timestamps.py
-        ohlcv.py
-        random.py
+        models/
+          __init__.py
+          base.py
+          iid_bootstrap.py
+          block_bootstrap.py
+          linear_returns.py
+          gbm.py
+          garch.py
+          jumps.py
+          regimes.py
 
-      diagnostics/
-        __init__.py
-        distribution.py
-        autocorrelation.py
-        volatility.py
-        drawdowns.py
-        candle_stats.py
-        volume.py
-        strategy_probes.py
-        report.py
+        simulation/
+          __init__.py
+          engine.py
+          timestamps.py
+          ohlcv.py
+          random.py
 
-      strategy/
-        __init__.py
-        protocols.py
-        evaluation.py
-        metrics.py
-        optimization.py
+        diagnostics/
+          __init__.py
+          distribution.py
+          autocorrelation.py
+          volatility.py
+          drawdowns.py
+          candle_stats.py
+          volume.py
+          report.py
 
-      io/
-        __init__.py
-        serialization.py
+        io/
+          __init__.py
+          serialization.py
 
-      visualization/
-        __init__.py
-        plots.py
+        visualization/
+          __init__.py
+          plots.py
 
   notebooks/
     01_data_loading_and_cleaning.py
@@ -137,8 +132,8 @@ synthetic_data_generator/
     04_garch_or_volatility_model.py
     05_ohlcv_reconstruction.py
     06_synthetic_vs_real_diagnostics.py
-    07_strategy_robustness_test.py
-    08_walk_forward_synthetic_optimization.py
+    07_synthetic_vs_real_validation.py
+    08_downstream_compatibility_checks.py
 
   tests/
     test_schema.py
@@ -149,7 +144,6 @@ synthetic_data_generator/
     test_ohlcv_reconstruction.py
     test_diagnostics.py
     test_serialization.py
-    test_strategy_evaluation.py
 ```
 
 Responsibilities:
@@ -170,11 +164,12 @@ Responsibilities:
 | `models/garch.py`             | Volatility clustering model.                                                                           |
 | `simulation/ohlcv.py`         | Converts simulated returns into valid OHLCV candles.                                                   |
 | `diagnostics/*`               | Real-vs-synthetic statistical comparisons.                                                             |
-| `strategy/*`                  | Strategy protocol, evaluation over many paths, metrics aggregation.                                    |
 | `io/serialization.py`         | Save/load fitted model artifacts with versioning.                                                      |
 | `visualization/plots.py`      | Lightweight plotting wrappers; notebooks decide presentation.                                          |
 
 Keep the first version pandas-native. You can accept Polars later, but `statsmodels` and `arch` workflows are naturally pandas/numpy-friendly, so pandas is the path of least friction for the MVP. `statsmodels` supports AR/ARMA/ARIMA-style modeling, while `arch` supports common GARCH-style volatility models and time-series bootstraps. ([Statsmodels][1])
+
+For direct usage from backtesting tooling, keep this boundary explicit: synthetic generation, validation, and diagnostics belong to `qik.synthetic`; strategy-specific evaluation should be owned by the downstream strategy consumer packages.
 
 ## 4. Define the core abstraction
 
@@ -867,16 +862,12 @@ Here is the exact MVP I recommend.
 Use the working title **Synthetic Data Generator**, but make the importable package:
 
 ```text
-synthetic_data_generator
+qik-synthetic
 ```
-
-or, cleaner:
 
 ```text
-synthetic_candles
+qik.synthetic
 ```
-
-I slightly prefer `synthetic_candles` because it says what the package actually generates.
 
 ### First model to implement
 
@@ -933,7 +924,7 @@ high-low range distribution
 body/wick ratio distribution
 log-volume distribution
 return-volume relationship
-simple trend and mean-reversion strategy probes
+strategy-probe payload compatibility notes (for downstream consumers)
 ```
 
 ### Minimum Marimo notebooks
@@ -945,7 +936,7 @@ For the first few days, only build these:
 02_fit_linear_return_model.py
 03_ohlcv_reconstruction.py
 04_synthetic_vs_real_diagnostics.py
-05_strategy_robustness_test.py
+05_consumer_probe_notes.py
 ```
 
 Add GARCH as notebook `06` once the linear model and diagnostics are stable.
@@ -956,29 +947,26 @@ Start with this smaller structure:
 
 ```text
 src/
-  synthetic_candles/
+  qik/
     __init__.py
-    schema.py
-    transforms.py
-    models/
+    synthetic/
       __init__.py
-      base.py
-      linear_returns.py
-      iid_bootstrap.py
-    simulation/
-      __init__.py
-      ohlcv.py
-      timestamps.py
-    diagnostics/
-      __init__.py
-      stats.py
-      plots.py
-      strategy_probes.py
-    strategy/
-      __init__.py
-      evaluation.py
-      metrics.py
-    io.py
+      schema.py
+      transforms.py
+      models/
+        __init__.py
+        base.py
+        linear_returns.py
+        iid_bootstrap.py
+      simulation/
+        __init__.py
+        ohlcv.py
+        timestamps.py
+      diagnostics/
+        __init__.py
+        stats.py
+        plots.py
+      io.py
 ```
 
 You can split modules later. Do not prematurely create 30 files before the first real path simulation works.
