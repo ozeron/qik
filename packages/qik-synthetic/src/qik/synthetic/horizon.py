@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import math
 import re
 
@@ -12,6 +13,7 @@ from .errors import SyntheticValidationError
 _INTERVAL_RE = re.compile(r"^(\d+)([smhdw])$")
 
 
+@lru_cache(maxsize=128)
 def parse_interval(interval: str) -> timedelta:
     match = _INTERVAL_RE.match(interval.strip().lower())
     if not match:

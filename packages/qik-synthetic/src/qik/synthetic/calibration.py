@@ -36,16 +36,24 @@ def calibrate_ohlcv_params(frame: pd.DataFrame) -> dict[str, Any]:
 
     if not isinstance(frame, pd.DataFrame):
         raise SyntheticValidationError("calibrate_ohlcv_params expects a pandas DataFrame")
-    frame = frame.copy()
+    _reject_multi_identity(frame)
+    order = None
     if "timestamp" in frame.columns:
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-        frame = frame.sort_values("timestamp").reset_index(drop=True)
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True)
+        if not timestamps.is_monotonic_increasing:
+            order = np.argsort(timestamps.to_numpy())
 
     open_ = _finite_series(frame, "open")
     high = _finite_series(frame, "high")
     low = _finite_series(frame, "low")
     close = _finite_series(frame, "close")
     volume = _finite_series(frame, "volume")
+    if order is not None:
+        open_ = open_[order]
+        high = high[order]
+        low = low[order]
+        close = close[order]
+        volume = volume[order]
 
     if (open_ <= 0).any() or (high <= 0).any() or (low <= 0).any() or (close <= 0).any():
         raise SyntheticValidationError("OHLC prices must be positive")
@@ -62,8 +70,9 @@ def calibrate_ohlcv_params(frame: pd.DataFrame) -> dict[str, Any]:
     else:
         drift = float(np.mean(log_returns))
         if log_returns.size > 4:
-            iqr_vol = (np.quantile(log_returns, 0.75) - np.quantile(log_returns, 0.25)) / 1.349
-            q90_vol = (np.quantile(log_returns, 0.95) - np.quantile(log_returns, 0.05)) / 3.289707253902945
+            q05, q25, q75, q95 = np.quantile(log_returns, [0.05, 0.25, 0.75, 0.95])
+            iqr_vol = (q75 - q25) / 1.349
+            q90_vol = (q95 - q05) / 3.289707253902945
             mad_vol = np.median(np.abs(log_returns - np.median(log_returns))) / 0.67448975
             volatility = float(max(iqr_vol, q90_vol, mad_vol, 0.0))
         else:
@@ -110,4 +119,31 @@ def calibrate_ohlcv_params(frame: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-__all__ = ["calibrate_ohlcv_params"]
+def calibrate_many_ohlcv_params(
+    frame: pd.DataFrame,
+    *,
+    group_columns: tuple[str, ...] = ("symbol", "venue", "dataset", "interval"),
+) -> dict[tuple[object, ...], dict[str, Any]]:
+    """Estimate calibration params for each identity group in an OHLCV frame."""
+
+    if not isinstance(frame, pd.DataFrame):
+        raise SyntheticValidationError("calibrate_many_ohlcv_params expects a pandas DataFrame")
+    available = [column for column in group_columns if column in frame.columns]
+    if not available:
+        return {tuple(): calibrate_ohlcv_params(frame)}
+    out: dict[tuple[object, ...], dict[str, Any]] = {}
+    for key, group in frame.groupby(available, sort=True, observed=True):
+        normalized_key = key if isinstance(key, tuple) else (key,)
+        out[normalized_key] = calibrate_ohlcv_params(group)
+    return out
+
+
+__all__ = ["calibrate_ohlcv_params", "calibrate_many_ohlcv_params"]
+
+
+def _reject_multi_identity(frame: pd.DataFrame) -> None:
+    identity_columns = [column for column in ("symbol", "venue", "dataset", "interval") if column in frame.columns]
+    if not identity_columns:
+        return
+    if frame[identity_columns].drop_duplicates().shape[0] > 1:
+        raise SyntheticValidationError("calibrate_ohlcv_params expects a single identity; group multi-symbol frames first")

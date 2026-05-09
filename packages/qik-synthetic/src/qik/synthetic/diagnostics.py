@@ -48,13 +48,22 @@ def fingerprint_candle_table(
     """Return a stable hash for exact candle-table handoff verification."""
 
     selected = _canonical_frame(table, columns=columns, identity_columns=identity_columns)
-    payload = selected.to_json(
-        orient="split",
-        date_format="iso",
-        double_precision=12,
-        index=False,
-    )
-    return blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+    digest = blake2b(digest_size=16)
+    for column in selected.columns:
+        digest.update(column.encode("utf-8"))
+        digest.update(b"\0")
+        if column == "timestamp":
+            values = pd.to_datetime(selected[column], utc=True).astype("int64").to_numpy()
+            digest.update(values.astype("<i8", copy=False).tobytes())
+        elif column in {"open", "high", "low", "close", "volume"}:
+            values = selected[column].to_numpy(dtype=float)
+            digest.update(values.astype("<f8", copy=False).tobytes())
+        else:
+            for value in selected[column].astype(str):
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(4, "little"))
+                digest.update(encoded)
+    return digest.hexdigest()
 
 
 def compare_ohlcv(
@@ -65,6 +74,8 @@ def compare_ohlcv(
 ) -> OhlcvComparisonReport:
     """Compare real/reference and synthetic OHLCV distributions."""
 
+    _reject_multi_identity(real)
+    _reject_multi_identity(synthetic)
     reference = _prepare_ohlcv(real)
     candidate = _prepare_ohlcv(synthetic)
     if len(reference) < 2 or len(candidate) < 2:
@@ -92,6 +103,29 @@ def compare_ohlcv(
         thresholds=effective_thresholds,
         row_counts={"real": int(len(reference)), "synthetic": int(len(candidate))},
     )
+
+
+def compare_ohlcv_by_identity(
+    real: pd.DataFrame,
+    synthetic: pd.DataFrame,
+    *,
+    group_columns: tuple[str, ...] = ("symbol", "venue", "dataset", "interval"),
+    thresholds: dict[str, float] | None = None,
+) -> dict[tuple[object, ...], OhlcvComparisonReport]:
+    """Compare OHLCV frames per identity group."""
+
+    real_groups = _groups_by_identity(real, group_columns)
+    synthetic_groups = _groups_by_identity(synthetic, group_columns)
+    reports: dict[tuple[object, ...], OhlcvComparisonReport] = {}
+    for key in sorted(set(real_groups) | set(synthetic_groups)):
+        if key not in real_groups:
+            reports[key] = _missing_group_report("real", len(synthetic_groups[key]), thresholds)
+            continue
+        if key not in synthetic_groups:
+            reports[key] = _missing_group_report("synthetic", len(real_groups[key]), thresholds)
+            continue
+        reports[key] = compare_ohlcv(real_groups[key], synthetic_groups[key], thresholds=thresholds)
+    return reports
 
 
 def _canonical_frame(
@@ -132,22 +166,57 @@ def _prepare_ohlcv(table: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def _reject_multi_identity(table: pd.DataFrame) -> None:
+    identity_columns = [column for column in ("symbol", "venue", "dataset", "interval") if column in table.columns]
+    if not identity_columns:
+        return
+    if table[identity_columns].drop_duplicates().shape[0] > 1:
+        raise SyntheticValidationError("compare_ohlcv expects a single identity; group multi-symbol frames first")
+
+
+def _groups_by_identity(table: pd.DataFrame, group_columns: tuple[str, ...]) -> dict[tuple[object, ...], pd.DataFrame]:
+    available = [column for column in group_columns if column in table.columns]
+    if not available:
+        return {tuple(): table}
+    out: dict[tuple[object, ...], pd.DataFrame] = {}
+    for key, group in table.groupby(available, sort=True, observed=True):
+        out[key if isinstance(key, tuple) else (key,)] = group
+    return out
+
+
+def _missing_group_report(missing_side: str, present_count: int, thresholds: dict[str, float] | None):
+    effective_thresholds = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    if missing_side == "real":
+        row_counts = {"real": 0, "synthetic": int(present_count)}
+    else:
+        row_counts = {"real": int(present_count), "synthetic": 0}
+    return OhlcvComparisonReport(
+        passed=False,
+        metrics={},
+        warnings=(f"missing_identity_group side={missing_side}",),
+        thresholds=effective_thresholds,
+        row_counts=row_counts,
+    )
+
+
 def _distribution_stats(frame: pd.DataFrame) -> dict[str, float]:
     close = frame["close"].to_numpy(dtype=float)
     returns = np.diff(np.log(close))
     candle_range = ((frame["high"] - frame["low"]) / frame["close"]).to_numpy(dtype=float)
     volume = frame["volume"].to_numpy(dtype=float)
+    return_quantiles = np.quantile(returns, [0.01, 0.05, 0.95, 0.99])
+    close_quantiles = np.quantile(close, [0.05, 0.95])
     return {
         "return_mean": float(np.mean(returns)),
         "return_std": float(np.std(returns)),
-        "return_q01": float(np.quantile(returns, 0.01)),
-        "return_q05": float(np.quantile(returns, 0.05)),
-        "return_q95": float(np.quantile(returns, 0.95)),
-        "return_q99": float(np.quantile(returns, 0.99)),
+        "return_q01": float(return_quantiles[0]),
+        "return_q05": float(return_quantiles[1]),
+        "return_q95": float(return_quantiles[2]),
+        "return_q99": float(return_quantiles[3]),
         "open_median": float(np.median(frame["open"].to_numpy(dtype=float))),
         "close_median": float(np.median(close)),
-        "close_q05": float(np.quantile(close, 0.05)),
-        "close_q95": float(np.quantile(close, 0.95)),
+        "close_q05": float(close_quantiles[0]),
+        "close_q95": float(close_quantiles[1]),
         "range_median": float(np.median(candle_range)),
         "volume_median": float(np.median(volume)),
     }

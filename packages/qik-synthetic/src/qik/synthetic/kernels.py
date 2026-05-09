@@ -34,8 +34,11 @@ def simulate_returns_ar1(
 
     rng = np.random.default_rng(seed)
     eps = rng.normal(size=n)
-    kernels = np.power(phi, np.arange(n, dtype=float))
-    out = np.convolve(volatility * eps, kernels, mode="full")[:n]
+    out = np.empty(n, dtype=float)
+    state = 0.0
+    for idx, shock in enumerate(eps):
+        state = (phi * state) + (volatility * shock)
+        out[idx] = state
     if drift != 0.0:
         out = out + drift
     return out
@@ -50,7 +53,9 @@ def build_ohlcv(
     volume_loc: float = 12.0,
     volume_scale: float = 0.35,
 ) -> dict[str, np.ndarray]:
-    close = start_price * np.exp(np.cumsum(log_returns))
+    close = np.cumsum(log_returns, dtype=np.float64)
+    np.exp(close, out=close)
+    close *= start_price
     if close.size == 0:
         empty = np.array([], dtype=float)
         return {"open": empty, "high": empty, "low": empty, "close": empty, "volume": empty}
@@ -60,12 +65,20 @@ def build_ohlcv(
     open_price[1:] = close[:-1]
 
     rng = np.random.default_rng(seed)
-    raw_width = np.abs(rng.normal(loc=0.0, scale=0.35, size=close.size))
-    half_body = np.clip(np.abs(close - open_price), 1e-12, np.inf)
-    wick = half_body * (1.0 + raw_width) * max(float(wick_scale), 0.0)
-    high = np.maximum(open_price, close) + wick
-    low = np.maximum(1e-12, np.minimum(open_price, close) - wick)
-    volume = np.exp(rng.normal(loc=float(volume_loc), scale=max(float(volume_scale), 0.0), size=close.size))
+    raw_width = rng.normal(loc=0.0, scale=0.35, size=close.size)
+    np.abs(raw_width, out=raw_width)
+    wick = close - open_price
+    np.abs(wick, out=wick)
+    np.maximum(wick, 1e-12, out=wick)
+    wick *= 1.0 + raw_width
+    wick *= max(float(wick_scale), 0.0)
+    high = np.maximum(open_price, close)
+    high += wick
+    low = np.minimum(open_price, close)
+    low -= wick
+    np.maximum(low, 1e-12, out=low)
+    volume = rng.normal(loc=float(volume_loc), scale=max(float(volume_scale), 0.0), size=close.size)
+    np.exp(volume, out=volume)
 
     return {
         "open": open_price,

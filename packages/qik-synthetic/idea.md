@@ -191,3 +191,62 @@ Open calibration work:
   start/end price levels.
 - Add a heavy-tail or bootstrapped return model if matching both robust quantiles
   and raw volatility is required.
+
+## Performance task plan
+
+Implemented performance tasks:
+
+- Add columnar generation APIs:
+  - `SyntheticEngine.generate_frame`
+  - `SyntheticEngine.iter_generate_frames`
+  - `SyntheticEngine.generate_backtesting_payload`
+- Keep `SyntheticEngine.generate` and `iter_generate` compatible while sharing
+  the same internal block generation path.
+- Replace AR(1) convolution with an equivalent linear recurrence.
+- Make `to_backtesting_frame` use `DataFrame.from_records` and avoid rebuilding
+  rows before pandas conversion.
+- Add `compact_identity` support for categorical `symbol`, `venue`, `dataset`,
+  and `interval` columns on generated frames/payloads.
+- Replace JSON fingerprinting with canonical byte hashing.
+- Combine diagnostics/calibration quantile calls where possible.
+- Reject multi-identity diagnostics/calibration inputs unless callers group
+  first.
+- Add grouped multi-identity helpers:
+  - `compare_ohlcv_by_identity`
+  - `calibrate_many_ohlcv_params`
+- Avoid full-frame timestamp sorting in calibration; sort extracted arrays by
+  timestamp order instead.
+- Cache parsed intervals with `lru_cache`.
+- Add local benchmark script:
+  `packages/qik-synthetic/benchmarks/bench_synthetic.py`.
+
+Measured impact:
+
+- `100000` rows:
+  - `generate_frame`: `0.135569s`.
+  - legacy `generate`: `0.159400s`.
+  - direct frame payload: `0.120913s`.
+  - legacy generate + payload: `0.273482s`.
+  - direct payload speedup versus legacy total: `2.26x`.
+- One-year `1m` / `525600` rows:
+  - `generate_frame`: `0.673187s` to `0.776726s`.
+  - direct frame payload: `0.576792s` to `0.683421s`.
+  - compact frame memory: `27331554` bytes, about `26 MiB`.
+  - `/usr/bin/time -l` direct payload wall time including Python startup/imports:
+    `1.44s`.
+  - `/usr/bin/time -l` maximum resident set size: `171458560` bytes, about
+    `164 MiB`.
+  - Previous one-year legacy payload measurement was `4.62s` wall clock and
+    `629932032` bytes max RSS, about `601 MiB`.
+- One-year `1m` diagnostics/support timings:
+  - Fast fingerprint: `1.785277s`.
+  - Self comparison diagnostics: `0.616781s`.
+  - Calibration: `0.167782s`.
+  - AR(1) frame generation after recurrence rewrite: `0.742274s`.
+
+Remaining realism/modeling tasks:
+
+- Add price-bridge and heavy-tail/bootstrapped return models for realism rather
+  than speed.
+- Decide whether `compact_identity=True` should become the default only for the
+  new frame APIs after downstream adapter compatibility is confirmed.

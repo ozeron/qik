@@ -25,6 +25,24 @@ from .types import (
 _INTERNAL_BLOCK_SIZE = 200_000
 
 
+@dataclass(frozen=True)
+class _RunPlan:
+    request: SyntheticRequest
+    context: SyntheticContext
+    n_bars: int
+    params: dict[str, object]
+    run_id: str
+    interval_step: object
+
+
+@dataclass(frozen=True)
+class _OhlcvBlock:
+    block_index: int
+    block_start: int
+    timestamps: tuple[datetime, ...]
+    ohlcv: dict[str, object]
+
+
 def _seed_to_int(seed_data: bytes) -> int:
     return int.from_bytes(blake2b(seed_data, digest_size=8).digest(), "big", signed=False)
 
@@ -57,17 +75,24 @@ class SyntheticEngine:
 
     def generate(self, request: SyntheticRequest) -> SyntheticBatch:
         """Materialize a full synthetic batch for one request."""
-        request = self._normalize_request(request)
-        context, n_bars = self._resolve_run_context(request)
-        self._validate_context(context, request)
-
-        chunks = tuple(self.iter_generate(request))
-        bars = tuple(bar for chunk in chunks for bar in chunk.bars)
+        plan = self._prepare_run(request)
+        bars = tuple(
+            {
+                "timestamp": block.timestamps[idx],
+                "open": float(block.ohlcv["open"][idx]),
+                "high": float(block.ohlcv["high"][idx]),
+                "low": float(block.ohlcv["low"][idx]),
+                "close": float(block.ohlcv["close"][idx]),
+                "volume": float(block.ohlcv["volume"][idx]),
+            }
+            for block in self._iter_ohlcv_blocks(plan)
+            for idx in range(len(block.timestamps))
+        )
         return SyntheticBatch(
             bars=bars,
-            context=context,
-            request=request,
-            metadata=self._build_metadata(request, context),
+            context=plan.context,
+            request=plan.request,
+            metadata=self._build_metadata(plan.request, plan.context),
         )
 
     def iter_generate(self, request: SyntheticRequest, *, chunk_size: int = 200_000) -> Iterator[SyntheticChunk]:
@@ -79,61 +104,91 @@ class SyntheticEngine:
         if chunk_size <= 0:
             raise SyntheticValidationError("chunk_size must be greater than 0")
 
-        request = self._normalize_request(request)
-        context, n_bars = self._resolve_run_context(request)
-        self._validate_context(context, request)
+        plan = self._prepare_run(request)
 
-        if n_bars == 0:
+        if plan.n_bars == 0:
             return
-
-        params = dict(request.model_params)
-        params.setdefault("trading_hours", context.trading_hours)
-        params.setdefault("asset_class", context.asset_class)
-        params["start_price"] = float(request.start_price)
-
-        run_id = self._run_id(request)
-        timestamp_cursor = request.start_ts
-        interval_step = parse_interval(context.interval)
-        last_close = float(request.start_price)
         chunk_index = 0
 
-        for block_index, block_start in enumerate(range(0, n_bars, _INTERNAL_BLOCK_SIZE)):
-            block_n = min(_INTERNAL_BLOCK_SIZE, n_bars - block_start)
-            params["start_price"] = last_close
-            ohlcv = self.model.simulate_batch(
-                context,
-                block_n,
-                seed=self._chunk_seed(request, block_index),
-                params=params,
-            )
-            closes = ohlcv["close"]
-            if closes.size != block_n:
-                raise SyntheticValidationError("model returned invalid block size")
-
-            timestamps = generate_timestamps(
-                timestamp_cursor,
-                context.interval,
-                block_n,
-                trading_hours=context.trading_hours,
-            )
+        for block in self._iter_ohlcv_blocks(plan):
+            block_n = len(block.timestamps)
             for offset_start in range(0, block_n, chunk_size):
                 chunk_n = min(chunk_size, block_n - offset_start)
                 rows = tuple(
                     {
-                        "timestamp": timestamps[offset_start + offset],
-                        "open": float(ohlcv["open"][offset_start + offset]),
-                        "high": float(ohlcv["high"][offset_start + offset]),
-                        "low": float(ohlcv["low"][offset_start + offset]),
-                        "close": float(ohlcv["close"][offset_start + offset]),
-                        "volume": float(ohlcv["volume"][offset_start + offset]),
+                        "timestamp": block.timestamps[offset_start + offset],
+                        "open": float(block.ohlcv["open"][offset_start + offset]),
+                        "high": float(block.ohlcv["high"][offset_start + offset]),
+                        "low": float(block.ohlcv["low"][offset_start + offset]),
+                        "close": float(block.ohlcv["close"][offset_start + offset]),
+                        "volume": float(block.ohlcv["volume"][offset_start + offset]),
                     }
                     for offset in range(chunk_n)
                 )
-                yield SyntheticChunk(bars=rows, chunk_index=chunk_index, run_id=run_id)
+                yield SyntheticChunk(bars=rows, chunk_index=chunk_index, run_id=plan.run_id)
                 chunk_index += 1
 
-            last_close = float(closes[-1])
-            timestamp_cursor = timestamps[-1] + interval_step
+    def iter_generate_frames(self, request: SyntheticRequest, *, chunk_size: int = 200_000, compact_identity: bool = False):
+        """Yield generated candle frames without materializing Python row dicts."""
+        if chunk_size <= 0:
+            raise SyntheticValidationError("chunk_size must be greater than 0")
+
+        plan = self._prepare_run(request)
+        if plan.n_bars == 0:
+            return
+
+        for block in self._iter_ohlcv_blocks(plan):
+            block_n = len(block.timestamps)
+            for offset_start in range(0, block_n, chunk_size):
+                chunk_n = min(chunk_size, block_n - offset_start)
+                yield self._frame_from_block(
+                    plan,
+                    block,
+                    offset_start=offset_start,
+                    chunk_n=chunk_n,
+                    compact_identity=compact_identity,
+                )
+
+    def generate_frame(self, request: SyntheticRequest, *, compact_identity: bool = False):
+        """Materialize a generated candle frame via the columnar fast path."""
+        plan = self._prepare_run(request)
+        return self._generate_frame_from_plan(plan, compact_identity=compact_identity)
+
+    def generate_backtesting_payload(
+        self,
+        request: SyntheticRequest,
+        *,
+        run_context: Mapping[str, str] | None = None,
+        compact_identity: bool = False,
+    ) -> Mapping[str, object]:
+        """Generate a backtesting payload without building `SyntheticBatch.bars`."""
+        from .backtesting import to_backtesting_payload_from_frame
+
+        plan = self._prepare_run(request)
+        frame = self._generate_frame_from_plan(plan, compact_identity=compact_identity)
+        return to_backtesting_payload_from_frame(
+            frame,
+            metadata=self._build_metadata(plan.request, plan.context),
+            identity=self._identity_for_plan(plan),
+            n_bars=plan.n_bars,
+            run_context=run_context,
+        )
+
+    def iter_generate_many_frames(
+        self,
+        requests: Sequence[SyntheticRequest],
+        *,
+        chunk_size: int = 200_000,
+        compact_identity: bool = False,
+    ):
+        """Yield `(request_index, frame)` chunks for many requests sequentially."""
+        for index, request in enumerate(requests):
+            for frame in self.iter_generate_frames(
+                request,
+                chunk_size=chunk_size,
+                compact_identity=compact_identity,
+            ):
+                yield index, frame
 
     def generate_many(
         self,
@@ -182,6 +237,117 @@ class SyntheticEngine:
                     )
 
         return tuple(out)
+
+    def _prepare_run(self, request: SyntheticRequest) -> _RunPlan:
+        request = self._normalize_request(request)
+        context, n_bars = self._resolve_run_context(request)
+        self._validate_context(context, request)
+        params = dict(request.model_params)
+        params.setdefault("trading_hours", context.trading_hours)
+        params.setdefault("asset_class", context.asset_class)
+        params["start_price"] = float(request.start_price)
+        return _RunPlan(
+            request=request,
+            context=context,
+            n_bars=n_bars,
+            params=params,
+            run_id=self._run_id(request),
+            interval_step=parse_interval(context.interval),
+        )
+
+    def _iter_ohlcv_blocks(self, plan: _RunPlan):
+        timestamp_cursor = plan.request.start_ts
+        last_close = float(plan.request.start_price)
+        for block_index, block_start in enumerate(range(0, plan.n_bars, _INTERNAL_BLOCK_SIZE)):
+            block_n = min(_INTERNAL_BLOCK_SIZE, plan.n_bars - block_start)
+            params = dict(plan.params)
+            params["start_price"] = last_close
+            ohlcv = self.model.simulate_batch(
+                plan.context,
+                block_n,
+                seed=self._chunk_seed(plan.request, block_index),
+                params=params,
+            )
+            closes = ohlcv["close"]
+            if closes.size != block_n:
+                raise SyntheticValidationError("model returned invalid block size")
+            timestamps = generate_timestamps(
+                timestamp_cursor,
+                plan.context.interval,
+                block_n,
+                trading_hours=plan.context.trading_hours,
+            )
+            yield _OhlcvBlock(
+                block_index=block_index,
+                block_start=block_start,
+                timestamps=timestamps,
+                ohlcv=ohlcv,
+            )
+            last_close = float(closes[-1])
+            timestamp_cursor = timestamps[-1] + plan.interval_step
+
+    def _generate_frame_from_plan(self, plan: _RunPlan, *, compact_identity: bool = False):
+        try:
+            import pandas as pd
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency boundary
+            raise SyntheticValidationError("pandas is required for generate_frame") from exc
+
+        frames = [
+            self._frame_from_block(
+                plan,
+                block,
+                offset_start=0,
+                chunk_n=len(block.timestamps),
+                compact_identity=compact_identity,
+            )
+            for block in self._iter_ohlcv_blocks(plan)
+        ]
+        if not frames:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "symbol", "venue", "dataset", "interval"])
+        if len(frames) == 1:
+            return frames[0]
+        return pd.concat(frames, ignore_index=True)
+
+    def _frame_from_block(
+        self,
+        plan: _RunPlan,
+        block: _OhlcvBlock,
+        *,
+        offset_start: int,
+        chunk_n: int,
+        compact_identity: bool,
+    ):
+        try:
+            import pandas as pd
+        except ModuleNotFoundError as exc:  # pragma: no cover - dependency boundary
+            raise SyntheticValidationError("pandas is required for generate_frame") from exc
+
+        offset_end = offset_start + chunk_n
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(block.timestamps[offset_start:offset_end], utc=True),
+                "open": block.ohlcv["open"][offset_start:offset_end],
+                "high": block.ohlcv["high"][offset_start:offset_end],
+                "low": block.ohlcv["low"][offset_start:offset_end],
+                "close": block.ohlcv["close"][offset_start:offset_end],
+                "volume": block.ohlcv["volume"][offset_start:offset_end],
+            }
+        )
+        identity = self._identity_for_plan(plan)
+        for column, value in identity.items():
+            frame[column] = value
+        if compact_identity:
+            for column in identity:
+                frame[column] = frame[column].astype("category")
+        return frame
+
+    def _identity_for_plan(self, plan: _RunPlan) -> dict[str, str | None]:
+        return {
+            "symbol": plan.context.symbol,
+            "venue": plan.context.venue,
+            "dataset": plan.context.dataset,
+            "interval": plan.request.interval,
+        }
 
     def _normalize_request(self, request: SyntheticRequest) -> SyntheticRequest:
         if request.start_ts.tzinfo is None:

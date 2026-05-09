@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from qik.synthetic import (
@@ -18,9 +19,11 @@ from qik.synthetic import (
     calibrate_ohlcv_params,
     compare_ohlcv,
     fingerprint_candle_table,
+    to_backtesting_frame,
     to_backtesting_payload,
     validate_backtesting_payload,
 )
+from qik.synthetic.kernels import simulate_returns_ar1
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "synthetic" / "request_btc.json"
@@ -55,6 +58,31 @@ def test_chunk_iteration_matches_materialized_generation():
     chunked = tuple(bar for chunk in engine.iter_generate(request, chunk_size=5) for bar in chunk.bars)
 
     assert chunked == batch.bars
+
+
+def test_generate_frame_matches_legacy_payload():
+    payload = _load_fixture()
+    request = as_request(**payload)
+    engine = SyntheticEngine(model="gaussian_rw")
+
+    legacy = to_backtesting_payload(engine.generate(request))["candle_table"]
+    frame = engine.generate_frame(request)
+    direct_payload = engine.generate_backtesting_payload(request)
+
+    assert fingerprint_candle_table(frame) == fingerprint_candle_table(legacy)
+    assert fingerprint_candle_table(direct_payload["candle_table"]) == fingerprint_candle_table(legacy)
+
+
+def test_generate_frame_can_compact_identity_columns():
+    payload = _load_fixture()
+    request = as_request(**payload)
+
+    frame = SyntheticEngine(model="gaussian_rw").generate_frame(request, compact_identity=True)
+
+    assert str(frame["symbol"].dtype) == "category"
+    assert str(frame["venue"].dtype) == "category"
+    assert str(frame["dataset"].dtype) == "category"
+    assert str(frame["interval"].dtype) == "category"
 
 
 def test_horizon_rejects_ambiguous_inputs():
@@ -93,6 +121,28 @@ def test_payload_bridge_requires_identity():
     assert payload["metadata"]["first_timestamp"] == batch.bars[0]["timestamp"]
     assert payload["metadata"]["last_timestamp"] == batch.bars[-1]["timestamp"]
     assert payload["metadata"]["first_close"] == batch.bars[0]["close"]
+
+
+def test_backtesting_frame_sorts_shuffled_bars():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=8,
+        seed=42,
+    )
+    batch = SyntheticEngine(model="gaussian_rw").generate(request)
+    shuffled = type(batch)(
+        bars=tuple(reversed(batch.bars)),
+        context=batch.context,
+        request=batch.request,
+        metadata=batch.metadata,
+    )
+
+    frame = to_backtesting_frame(shuffled)
+
+    assert frame["timestamp"].is_monotonic_increasing
 
 
 def test_payload_bridge_requires_complete_identity():
@@ -296,6 +346,25 @@ def test_compare_ohlcv_treats_row_count_mismatch_as_failure():
     assert any("row_count_mismatch" in warning for warning in report.warnings)
 
 
+def test_compare_ohlcv_rejects_multi_identity_frames():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        venue="binance",
+        dataset="trade_bars",
+        n_bars=8,
+        seed=42,
+    )
+    frame = SyntheticEngine(model="gaussian_rw").generate_frame(request)
+    mixed = frame.copy()
+    mixed.loc[mixed.index[-1], "symbol"] = "ETHUSDT"
+
+    with pytest.raises(SyntheticValidationError):
+        compare_ohlcv(mixed, mixed)
+
+
 def test_calibrated_params_reduce_range_and_volume_drift():
     request = as_request(
         start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
@@ -399,3 +468,37 @@ def test_calibration_rejects_all_zero_volume():
 
     with pytest.raises(SyntheticValidationError):
         calibrate_ohlcv_params(frame)
+
+
+def test_calibration_rejects_multi_identity_frames():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        venue="binance",
+        dataset="trade_bars",
+        n_bars=8,
+        seed=42,
+    )
+    frame = SyntheticEngine(model="gaussian_rw").generate_frame(request)
+    frame.loc[frame.index[-1], "symbol"] = "ETHUSDT"
+
+    with pytest.raises(SyntheticValidationError):
+        calibrate_ohlcv_params(frame)
+
+
+def test_ar1_recurrence_matches_convolution_definition():
+    n = 128
+    seed = 123
+    phi = 0.4
+    volatility = 0.02
+    drift = 0.001
+    rng = np.random.default_rng(seed)
+    eps = rng.normal(size=n)
+    kernels = np.power(phi, np.arange(n, dtype=float))
+    expected = np.convolve(volatility * eps, kernels, mode="full")[:n] + drift
+
+    actual = simulate_returns_ar1(n, seed=seed, phi=phi, drift=drift, volatility=volatility)
+
+    np.testing.assert_allclose(actual, expected)
