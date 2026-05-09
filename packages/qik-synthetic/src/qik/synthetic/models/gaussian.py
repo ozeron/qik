@@ -54,4 +54,11 @@ class GaussianRandomWalkModel:
             raise SyntheticValidationError("simulate_batch requires start_price")
         start_price = float(params["start_price"])
         returns = self.simulate_returns(ctx, n, seed=seed, params=params)
-        return build_ohlcv(start_price, returns, seed=seed)
+        return build_ohlcv(
+            start_price,
+            returns,
+            seed=seed,
+            wick_scale=float(params.get("wick_scale", 1.0)),
+            volume_loc=float(params.get("volume_loc", 12.0)),
+            volume_scale=float(params.get("volume_scale", 0.35)),
+        )

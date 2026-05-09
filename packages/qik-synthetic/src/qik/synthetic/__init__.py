@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from .backtesting import to_backtesting_frame, to_backtesting_payload, validate_backtesting_payload
+from .calibration import calibrate_ohlcv_params
 from .context import DefaultMarketContextProvider
+from .diagnostics import OhlcvComparisonReport, compare_ohlcv, fingerprint_candle_table
 from .engine import SyntheticEngine
 from .errors import (
     SyntheticConversionError,
@@ -42,6 +44,10 @@ __all__ = [
     "to_backtesting_frame",
     "to_backtesting_payload",
     "validate_backtesting_payload",
+    "calibrate_ohlcv_params",
+    "fingerprint_candle_table",
+    "compare_ohlcv",
+    "OhlcvComparisonReport",
     "resolve_model",
     "list_models",
     "SyntheticContext",

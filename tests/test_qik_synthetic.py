@@ -12,8 +12,12 @@ from qik.synthetic import (
     SyntheticConversionError,
     SyntheticEngine,
     SyntheticContextError,
+    SyntheticValidationError,
     as_request,
     bars_from_span,
+    calibrate_ohlcv_params,
+    compare_ohlcv,
+    fingerprint_candle_table,
     to_backtesting_payload,
     validate_backtesting_payload,
 )
@@ -211,3 +215,187 @@ def test_callable_context_provider_is_supported():
     batch = SyntheticEngine(model="gaussian_rw", context_provider=resolve_context).generate(request)
 
     assert batch.context.venue == "test"
+
+
+def test_fingerprint_candle_table_detects_upload_mutation():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=8,
+        seed=42,
+    )
+    payload = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))
+    uploaded = payload["candle_table"].copy()
+
+    assert fingerprint_candle_table(payload["candle_table"]) == fingerprint_candle_table(uploaded)
+
+    uploaded.loc[0, "close"] = uploaded.loc[0, "close"] + 1.0
+    assert fingerprint_candle_table(payload["candle_table"]) != fingerprint_candle_table(uploaded)
+
+
+def test_compare_ohlcv_reports_similarity_and_drift():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=64,
+        seed=42,
+    )
+    frame = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))["candle_table"]
+
+    same_report = compare_ohlcv(frame, frame)
+    assert same_report.passed
+    assert same_report.row_counts == {"real": 64, "synthetic": 64}
+
+    shifted = frame.copy()
+    shifted["close"] = shifted["close"] * 1.2
+    shifted["open"] = shifted["open"] * 1.2
+    shifted["high"] = shifted["high"] * 1.2
+    shifted["low"] = shifted["low"] * 1.2
+    drift_report = compare_ohlcv(frame, shifted)
+
+    assert not drift_report.passed
+    assert any("close_median_rel_diff" in warning for warning in drift_report.warnings)
+
+
+def test_compare_ohlcv_rejects_non_finite_values():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=8,
+        seed=42,
+    )
+    frame = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))["candle_table"]
+    corrupted = frame.copy()
+    corrupted.loc[0, "close"] = float("inf")
+
+    with pytest.raises(Exception):
+        compare_ohlcv(frame, corrupted)
+
+
+def test_compare_ohlcv_treats_row_count_mismatch_as_failure():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=8,
+        seed=42,
+    )
+    frame = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))["candle_table"]
+
+    report = compare_ohlcv(frame, frame.iloc[:-1].copy())
+
+    assert not report.passed
+    assert report.row_counts == {"real": 8, "synthetic": 7}
+    assert any("row_count_mismatch" in warning for warning in report.warnings)
+
+
+def test_calibrated_params_reduce_range_and_volume_drift():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        venue="binance",
+        dataset="trade_bars",
+        n_bars=256,
+        seed=42,
+    )
+    default_frame = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))["candle_table"]
+    real_like = default_frame.copy()
+    real_like["high"] = real_like[["open", "close"]].max(axis=1) * 1.0002
+    real_like["low"] = real_like[["open", "close"]].min(axis=1) * 0.9998
+    real_like["volume"] = 750.0
+
+    calibrated_params = calibrate_ohlcv_params(real_like)
+    calibrated_request = as_request(
+        start_ts=request.start_ts,
+        interval=request.interval,
+        start_price=request.start_price,
+        symbol=request.symbol,
+        venue=request.venue,
+        dataset=request.dataset,
+        n_bars=request.n_bars,
+        seed=request.seed,
+        model_params=calibrated_params,
+    )
+    calibrated_frame = to_backtesting_payload(
+        SyntheticEngine(model="gaussian_rw").generate(calibrated_request)
+    )["candle_table"]
+
+    default_report = compare_ohlcv(real_like, default_frame)
+    calibrated_report = compare_ohlcv(real_like, calibrated_frame)
+
+    assert calibrated_params["volume_loc"] == pytest.approx(6.620073, rel=1e-6)
+    assert calibrated_report.metrics["volume_median_rel_diff"] < default_report.metrics["volume_median_rel_diff"]
+    assert calibrated_report.metrics["range_median_rel_diff"] < default_report.metrics["range_median_rel_diff"]
+
+
+def test_calibration_sorts_timestamped_frames_before_estimating_returns():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        venue="binance",
+        dataset="trade_bars",
+        n_bars=32,
+        seed=42,
+    )
+    frame = to_backtesting_payload(SyntheticEngine(model="ar1").generate(request))["candle_table"]
+
+    sorted_params = calibrate_ohlcv_params(frame)
+    shuffled_params = calibrate_ohlcv_params(frame.sample(frac=1.0, random_state=7))
+
+    assert shuffled_params["drift"] == pytest.approx(sorted_params["drift"])
+    assert shuffled_params["volatility"] == pytest.approx(sorted_params["volatility"])
+    assert shuffled_params["phi"] == pytest.approx(sorted_params["phi"])
+
+
+def test_calibration_returns_ar1_innovation_volatility():
+    rows = []
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    price = 1000.0
+    ret = 0.001
+    for idx in range(64):
+        ret = 0.8 * ret + 0.001
+        open_ = price
+        close = price * (1.0 + ret)
+        rows.append(
+            {
+                "timestamp": start + timedelta(hours=idx),
+                "open": open_,
+                "high": max(open_, close) * 1.001,
+                "low": min(open_, close) * 0.999,
+                "close": close,
+                "volume": 100.0 + idx,
+            }
+        )
+        price = close
+
+    params = calibrate_ohlcv_params(__import__("pandas").DataFrame(rows))
+
+    assert params["phi"] > 0.5
+    assert params["ar1_volatility"] < params["volatility"]
+
+
+def test_calibration_rejects_all_zero_volume():
+    request = as_request(
+        start_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        interval="1h",
+        start_price=1000.0,
+        symbol="BTCUSDT",
+        n_bars=8,
+        seed=42,
+    )
+    frame = to_backtesting_payload(SyntheticEngine(model="gaussian_rw").generate(request))["candle_table"]
+    frame["volume"] = 0.0
+
+    with pytest.raises(SyntheticValidationError):
+        calibrate_ohlcv_params(frame)

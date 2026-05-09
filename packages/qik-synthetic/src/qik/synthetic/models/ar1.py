@@ -37,7 +37,7 @@ class AR1Model:
             raise SyntheticValidationError("n must be positive")
         params = params or {}
         drift = float(params.get("drift", 0.0))
-        volatility = float(params.get("volatility", 0.01))
+        volatility = float(params.get("ar1_volatility", params.get("volatility", 0.01)))
         phi = float(params.get("phi", 0.2))
         return simulate_returns_ar1(n, seed=seed, phi=phi, drift=drift, volatility=volatility)
 
@@ -54,4 +54,11 @@ class AR1Model:
             raise SyntheticValidationError("simulate_batch requires start_price")
         start_price = float(params["start_price"])
         returns = self.simulate_returns(ctx, n, seed=seed, params=params)
-        return build_ohlcv(start_price, returns, seed=seed)
+        return build_ohlcv(
+            start_price,
+            returns,
+            seed=seed,
+            wick_scale=float(params.get("wick_scale", 1.0)),
+            volume_loc=float(params.get("volume_loc", 12.0)),
+            volume_scale=float(params.get("volume_scale", 0.35)),
+        )

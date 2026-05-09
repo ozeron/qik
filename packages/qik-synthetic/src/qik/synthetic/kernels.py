@@ -46,6 +46,9 @@ def build_ohlcv(
     log_returns: np.ndarray,
     *,
     seed: int | None = None,
+    wick_scale: float = 1.0,
+    volume_loc: float = 12.0,
+    volume_scale: float = 0.35,
 ) -> dict[str, np.ndarray]:
     close = start_price * np.exp(np.cumsum(log_returns))
     if close.size == 0:
@@ -59,10 +62,10 @@ def build_ohlcv(
     rng = np.random.default_rng(seed)
     raw_width = np.abs(rng.normal(loc=0.0, scale=0.35, size=close.size))
     half_body = np.clip(np.abs(close - open_price), 1e-12, np.inf)
-    wick = half_body * (1.0 + raw_width)
+    wick = half_body * (1.0 + raw_width) * max(float(wick_scale), 0.0)
     high = np.maximum(open_price, close) + wick
     low = np.maximum(1e-12, np.minimum(open_price, close) - wick)
-    volume = np.exp(rng.normal(loc=12.0, scale=0.35, size=close.size))
+    volume = np.exp(rng.normal(loc=float(volume_loc), scale=max(float(volume_scale), 0.0), size=close.size))
 
     return {
         "open": open_price,
