@@ -1,0 +1,13 @@
+{
+  "start_ts": "2024-01-01T00:00:00+00:00",
+  "interval": "1h",
+  "start_price": 50000.0,
+  "symbol": "BTCUSDT",
+  "n_bars": 24,
+  "seed": 7,
+  "model": "gaussian_rw",
+  "model_params": {
+    "drift": 0.0001,
+    "volatility": 0.01
+  }
+}
