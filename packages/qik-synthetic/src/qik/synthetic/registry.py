@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from .errors import SyntheticDependencyError, SyntheticValidationError
-from .models import AR1Model, GaussianRandomWalkModel, StationaryBootstrapModel, StudentTRandomWalkModel
+from .models import (
+    AR1Model,
+    EmpiricalSVModel,
+    GaussianRandomWalkModel,
+    RegimeConditionedBootstrapModel,
+    StationaryBootstrapModel,
+    StudentTRandomWalkModel,
+)
 
 
 def _model_from_name(name: str):
@@ -14,7 +21,11 @@ def _model_from_name(name: str):
         return AR1Model
     if key in {"stationary_bootstrap", "empirical_bootstrap"}:
         return StationaryBootstrapModel
-    if key in {"student_t_rw", "student_t"}:
+    if key in {"empirical_sv", "regime_bootstrap", "seasonal_bootstrap"}:
+        return EmpiricalSVModel
+    if key == "regime_conditioned_bootstrap":
+        return RegimeConditionedBootstrapModel
+    if key in {"student_t_rw", "student_t", "realistic_btc_1h", "recommended_realism"}:
         return StudentTRandomWalkModel
     if key == "garch":
         try:
@@ -36,4 +47,13 @@ def resolve_model(name: str):
 
 
 def list_models() -> tuple[str, ...]:
-    return ("gaussian_rw", "ar1", "garch", "stationary_bootstrap", "student_t_rw")
+    return (
+        "gaussian_rw",
+        "ar1",
+        "garch",
+        "stationary_bootstrap",
+        "student_t_rw",
+        "empirical_sv",
+        "regime_conditioned_bootstrap",
+        "realistic_btc_1h",
+    )

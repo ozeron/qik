@@ -11,6 +11,7 @@ import pandas as pd
 
 from .diagnostics import fingerprint_candle_table
 from .errors import SyntheticValidationError
+from .regimes import RegimeLabelConfig, RegimeState, fit_regime_state
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class OhlcvCalibrationProfile:
     feature_frame_fingerprint: str
     model_params: dict[str, Any]
     features: dict[str, np.ndarray]
+    regime_state: RegimeState | None = None
 
 
 def _finite_series(frame: pd.DataFrame, column: str) -> np.ndarray:
@@ -58,7 +60,12 @@ def calibrate_many_ohlcv_params(
     return {key: dict(profile.model_params) for key, profile in fit_many_ohlcv_profiles(frame, group_columns=group_columns).items()}
 
 
-def fit_ohlcv_profile(frame: pd.DataFrame, *, model: str = "generic") -> OhlcvCalibrationProfile:
+def fit_ohlcv_profile(
+    frame: pd.DataFrame,
+    *,
+    model: str = "generic",
+    regime_config: RegimeLabelConfig | None = None,
+) -> OhlcvCalibrationProfile:
     """Fit a structured calibration profile from one OHLCV identity."""
 
     if not isinstance(frame, pd.DataFrame):
@@ -72,6 +79,7 @@ def fit_ohlcv_profile(frame: pd.DataFrame, *, model: str = "generic") -> OhlcvCa
     volume = _finite_series(prepared, "volume")
     _validate_ohlcv_arrays(open_, high, low, close, volume)
     features = extract_ohlcv_features(prepared)
+    calendar_features_present = bool(features.get("calendar_features_present", np.asarray([False], dtype=bool))[0])
     log_returns = features["close_to_close_return"]
     drift, volatility, robust_volatility, phi, ar1_volatility = _return_params(log_returns)
     positive_volume = volume[volume > 0]
@@ -112,9 +120,16 @@ def fit_ohlcv_profile(frame: pd.DataFrame, *, model: str = "generic") -> OhlcvCa
         "volume_scale": max(volume_scale, 0.0),
         "volume_median": float(np.median(volume)),
         "log_volume_q95": float(np.quantile(np.log(np.maximum(volume, 1e-12)), 0.95)),
+        "log_volume_hour_iqr": float(np.quantile(features["log_volume_hour_effect"], 0.75) - np.quantile(features["log_volume_hour_effect"], 0.25)),
+        "volume_level_last_30d": float(np.median(volume[-720:])) if volume.size else 0.0,
+        "volume_level_last_90d": float(np.median(volume[-2160:])) if volume.size else 0.0,
         "hourly_volume_profile_distance": 0.0,
     }
+    recent_volume = volume[-min(volume.size, 2160) :]
+    volume_loc_recent = float(np.median(np.log(np.maximum(recent_volume, 1e-12)))) if recent_volume.size else volume_loc
+    beta_abs, beta_range = _volume_coupling_params(features)
     model_params = {
+        "realism_profile_version": "btc_1h_v1",
         "drift": drift,
         "volatility": max(robust_volatility, 0.0),
         "volatility_raw": max(volatility, 0.0),
@@ -122,11 +137,29 @@ def fit_ohlcv_profile(frame: pd.DataFrame, *, model: str = "generic") -> OhlcvCa
         "ar1_volatility": max(ar1_volatility, 0.0),
         "wick_scale": wick_scale,
         "volume_loc": volume_loc,
+        "volume_loc_recent": volume_loc_recent,
         "volume_scale": max(volume_scale, 0.0),
+        "empirical_sv_volume_beta_abs_return": beta_abs,
+        "empirical_sv_volume_beta_range": beta_range,
         "ohlcv_features": features,
         "bootstrap_mean_block_size": 48,
+        "time_align_bootstrap": calendar_features_present,
+        "time_alignment_available": calendar_features_present,
+        "student_t_df": _student_t_df_estimate(log_returns),
+        "empirical_sv_return_clip": float(np.quantile(np.abs(log_returns[np.isfinite(log_returns)]), 0.995)) if np.isfinite(log_returns).any() else 0.35,
     }
     identity = _identity(prepared)
+    timestamps_present = "timestamp" in prepared.columns
+    regime_state = (
+        fit_regime_state(
+            features,
+            interval=identity.get("interval") or None,
+            timestamps_present=timestamps_present,
+            config=regime_config,
+        )
+        if regime_config is not None
+        else None
+    )
     return OhlcvCalibrationProfile(
         identity=identity,
         row_count=int(len(prepared)),
@@ -140,6 +173,7 @@ def fit_ohlcv_profile(frame: pd.DataFrame, *, model: str = "generic") -> OhlcvCa
         feature_frame_fingerprint=_feature_frame_fingerprint(prepared),
         model_params=model_params,
         features=features,
+        regime_state=regime_state,
     )
 
 
@@ -175,18 +209,54 @@ def extract_ohlcv_features(frame: pd.DataFrame) -> dict[str, np.ndarray]:
     prev_close[0] = open_[0]
     prev_close[1:] = close[:-1]
     timestamp = pd.to_datetime(prepared["timestamp"], utc=True) if "timestamp" in prepared.columns else None
-    return {
-        "close_to_close_return": np.diff(np.log(close), prepend=np.log(open_[0])),
+    close_to_close = np.diff(np.log(close), prepend=np.log(open_[0]))
+    rel_range = (high - low) / close
+    body_rel = np.abs(close - open_) / close
+    upper_wick_rel = np.maximum(high / np.maximum(open_, close) - 1.0, 0.0)
+    lower_wick_rel = np.maximum(np.minimum(open_, close) / np.maximum(low, 1e-12) - 1.0, 0.0)
+    rolling_24h_vol = _rolling_std(close_to_close, 24)
+    rolling_168h_vol = _rolling_std(close_to_close, 168)
+    abs_returns = np.abs(close_to_close)
+    regime_basis = np.maximum(rolling_24h_vol, abs_returns)
+    volatility_regime = _volatility_regimes(regime_basis)
+    log_volume = np.log(np.maximum(volume, 1e-12))
+    hours = timestamp.dt.hour.to_numpy(dtype=float) if timestamp is not None else None
+    days = timestamp.dt.dayofweek.to_numpy(dtype=float) if timestamp is not None else None
+    hour_effect = _hour_effect(log_volume, hours)
+    log_volume_baseline = float(np.median(log_volume)) if log_volume.size else 0.0
+    if hours is None:
+        log_volume_hour_residual = log_volume - log_volume_baseline
+    else:
+        log_volume_hour_residual = log_volume - log_volume_baseline - np.take(hour_effect, hours.astype(int))
+    volume_level_24h = _rolling_median(volume, 24)
+    volume_level_168h = _rolling_median(volume, 168)
+    features = {
+        "close_to_close_return": close_to_close,
         "open_gap_return": np.log(open_ / np.maximum(prev_close, 1e-12)),
         "intrabar_return": np.log(close / open_),
-        "upper_wick_rel": np.maximum(high / np.maximum(open_, close) - 1.0, 0.0),
-        "lower_wick_rel": np.maximum(np.minimum(open_, close) / np.maximum(low, 1e-12) - 1.0, 0.0),
-        "rel_range": (high - low) / close,
-        "log_volume": np.log(np.maximum(volume, 1e-12)),
+        "upper_wick_rel": upper_wick_rel,
+        "lower_wick_rel": lower_wick_rel,
+        "rel_range": rel_range,
+        "body_rel": body_rel,
+        "body_to_range": body_rel / np.maximum(rel_range, 1e-12),
+        "upper_wick_share": upper_wick_rel / np.maximum(rel_range, 1e-12),
+        "lower_wick_share": lower_wick_rel / np.maximum(rel_range, 1e-12),
+        "rolling_24h_vol": rolling_24h_vol,
+        "rolling_168h_vol": rolling_168h_vol,
+        "volatility_regime": volatility_regime.astype(float),
+        "shock_flag": (volatility_regime >= 3).astype(float),
+        "log_volume": log_volume,
+        "log_volume_hour_effect": hour_effect.astype(float),
+        "log_volume_hour_residual": log_volume_hour_residual,
+        "volume_level_24h": volume_level_24h,
+        "volume_level_168h": volume_level_168h,
         "volume": volume.astype(float),
-        "hour_of_day": timestamp.dt.hour.to_numpy(dtype=float) if timestamp is not None else np.zeros(len(close), dtype=float),
-        "day_of_week": timestamp.dt.dayofweek.to_numpy(dtype=float) if timestamp is not None else np.zeros(len(close), dtype=float),
+        "calendar_features_present": np.asarray([timestamp is not None], dtype=bool),
     }
+    if hours is not None and days is not None:
+        features["hour_of_day"] = hours
+        features["day_of_week"] = days
+    return features
 
 
 def _feature_frame_fingerprint(frame: pd.DataFrame) -> str:
@@ -200,7 +270,12 @@ def _feature_frame_fingerprint(frame: pd.DataFrame) -> str:
 def _prepare_frame(frame: pd.DataFrame) -> pd.DataFrame:
     prepared = frame.copy()
     if "timestamp" in prepared.columns:
-        prepared["timestamp"] = pd.to_datetime(prepared["timestamp"], utc=True)
+        try:
+            prepared["timestamp"] = pd.to_datetime(prepared["timestamp"], utc=True)
+        except (TypeError, ValueError) as exc:
+            raise SyntheticValidationError("timestamp column contains invalid values") from exc
+        if prepared["timestamp"].isna().any():
+            raise SyntheticValidationError("timestamp column contains missing values")
         if not prepared["timestamp"].is_monotonic_increasing:
             prepared = prepared.sort_values("timestamp").reset_index(drop=True)
     return prepared
@@ -256,6 +331,84 @@ def _acf(values: np.ndarray, lag: int) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _rolling_std(values: np.ndarray, window: int) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(0, dtype=float)
+    series = pd.Series(values)
+    out = series.rolling(window=window, min_periods=2).std().bfill().fillna(0.0).to_numpy(dtype=float)
+    return out
+
+
+def _rolling_median(values: np.ndarray, window: int) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(0, dtype=float)
+    return pd.Series(values).rolling(window=window, min_periods=1).median().to_numpy(dtype=float)
+
+
+def _volatility_regimes(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return np.zeros(0, dtype=int)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return np.zeros(values.size, dtype=int)
+    q30, q75, q95 = np.quantile(finite, [0.30, 0.75, 0.95])
+    return np.digitize(values, [q30, q75, q95], right=True).astype(int)
+
+
+def _hour_effect(log_volume: np.ndarray, hours: np.ndarray | None) -> np.ndarray:
+    baseline = float(np.median(log_volume)) if log_volume.size else 0.0
+    out = np.zeros(24, dtype=float)
+    if hours is None:
+        return out
+    hour_int = hours.astype(int)
+    for hour in range(24):
+        mask = hour_int == hour
+        out[hour] = float(np.median(log_volume[mask]) - baseline) if mask.any() else 0.0
+    return out
+
+
+def _student_t_df_estimate(log_returns: np.ndarray) -> float:
+    returns = log_returns[np.isfinite(log_returns)]
+    if returns.size < 32:
+        return 5.0
+    centered = returns - np.median(returns)
+    robust = np.median(np.abs(centered)) / 0.67448975
+    if robust <= 0:
+        return 8.0
+    tail_ratio = float(np.quantile(np.abs(centered), 0.95) / robust)
+    if tail_ratio > 3.5:
+        return 3.5
+    if tail_ratio > 2.8:
+        return 5.0
+    return 8.0
+
+
+def _volume_coupling_params(features: dict[str, np.ndarray]) -> tuple[float, float]:
+    log_residual = np.asarray(features.get("log_volume_hour_residual", np.zeros(0)), dtype=float)
+    returns = np.abs(np.asarray(features.get("close_to_close_return", np.zeros(log_residual.size)), dtype=float))
+    ranges = np.asarray(features.get("rel_range", np.zeros(log_residual.size)), dtype=float)
+    n = min(log_residual.size, returns.size, ranges.size)
+    if n < 8:
+        return 0.08, 0.04
+    y = log_residual[:n] - float(np.median(log_residual[:n]))
+    x_abs = _standardize(returns[:n])
+    x_range = _standardize(ranges[:n])
+    design = np.column_stack([x_abs, x_range])
+    try:
+        beta, *_ = np.linalg.lstsq(design, y, rcond=None)
+    except np.linalg.LinAlgError:
+        return 0.08, 0.04
+    return float(np.clip(beta[0], -0.5, 0.5)), float(np.clip(beta[1], -0.5, 0.5))
+
+
+def _standardize(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    scale = float(np.std(values))
+    if scale <= 0:
+        return np.zeros_like(values, dtype=float)
+    return (values - float(np.median(values))) / scale
+
+
 def _normalize_group_key(key: object) -> tuple[object, ...]:
     raw = key if isinstance(key, tuple) else (key,)
     return tuple(None if pd.isna(value) else value for value in raw)
@@ -278,6 +431,8 @@ def _reject_multi_identity(frame: pd.DataFrame) -> None:
 
 __all__ = [
     "OhlcvCalibrationProfile",
+    "RegimeLabelConfig",
+    "RegimeState",
     "calibrate_ohlcv_params",
     "calibrate_many_ohlcv_params",
     "extract_ohlcv_features",

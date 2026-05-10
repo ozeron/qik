@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 import numpy as np
 
+from .errors import SyntheticValidationError
+
 
 def simulate_log_returns(
     n: int,
@@ -149,6 +151,136 @@ def stationary_bootstrap_indices(
             cursor = (cursor + 1) % source_n
         indices[idx] = cursor
     return indices
+
+
+def stationary_bootstrap_indices_by_time(
+    source_hours: np.ndarray,
+    target_hours: np.ndarray,
+    *,
+    source_days: np.ndarray | None = None,
+    target_days: np.ndarray | None = None,
+    mean_block_size: float = 48.0,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Return stationary-bootstrap indices whose restarts match target hour/day.
+
+    Continuing a block advances the source cursor to preserve local dependence.
+    On block restarts, the source row is chosen from matching day/hour rows when
+    possible, then matching-hour rows, then the full source history.
+    """
+
+    source_hours = np.asarray(source_hours, dtype=int)
+    target_hours = np.asarray(target_hours, dtype=int)
+    if source_hours.size <= 0:
+        raise ValueError("source_hours must be non-empty")
+    if target_hours.size <= 0:
+        return np.zeros(0, dtype=int)
+    source_n = int(source_hours.size)
+    if source_days is not None:
+        source_days = np.asarray(source_days, dtype=int)
+        if source_days.size != source_n:
+            raise ValueError("source_days must match source_hours length")
+    if target_days is not None:
+        target_days = np.asarray(target_days, dtype=int)
+        if target_days.size != target_hours.size:
+            raise ValueError("target_days must match target_hours length")
+
+    rng = np.random.default_rng(seed)
+    indices = np.empty(target_hours.size, dtype=int)
+    restart_probability = 1.0 / max(float(mean_block_size), 1.0)
+    by_hour = {hour: np.flatnonzero(source_hours == hour) for hour in range(24)}
+    by_day_hour: dict[tuple[int, int], np.ndarray] = {}
+    if source_days is not None:
+        for day in range(7):
+            for hour in range(24):
+                by_day_hour[(day, hour)] = np.flatnonzero((source_days == day) & (source_hours == hour))
+
+    def matching_cursor(idx: int, hour: int) -> int:
+        if source_days is not None and target_days is not None:
+            candidates = by_day_hour.get((int(target_days[idx]), int(hour)), np.array([], dtype=int))
+            bucket = f"day={int(target_days[idx])} hour={int(hour)}"
+        else:
+            candidates = by_hour.get(int(hour), np.array([], dtype=int))
+            bucket = f"hour={int(hour)}"
+        if candidates.size == 0:
+            raise SyntheticValidationError(
+                f"time-aligned bootstrap has no fitted rows for target {bucket}; "
+                "pass time_align_bootstrap=False to use unaligned stationary bootstrap"
+            )
+        return int(candidates[int(rng.integers(0, candidates.size))])
+
+    cursor = 0
+    for idx, hour in enumerate(target_hours):
+        if idx == 0 or rng.random() < restart_probability:
+            cursor = matching_cursor(idx, int(hour))
+        else:
+            next_cursor = (cursor + 1) % source_n
+            hour_matches = int(source_hours[next_cursor]) == int(hour)
+            day_matches = True
+            if source_days is not None and target_days is not None:
+                day_matches = int(source_days[next_cursor]) == int(target_days[idx])
+            cursor = next_cursor if hour_matches and day_matches else matching_cursor(idx, int(hour))
+        indices[idx] = cursor
+    return indices
+
+
+def bootstrap_feature_indices(
+    features: dict[str, np.ndarray],
+    output_n: int,
+    *,
+    params: dict | None = None,
+    mean_block_size: float = 48.0,
+    seed: int | None = None,
+) -> np.ndarray:
+    """Bootstrap feature rows, matching target timestamps when available."""
+
+    params = params or {}
+    target_timestamps = params.get("_timestamps")
+    if target_timestamps is not None and params.get("time_align_bootstrap", True):
+        if _calendar_features_present(features) is False:
+            return stationary_bootstrap_indices(
+                _feature_source_length(features),
+                output_n,
+                mean_block_size=float(params.get("bootstrap_mean_block_size", mean_block_size)),
+                seed=seed,
+            )
+        missing = [name for name in ("hour_of_day", "day_of_week") if name not in features]
+        if missing:
+            raise SyntheticValidationError(
+                "time-aligned feature sampling requires fitted feature columns: " + ", ".join(missing)
+            )
+        target_tuple = tuple(target_timestamps)
+        target_hours = np.fromiter((int(getattr(item, "hour")) for item in target_tuple), dtype=int, count=len(target_tuple))
+        target_days = np.fromiter((int(item.weekday()) for item in target_tuple), dtype=int, count=len(target_tuple))
+        return stationary_bootstrap_indices_by_time(
+            np.asarray(features["hour_of_day"], dtype=int),
+            target_hours,
+            source_days=np.asarray(features["day_of_week"], dtype=int),
+            target_days=target_days,
+            mean_block_size=float(params.get("bootstrap_mean_block_size", mean_block_size)),
+            seed=seed,
+        )
+    return stationary_bootstrap_indices(
+        _feature_source_length(features),
+        output_n,
+        mean_block_size=float(params.get("bootstrap_mean_block_size", mean_block_size)),
+        seed=seed,
+    )
+
+
+def _feature_source_length(features: dict[str, np.ndarray]) -> int:
+    for name in ("volume", "intrabar_return", "close_to_close_return"):
+        if name in features:
+            return len(features[name])
+    raise SyntheticValidationError("feature sampling requires at least one source-length feature array")
+
+
+def _calendar_features_present(features: dict[str, np.ndarray]) -> bool | None:
+    marker = features.get("calendar_features_present")
+    if marker is None:
+        return None
+    values = np.asarray(marker, dtype=bool)
+    return bool(values.size and values.ravel()[0])
 
 
 def bars_to_rows(

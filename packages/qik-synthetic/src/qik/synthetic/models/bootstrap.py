@@ -8,9 +8,9 @@ from typing import Any
 
 import numpy as np
 
-from ..calibration import OhlcvCalibrationProfile, extract_ohlcv_features, fit_ohlcv_profile
+from ..calibration import OhlcvCalibrationProfile, fit_ohlcv_profile
 from ..errors import SyntheticValidationError
-from ..kernels import build_ohlcv_from_features, stationary_bootstrap_indices
+from ..kernels import bootstrap_feature_indices, build_ohlcv_from_features, stationary_bootstrap_indices
 from ..types import SyntheticContext
 
 
@@ -84,12 +84,7 @@ class StationaryBootstrapModel:
         source_n = len(features["intrabar_return"])
         if source_n <= 0:
             raise SyntheticValidationError("stationary_bootstrap requires fitted OHLCV features")
-        indices = stationary_bootstrap_indices(
-            source_n,
-            n,
-            mean_block_size=float(params.get("bootstrap_mean_block_size", self._mean_block_size)),
-            seed=seed,
-        )
+        indices = _bootstrap_indices(features, n, params=params, mean_block_size=self._mean_block_size, seed=seed)
         return build_ohlcv_from_features(
             float(params["start_price"]),
             open_gap_returns=np.asarray(features["open_gap_return"])[indices],
@@ -105,3 +100,14 @@ class StationaryBootstrapModel:
         if not raw_features:
             raise SyntheticValidationError("stationary_bootstrap requires fitted features or model_params['ohlcv_features']")
         return {key: np.asarray(value) for key, value in raw_features.items()}
+
+
+def _bootstrap_indices(
+    features: dict[str, np.ndarray],
+    n: int,
+    *,
+    params: Mapping[str, Any],
+    mean_block_size: float,
+    seed: int | None,
+) -> np.ndarray:
+    return bootstrap_feature_indices(features, n, params=dict(params), mean_block_size=mean_block_size, seed=seed)

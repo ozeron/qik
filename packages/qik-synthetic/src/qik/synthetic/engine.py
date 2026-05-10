@@ -272,8 +272,20 @@ class SyntheticEngine:
         last_close = float(plan.request.start_price)
         for block_index, block_start in enumerate(range(0, plan.n_bars, _INTERNAL_BLOCK_SIZE)):
             block_n = min(_INTERNAL_BLOCK_SIZE, plan.n_bars - block_start)
+            timestamps = generate_timestamps(
+                timestamp_cursor,
+                plan.context.interval,
+                block_n,
+                trading_hours=plan.context.trading_hours,
+            )
             params = dict(plan.params)
             params["start_price"] = last_close
+            params["_timestamps"] = timestamps
+            params["_block_start"] = block_start
+            params["_block_index"] = block_index
+            params["_run_id"] = plan.run_id
+            params["_run_seed"] = self._run_seed(plan.request)
+            params["_request_seed"] = plan.request.seed
             ohlcv = self.model.simulate_batch(
                 plan.context,
                 block_n,
@@ -283,12 +295,6 @@ class SyntheticEngine:
             closes = ohlcv["close"]
             if closes.size != block_n:
                 raise SyntheticValidationError("model returned invalid block size")
-            timestamps = generate_timestamps(
-                timestamp_cursor,
-                plan.context.interval,
-                block_n,
-                trading_hours=plan.context.trading_hours,
-            )
             yield _OhlcvBlock(
                 block_index=block_index,
                 block_start=block_start,

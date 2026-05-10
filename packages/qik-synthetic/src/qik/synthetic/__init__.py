@@ -50,6 +50,7 @@ from .types import (
     as_request,
 )
 from .registry import list_models, resolve_model
+from .regimes import RegimeGenerationDiagnostics, RegimeLabelConfig, RegimeState
 
 __all__ = [
     "SyntheticEngine",
@@ -70,6 +71,9 @@ __all__ = [
     "fit_many_ohlcv_profiles",
     "extract_ohlcv_features",
     "OhlcvCalibrationProfile",
+    "RegimeLabelConfig",
+    "RegimeState",
+    "RegimeGenerationDiagnostics",
     "fingerprint_candle_table",
     "compare_ohlcv",
     "compare_ohlcv_by_identity",
