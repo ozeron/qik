@@ -42,8 +42,9 @@ from qik.synthetic.kernels import (
     stationary_bootstrap_indices_by_time,
 )
 
-ROOT = Path(__file__).resolve().parents[1]
-FIXTURE = ROOT / "tests" / "fixtures" / "synthetic" / "request_btc.json"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = PACKAGE_ROOT / "tests" / "fixtures" / "synthetic" / "request_btc.json"
+BENCHMARK = PACKAGE_ROOT / "benchmarks" / "evaluate_btc_1h_realism.py"
 
 
 def _load_fixture() -> dict:
@@ -1118,7 +1119,7 @@ def test_empirical_sv_fit_profile_preserves_scalar_params_without_request_params
 def test_realism_score_penalizes_worse_metric_values_monotonically():
     import importlib.util
 
-    path = ROOT / "packages" / "qik-synthetic" / "benchmarks" / "evaluate_btc_1h_realism.py"
+    path = BENCHMARK
     spec = importlib.util.spec_from_file_location("btc_realism_benchmark_score", path)
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)
@@ -1447,7 +1448,7 @@ def test_timestamp_free_profile_generation_uses_unaligned_feature_sampling():
 def test_realism_benchmark_skips_garch_without_arch(monkeypatch):
     import importlib.util
 
-    path = ROOT / "packages" / "qik-synthetic" / "benchmarks" / "evaluate_btc_1h_realism.py"
+    path = BENCHMARK
     spec = importlib.util.spec_from_file_location("btc_realism_benchmark", path)
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)
@@ -1798,7 +1799,7 @@ def test_regime_conditioned_non_calendar_generation_is_stable_across_internal_bl
 def test_realism_benchmark_routes_regime_model_through_profile_fit():
     import importlib.util
 
-    path = ROOT / "packages" / "qik-synthetic" / "benchmarks" / "evaluate_btc_1h_realism.py"
+    path = BENCHMARK
     spec = importlib.util.spec_from_file_location("btc_realism_benchmark_regime", path)
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)
@@ -1811,7 +1812,7 @@ def test_realism_benchmark_uses_reference_interval_for_generation(monkeypatch):
     import importlib.util
     from types import SimpleNamespace
 
-    path = ROOT / "packages" / "qik-synthetic" / "benchmarks" / "evaluate_btc_1h_realism.py"
+    path = BENCHMARK
     spec = importlib.util.spec_from_file_location("btc_realism_benchmark_interval_request", path)
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)
@@ -1854,7 +1855,7 @@ def test_realism_benchmark_uses_reference_interval_for_generation(monkeypatch):
 def test_realism_benchmark_interval_loader_can_skip_unavailable_cache(tmp_path):
     import importlib.util
 
-    path = ROOT / "packages" / "qik-synthetic" / "benchmarks" / "evaluate_btc_1h_realism.py"
+    path = BENCHMARK
     spec = importlib.util.spec_from_file_location("btc_realism_benchmark_intervals", path)
     benchmark = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(benchmark)

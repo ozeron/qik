@@ -19,7 +19,7 @@ monorepo.
 2. Run through `SyntheticEngine` (`generate` or `iter_generate`).
 3. Convert with `to_backtesting_payload` only when identity is required.
 4. Keep fixtures and payload templates outside package source under
-   `tests/fixtures`.
+   `packages/qik-synthetic/tests/fixtures`.
 
 ## Compatibility and external integrations
 
@@ -233,7 +233,7 @@ Implemented next-step realism changes:
 Verification command:
 
 ```bash
-uv run --with pytest pytest tests/test_qik_synthetic.py -q
+uv run --with pytest pytest packages/qik-synthetic/tests/test_qik_synthetic.py -q
 ```
 
 Result:
