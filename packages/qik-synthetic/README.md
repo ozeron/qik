@@ -37,6 +37,30 @@ The BTC default provider resolves to:
 SPY defaults resolve to:
 - `symbol="SPY"`, `venue="alpaca"`, `dataset="stock_bars"`, `trading_hours="equity_sessions"`
 
+Model recommendations
+---------------------
+
+Use synthetic BTC candles as robustness tests, not as extra truth. Fit realism
+models on a training window, select on validation, and keep a sealed real test
+window for reporting.
+
+Current BTCUSDT 1h recommendation:
+
+| Use case | Model | Recommendation | Why |
+| --- | --- | --- | --- |
+| Default calibrated realism | `recommended_realism` / `realistic_btc_1h` / `student_t_rw` | Use first | Best validation-selected score in the current BTCUSDT 1h benchmark; strongest robust volatility and candle-range behavior among the calibrated defaults. |
+| Dependent-return baseline | `stationary_bootstrap` | Compare against it | Preserves local historical dependence better than independent random walks, but can replay unstable raw volatility and should not be the only robustness test. |
+| Experimental regime robustness | `regime_conditioned_bootstrap` | Keep, but do not make default yet | The wide sweep found `calendar_conditioning=false` with `2d` blocks as the best candidate, including strong report-only test behavior, but validation still lags `student_t_rw` and trend/drawdown labels are not yet influencing paths enough. |
+| Optional econometric baseline | `garch` | Keep as a comparison | Useful when `qik-synthetic[models]` is installed, but it was not the closest BTCUSDT 1h model on validation. |
+| Smoke tests and adapters | `gaussian_rw`, `ar1` | Use for speed/contract checks | Fast and deterministic, but they miss important tail, dependence, and volume behavior. |
+| Early coupled SV research | `empirical_sv` | Keep experimental | Improves some coupling metrics, but current return distribution quality is not good enough for default use. |
+
+Do not drop `regime_conditioned_bootstrap` yet. It is not the recommended
+default, but it is useful as a robustness generator and diagnostics surface. The
+next research target is to coarsen calendar/regime buckets and sample explicit
+segments so trend, drawdown, and volume states affect path continuity more
+directly.
+
 Streaming and horizons
 ----------------------
 
