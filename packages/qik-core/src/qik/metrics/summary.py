@@ -295,7 +295,10 @@ def summarize_equity_curve(
         return _empty_summary()
     mdd = max_drawdown_from_equity(eq)
     n = len(rets)
-    years = max(n / periods_per_year, 1e-9)
+    if isinstance(eq.index, pd.DatetimeIndex):
+        years = window_years(eq.index[0].date(), eq.index[-1].date())
+    else:  # no calendar: fall back to the bar count
+        years = max(n / periods_per_year, 1e-9)
     cagr = cagr_from_equity(float(eq.iloc[0]), float(eq.iloc[-1]), years=years)
     sharpe = ann_sharpe(rets, periods_per_year=periods_per_year)
     sortino = ann_sortino(rets, periods_per_year=periods_per_year)

@@ -126,47 +126,51 @@ def max_drawdown_from_pnl(
     *,
     initial_capital: float,
 ) -> tuple[float, float]:
-    """Max drawdown in dollars and fraction from a PnL stream (trade or daily)."""
+    """Max drawdown in dollars and fraction (both ≤ 0) from a PnL stream.
+
+    The running peak starts at ``initial_capital`` (PnL 0), so an opening losing
+    streak counts as drawdown.
+    """
 
     if pnl.empty:
         return 0.0, 0.0
     equity = float(initial_capital) + pnl.astype(float).cumsum()
-    peak = equity.cummax()
+    peak = equity.cummax().clip(lower=float(initial_capital))
     dd_usd = equity - peak
     dd_pct = equity / peak - 1.0
-    return float(dd_usd.min()) if len(dd_usd) else 0.0, float(dd_pct.min()) if len(dd_pct) else 0.0
+    return float(dd_usd.min()), float(dd_pct.min())
 
 
-def max_drawdown_usd(
-    pnl: pd.Series | np.ndarray | Sequence[float],
-    *,
-    start_at_zero: bool = False,
-) -> float:
+def max_drawdown_usd(pnl: pd.Series | np.ndarray | Sequence[float]) -> float:
     """Max drawdown (≤ 0, dollars) of cumulative PnL with no capital base.
 
-    ``start_at_zero=False``: the peak starts at the first cumulative value, so an
-    opening losing streak is not a drawdown (same as :func:`max_drawdown_from_pnl`).
-    ``start_at_zero=True``: a 0 is prepended, so an opening losing streak counts.
-    Reports that show a positive magnitude use ``abs(max_drawdown_usd(...))``.
+    The running peak starts at 0, so an opening losing streak counts. Drawdown is
+    reported negative; never ``abs()`` it in a report.
     """
 
-    cum = pd.Series(np.asarray(pnl, dtype=float)).cumsum()
-    if cum.empty:
+    cum = np.cumsum(np.asarray(pnl, dtype=float))
+    if cum.size == 0:
         return 0.0
-    if start_at_zero:
-        cum = pd.concat([pd.Series([0.0]), cum], ignore_index=True)
-    return float((cum - cum.cummax()).min())
+    peak = np.maximum.accumulate(np.maximum(cum, 0.0))
+    return float(min((cum - peak).min(), 0.0))
 
 
-def max_drawdown_from_equity(equity: pd.Series) -> float:
-    """Max fractional drawdown from an equity level series."""
+def max_drawdown_from_equity(equity: pd.Series, *, initial: float | None = None) -> float:
+    """Max fractional drawdown (≤ 0) from an equity level series.
+
+    The running peak starts at ``initial`` when given (e.g. ``1.0`` for a
+    ``(1 + r).cumprod()`` curve whose first point is already after one return),
+    otherwise at the first equity value.
+    """
 
     eq = equity.dropna().astype(float)
     if eq.empty:
         return 0.0
     peak = eq.cummax()
+    if initial is not None:
+        peak = peak.clip(lower=float(initial))
     dd = eq / peak - 1.0
-    return float(dd.min()) if len(dd) else 0.0
+    return float(min(dd.min(), 0.0))
 
 
 def cagr_from_equity(
@@ -183,7 +187,7 @@ def cagr_from_equity(
 
 
 def window_years(date_from: date, date_to: date) -> float:
-    """Inclusive calendar span in years (365.25 day year)."""
+    """CAGR year count: calendar days between the dates / 365.25."""
 
     return max((pd.Timestamp(date_to) - pd.Timestamp(date_from)).days / 365.25, 1e-9)
 

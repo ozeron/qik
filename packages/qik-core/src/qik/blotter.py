@@ -29,7 +29,7 @@ BLOTTER_COLUMNS = (
     "mae_usd",
 )
 
-# Legacy producers (projects/*) name the date and pnl columns differently. Order is
+# Legacy producers name the date and pnl columns differently. Order is
 # the match priority and is frozen: changing it changes which column a blotter uses.
 DATE_CANDIDATES = ("trade_date", "session_date", "date", "exit_date")
 PNL_CANDIDATES = (
