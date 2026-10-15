@@ -3,6 +3,7 @@ name = "qik-core"
 version = "0.1.0"
 description = "Quant Infrastructure Kit core: strategy metrics, blotter contract, research reports."
 authors = [{ name = "Alex Lapchenko", email = "ozeron@me.com" }]
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=19"]  # pyarrow: qik.runs writes parquet
 
