@@ -1,0 +1,18 @@
+[project]
+name = "qik-core"
+version = "0.1.0"
+description = "Quant Infrastructure Kit core: strategy metrics, blotter contract, research reports."
+authors = [{ name = "Alex Lapchenko", email = "ozeron@me.com" }]
+requires-python = ">=3.13"
+dependencies = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=19"]  # pyarrow: qik.runs writes parquet
+
+[project.optional-dependencies]
+reports = ["quantstats>=0.0.81", "matplotlib>=3.8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# `qik` is a namespace package shared with qik-synthetic: no qik/__init__.py.
+packages = ["src/qik"]

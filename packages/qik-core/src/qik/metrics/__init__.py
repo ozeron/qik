@@ -1,0 +1,78 @@
+"""Shared strategy metrics: return grids, blotter stats, labelled Sharpe/CAGR."""
+
+from qik.metrics.returns import (
+    ReturnGrid,
+    active_day_returns,
+    build_returns,
+    calendar_returns,
+    eligible_sessions_from_frame,
+    equity_curve_returns,
+    session_pnl,
+    session_returns,
+    to_session_index,
+)
+from qik.metrics.risk import (
+    DEFAULT_PERIODS_PER_YEAR,
+    ann_sharpe,
+    ann_sortino,
+    ann_vol,
+    cagr_from_equity,
+    calmar,
+    carver_tail_ratios,
+    max_drawdown_from_equity,
+    max_drawdown_from_pnl,
+    max_drawdown_usd,
+    return_shape_stats,
+    return_skew,
+    window_years,
+)
+from qik.metrics.schema import TradeColumns, resolve_col
+from qik.metrics.summary import (
+    StrategySummary,
+    summarize_equity_curve,
+    summarize_trades,
+    summarize_window,
+)
+from qik.metrics.trade_stats import (
+    expectancy,
+    gross_profit_loss,
+    profit_factor,
+    trade_blotter_stats,
+    win_rate,
+)
+
+__all__ = [
+    "DEFAULT_PERIODS_PER_YEAR",
+    "ReturnGrid",
+    "StrategySummary",
+    "TradeColumns",
+    "active_day_returns",
+    "ann_sharpe",
+    "ann_sortino",
+    "build_returns",
+    "calendar_returns",
+    "ann_vol",
+    "calmar",
+    "carver_tail_ratios",
+    "cagr_from_equity",
+    "eligible_sessions_from_frame",
+    "equity_curve_returns",
+    "expectancy",
+    "gross_profit_loss",
+    "max_drawdown_from_equity",
+    "max_drawdown_from_pnl",
+    "max_drawdown_usd",
+    "profit_factor",
+    "resolve_col",
+    "return_shape_stats",
+    "return_skew",
+    "session_pnl",
+    "session_returns",
+    "summarize_equity_curve",
+    "summarize_trades",
+    "summarize_window",
+    "to_session_index",
+    "trade_blotter_stats",
+    "win_rate",
+    "window_years",
+]
