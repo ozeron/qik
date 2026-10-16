@@ -13,6 +13,7 @@ from qik.metrics.returns import (
 )
 from qik.metrics.risk import (
     DEFAULT_PERIODS_PER_YEAR,
+    MIN_TRADES_FOR_SHARPE,
     ann_sharpe,
     ann_sortino,
     ann_vol,
@@ -22,6 +23,7 @@ from qik.metrics.risk import (
     max_drawdown_from_equity,
     max_drawdown_from_pnl,
     max_drawdown_usd,
+    reportable_sharpe,
     return_shape_stats,
     return_skew,
     window_years,
@@ -43,6 +45,7 @@ from qik.metrics.trade_stats import (
 
 __all__ = [
     "DEFAULT_PERIODS_PER_YEAR",
+    "MIN_TRADES_FOR_SHARPE",
     "ReturnGrid",
     "StrategySummary",
     "TradeColumns",
@@ -63,6 +66,7 @@ __all__ = [
     "max_drawdown_from_pnl",
     "max_drawdown_usd",
     "profit_factor",
+    "reportable_sharpe",
     "resolve_col",
     "return_shape_stats",
     "return_skew",

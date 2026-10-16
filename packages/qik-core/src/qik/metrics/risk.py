@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_PERIODS_PER_YEAR = 252.0
+# Below this many trades a headline Sharpe is noise: cards/tables show it blank, run records keep
+# the raw ``sharpe_ann`` (see ``reportable_sharpe``).
+MIN_TRADES_FOR_SHARPE = 30
 
 # Carver AFTS: inv_cdf(0.99) / inv_cdf(0.70) ≈ inv_cdf(0.01) / inv_cdf(0.30).
 _CARVER_TAIL_REF = 4.4395
@@ -35,6 +38,18 @@ def ann_sharpe(
     if sig <= 0.0:
         return float("nan")
     return (mu / sig) * float(np.sqrt(periods_per_year))
+
+
+def reportable_sharpe(sharpe: float | None, n_trades: int | None) -> float | None:
+    """``sharpe`` for a headline (project card / table), ``None`` below ``MIN_TRADES_FOR_SHARPE``.
+
+    ``n_trades=None`` (equity-only engines) means unknown and keeps the value; NaN becomes None.
+    """
+    if sharpe is None or not np.isfinite(sharpe):
+        return None
+    if n_trades is not None and n_trades < MIN_TRADES_FOR_SHARPE:
+        return None
+    return float(sharpe)
 
 
 def ann_vol(
@@ -204,6 +219,7 @@ def calmar(cagr: float, max_drawdown: float) -> float:
 
 __all__ = [
     "DEFAULT_PERIODS_PER_YEAR",
+    "MIN_TRADES_FOR_SHARPE",
     "ann_sharpe",
     "ann_sortino",
     "ann_vol",
@@ -213,6 +229,7 @@ __all__ = [
     "max_drawdown_from_equity",
     "max_drawdown_from_pnl",
     "max_drawdown_usd",
+    "reportable_sharpe",
     "return_shape_stats",
     "return_skew",
     "window_years",
