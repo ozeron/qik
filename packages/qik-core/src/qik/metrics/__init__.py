@@ -1,5 +1,6 @@
 """Shared strategy metrics: return grids, blotter stats, labelled Sharpe/CAGR."""
 
+from qik.metrics.overfitting import PBOResult, pbo
 from qik.metrics.returns import (
     ReturnGrid,
     active_day_returns,
@@ -47,6 +48,7 @@ from qik.metrics.trade_stats import (
 __all__ = [
     "DEFAULT_PERIODS_PER_YEAR",
     "MIN_TRADES_FOR_SHARPE",
+    "PBOResult",
     "ReturnGrid",
     "StrategySummary",
     "TradeColumns",
@@ -67,6 +69,7 @@ __all__ = [
     "max_drawdown_from_equity",
     "max_drawdown_from_pnl",
     "max_drawdown_usd",
+    "pbo",
     "profit_factor",
     "reportable_sharpe",
     "resolve_col",
