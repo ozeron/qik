@@ -31,6 +31,10 @@ class PBOResult:
     )
 
 
+def _all_midnight(stamps: np.ndarray) -> bool:
+    return bool(np.array_equal(stamps, stamps.astype("datetime64[D]").astype(stamps.dtype)))
+
+
 def pbo(
     daily_pnl: pd.DataFrame,
     *,
@@ -83,7 +87,7 @@ def pbo(
         or dates.hasnans
         or not dates.is_unique
         or not dates.is_monotonic_increasing
-        or not dates.equals(dates.normalize())
+        or not _all_midnight(dates.to_numpy())
     ):
         raise ValueError("index must contain sorted unique timezone-naive midnight dates")
     if len(daily_pnl) < 2 * n_blocks or daily_pnl.shape[1] < 2:
