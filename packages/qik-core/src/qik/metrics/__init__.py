@@ -29,6 +29,7 @@ from qik.metrics.risk import (
     window_years,
 )
 from qik.metrics.schema import TradeColumns, resolve_col
+from qik.metrics.significance import deflated_sharpe
 from qik.metrics.summary import (
     StrategySummary,
     summarize_equity_curve,
@@ -58,6 +59,7 @@ __all__ = [
     "calmar",
     "carver_tail_ratios",
     "cagr_from_equity",
+    "deflated_sharpe",
     "eligible_sessions_from_frame",
     "equity_curve_returns",
     "expectancy",
