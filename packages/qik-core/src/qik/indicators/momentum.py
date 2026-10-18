@@ -10,7 +10,7 @@ import pandas as pd
 from qik.indicators.moving_average import Seed, _check_length, rma
 
 RsiSmoothing = Literal["wilder", "sma"]
-ZeroLoss = Literal["guard", "nan"]
+ZeroLoss = Literal["guard", "nan", "gain_only"]
 FirstDiff = Literal["skip", "zero"]
 
 
@@ -54,9 +54,10 @@ def rsi(
         raise ValueError(f"unknown smoothing: {smoothing!r}")
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     out = 100.0 - (100.0 / (1.0 + rs))
-    if zero_loss == "guard":
+    if zero_loss in ("guard", "gain_only"):
         out = out.where(~((avg_loss == 0.0) & (avg_gain > 0.0)), 100.0)
-        out = out.where(~((avg_loss == 0.0) & (avg_gain == 0.0)), 50.0)
+        if zero_loss == "guard":
+            out = out.where(~((avg_loss == 0.0) & (avg_gain == 0.0)), 50.0)
     elif zero_loss != "nan":
         raise ValueError(f"unknown zero_loss: {zero_loss!r}")
     return out

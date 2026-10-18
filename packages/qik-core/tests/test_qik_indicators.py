@@ -15,6 +15,64 @@ import pandas as pd
 import pytest
 
 import qik.indicators as qi
+from qik.indicators import arrays
+
+
+def test_array_rsi_seeds_on_n_actual_changes_and_preserves_flat_policy() -> None:
+    close = np.array([100.0, 101.0, 103.0, 102.0, 102.0, 105.0])
+    np.testing.assert_array_equal(
+        arrays.rsi(close, 2),
+        [np.nan, np.nan, 100.0, 60.0, 60.0, 93.10344827586206],
+    )
+    assert np.isnan(arrays.rsi(np.ones(20), 14)[13])
+    assert arrays.rsi(np.ones(20), 14)[14] == 50.0
+    assert arrays.rsi(np.ones(20), 14, flat=100.0)[14] == 100.0
+
+
+def test_array_rsi_missing_delta_policy_is_explicit() -> None:
+    close = np.array([1.0, 1.0, np.nan, 2.0, 3.0])
+    assert np.isnan(arrays.rsi(close, 2)[2:]).all()
+    np.testing.assert_array_equal(
+        arrays.rsi(close, 2, flat=100.0, missing="zero"),
+        [np.nan, np.nan, 100.0, 100.0, 100.0],
+    )
+
+
+def test_array_rsi_promotes_the_sma_seed_before_division() -> None:
+    close = np.array([4.0, 5.0, 3.0, 6.0], dtype=np.float32)
+    assert arrays.rsi(close, 2)[2] == 33.33333333333333
+    close = np.cumsum(np.random.default_rng(1).normal(size=256)).astype(np.float32)
+    assert arrays.rsi(close, 14)[15] == 60.64146423339844
+
+
+def test_array_atr_keeps_native_true_range_and_seed_precision() -> None:
+    high = np.array([100000000.0, 1.0], dtype=np.float32)
+    low = np.array([99999984.0, 0.0], dtype=np.float32)
+    close = np.array([100000000.0, 1.0], dtype=np.float32)
+    assert arrays.atr(high, low, close, 2)[1] == 50000008.0
+
+
+def test_array_true_range_preserves_nan_and_session_resets() -> None:
+    h = np.array([12.0, 23.0, np.nan, 16.0])
+    l = np.array([10.0, 20.0, 14.0, 14.0])
+    c = np.array([11.0, 21.0, 15.0, 15.0])
+    np.testing.assert_array_equal(arrays.true_range(h, l, c), [2.0, 12.0, np.nan, 2.0])
+    np.testing.assert_array_equal(
+        arrays.true_range(h, l, c, session_start=np.array([True, True, False, False])),
+        [2.0, 3.0, np.nan, 2.0],
+    )
+
+
+def test_array_ema_uses_increment_recurrence() -> None:
+    np.testing.assert_array_equal(
+        arrays.ema(np.array([1.0, 3.0, 8.0, 2.0]), 2),
+        [np.nan, 2.0, 6.0, 3.3333333333333335],
+    )
+
+
+def test_rsi_gain_only_zero_loss_policy() -> None:
+    assert qi.rsi(pd.Series(np.ones(20)), 2, zero_loss="gain_only").isna().all()
+    assert qi.rsi(pd.Series(np.arange(20.0)), 2, zero_loss="gain_only").iloc[-1] == 100.0
 
 
 def _walk(n: int = 300, seed: int = 7) -> pd.DataFrame:

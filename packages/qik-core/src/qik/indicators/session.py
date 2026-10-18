@@ -40,6 +40,11 @@ def vwap_price(
     raise ValueError(f"unknown price: {price!r}")
 
 
+def weighted_price(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series) -> float:
+    """Final HLC3 VWAP of a window, using pandas' reduction order."""
+    return float((vwap_price(high, low, close) * volume).sum() / volume.sum())
+
+
 def session_vwap(
     high: pd.Series,
     low: pd.Series,

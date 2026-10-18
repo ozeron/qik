@@ -2,25 +2,40 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 
 from qik.metrics.schema import TradeColumns
 
 
-def profit_factor(pnl: pd.Series) -> float:
-    """Gross wins / |gross losses|; inf if wins>0 and no losses; nan if empty."""
+def profit_factor(
+    pnl: pd.Series | np.ndarray,
+    *,
+    zero_loss: Literal["nan", "inf"] = "nan",
+    division: Literal["float", "native"] = "float",
+) -> float:
+    """Gross wins / |gross losses|; inf if wins>0 and no losses.
 
-    if pnl.empty:
-        return float("nan")
+    Empty or all-zero input returns nan, or inf when ``zero_loss="inf"``.
+    """
+
+    if zero_loss not in ("nan", "inf"):
+        raise ValueError(f"unknown zero_loss: {zero_loss!r}")
+    if division not in ("float", "native"):
+        raise ValueError(f"unknown division: {division!r}")
+    if len(pnl) == 0:
+        return float("inf") if zero_loss == "inf" else float("nan")
     wins = pnl[pnl > 0.0]
     losses = pnl[pnl < 0.0]
-    gross_profit = float(wins.sum()) if len(wins) else 0.0
-    gross_loss = float(losses.sum()) if len(losses) else 0.0
+    gross_profit = wins.sum()
+    gross_loss = losses.sum()
+    if division == "float":
+        gross_profit, gross_loss = float(gross_profit), float(gross_loss)
     if gross_loss < 0.0:
-        return gross_profit / abs(gross_loss)
-    if gross_profit > 0.0:
+        return float(gross_profit / abs(gross_loss))
+    if gross_profit > 0.0 or zero_loss == "inf":
         return float("inf")
     return float("nan")
 

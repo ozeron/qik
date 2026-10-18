@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from datetime import date
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -18,11 +20,12 @@ _CARVER_TAIL_REF = 4.4395
 
 
 def ann_sharpe(
-    returns: pd.Series,
+    returns: pd.Series | np.ndarray,
     *,
     periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
     rf: float = 0.0,
     ddof: int = 1,
+    zero_vol: Literal["nan", "propagate"] = "nan",
 ) -> float:
     """Annualized Sharpe from a return (or PnL) series.
 
@@ -30,13 +33,30 @@ def ann_sharpe(
     project reports use — pass it explicitly so the definition stays visible.
     """
 
+    if zero_vol not in ("nan", "propagate"):
+        raise ValueError(f"unknown zero_vol: {zero_vol!r}")
+    if isinstance(returns, np.ndarray):
+        if len(returns) < 2:
+            return float("nan")
+        excess_array = np.asarray(returns, float)
+        if rf:
+            excess_array = excess_array - float(rf) / float(periods_per_year)
+        mu_array = excess_array.mean()
+        sig_array = excess_array.std(ddof=ddof)
+        if sig_array <= 0.0 and zero_vol == "nan":
+            return float("nan")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return float(mu_array / sig_array * math.sqrt(periods_per_year))
     if len(returns) < 2:
         return float("nan")
     excess = returns.astype(float) - float(rf) / float(periods_per_year)
     mu = float(excess.mean())
     sig = float(excess.std(ddof=ddof))
-    if sig <= 0.0:
+    if sig <= 0.0 and zero_vol == "nan":
         return float("nan")
+    if sig == 0.0:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return float(np.divide(mu, sig) * np.sqrt(periods_per_year))
     return (mu / sig) * float(np.sqrt(periods_per_year))
 
 
@@ -156,21 +176,33 @@ def max_drawdown_from_pnl(
     return float(dd_usd.min()), float(dd_pct.min())
 
 
-def max_drawdown_usd(pnl: pd.Series | np.ndarray | Sequence[float]) -> float:
+def max_drawdown_usd(
+    pnl: pd.Series | np.ndarray | Sequence[float],
+    *,
+    accumulation: Literal["float", "native"] = "float",
+) -> float:
     """Max drawdown (≤ 0, dollars) of cumulative PnL with no capital base.
 
     The running peak starts at 0, so an opening losing streak counts. Drawdown is
     reported negative; never ``abs()`` it in a report.
     """
 
-    cum = np.cumsum(np.asarray(pnl, dtype=float))
+    if accumulation not in ("float", "native"):
+        raise ValueError(f"unknown accumulation: {accumulation!r}")
+    values = np.asarray(pnl) if accumulation == "native" else np.asarray(pnl, dtype=float)
+    cum = np.cumsum(values).astype(float)
     if cum.size == 0:
         return 0.0
     peak = np.maximum.accumulate(np.maximum(cum, 0.0))
     return float(min((cum - peak).min(), 0.0))
 
 
-def max_drawdown_from_equity(equity: pd.Series, *, initial: float | None = None) -> float:
+def max_drawdown_from_equity(
+    equity: pd.Series | np.ndarray,
+    *,
+    initial: float | None = None,
+    arithmetic: Literal["ratio", "difference"] = "ratio",
+) -> float:
     """Max fractional drawdown (≤ 0) from an equity level series.
 
     The running peak starts at ``initial`` when given (e.g. ``1.0`` for a
@@ -178,13 +210,28 @@ def max_drawdown_from_equity(equity: pd.Series, *, initial: float | None = None)
     otherwise at the first equity value.
     """
 
+    if arithmetic not in ("ratio", "difference"):
+        raise ValueError(f"unknown arithmetic: {arithmetic!r}")
+    if isinstance(equity, np.ndarray):
+        eq_array = np.asarray(equity, float)
+        if initial is not None:
+            eq_array = np.r_[initial, eq_array]
+        if len(eq_array) == 0:
+            return 0.0
+        peak_array = np.maximum.accumulate(eq_array)
+        dd_array = (
+            (eq_array - peak_array) / peak_array
+            if arithmetic == "difference"
+            else eq_array / peak_array - 1.0
+        )
+        return float(dd_array.min())
     eq = equity.dropna().astype(float)
     if eq.empty:
         return 0.0
     peak = eq.cummax()
     if initial is not None:
         peak = peak.clip(lower=float(initial))
-    dd = eq / peak - 1.0
+    dd = (eq - peak) / peak if arithmetic == "difference" else eq / peak - 1.0
     return float(min(dd.min(), 0.0))
 
 
