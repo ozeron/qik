@@ -11,14 +11,23 @@ The path is ``$QIK_TRIAL_LOG`` when set, else ``results/trial_log.jsonl`` under 
 
 from __future__ import annotations
 
-import json
 import os
+import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from qik.runs import params_hash
+from qik.trial_storage import (
+    ParameterStore,
+    append_record,
+    compact_enabled,
+    dump_row,
+    external_path,
+    iter_trials,
+)
 
 TRIAL_LOG_ENV = "QIK_TRIAL_LOG"
 
@@ -49,8 +58,12 @@ def log_trial(
     }
     p = trial_log_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as fh:
-        fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+    compact = compact_enabled(p)
+    if compact:  # objects first and durable; the invocation line is what makes them count
+        row["params_ref"] = ParameterStore(p).put(params)
+        del row["params"]
+    # Exclusive flock; the compact partial-tail check is atomic with this append.
+    append_record(p, dump_row(row), strict=compact)
     return h
 
 
@@ -64,15 +77,17 @@ def count_trials(
     path: str | Path | None = None, *, project: str | None = None, stage: str | None = None
 ) -> TrialCount:
     p = trial_log_path(path)
-    if not p.exists():
+    if not p.exists() and not external_path(p).exists():
         return TrialCount(0, 0)
-    calls, hashes = 0, set()
-    for line in p.read_text().splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        if (project and row["project"] != project) or (stage and row["stage"] != stage):
-            continue
-        calls += 1
-        hashes.add(row["params_hash"])
-    return TrialCount(calls, len(hashes))
+    calls = 0
+    # Exact union, bounded RAM even for exhaustive windowed validation logs.
+    with tempfile.TemporaryDirectory(prefix="qik-trial-count-") as folder:
+        with sqlite3.connect(str(Path(folder) / "identities.sqlite")) as db:
+            db.execute("CREATE TABLE identities (hash TEXT PRIMARY KEY) WITHOUT ROWID")
+            for row in iter_trials(p):
+                if (project and row["project"] != project) or (stage and row["stage"] != stage):
+                    continue
+                calls += 1
+                db.execute("INSERT OR IGNORE INTO identities VALUES (?)", (row["params_hash"],))
+            unique = db.execute("SELECT count(*) FROM identities").fetchone()[0]
+    return TrialCount(calls, unique)

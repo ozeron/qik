@@ -23,6 +23,25 @@ def test_missing_log_is_zero(tmp_path: Path) -> None:
     assert count_trials(tmp_path / "none.jsonl").calls == 0
 
 
+def test_counts_stream_without_materializing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "stream.jsonl"
+    log_trial({"a": 1}, {}, project="P", stage="s", path=log)
+    with log.open("a") as stream:
+        stream.write("\n")
+    log_trial({"a": 1}, {}, project="P", stage="s", path=log)
+    original = log.read_bytes()
+
+    def forbidden(*args: object, **kwargs: object) -> str:
+        raise AssertionError("trial counting must stream")
+
+    monkeypatch.setattr(Path, "read_text", forbidden)
+    assert count_trials(log).calls == 2
+    assert count_trials(log).unique == 1
+    assert log.read_bytes() == original
+
+
 def test_env_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(TRIAL_LOG_ENV, str(tmp_path / "env.jsonl"))
     assert trial_log_path() == tmp_path / "env.jsonl"
