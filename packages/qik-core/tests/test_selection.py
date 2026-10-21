@@ -10,6 +10,7 @@ import pytest
 
 from qik.metrics import DEFAULT_PERIODS_PER_YEAR, deflated_sharpe
 from qik.selection import (
+    NEffParticipation,
     deflated_sharpe_from_returns,
     dsr_inputs,
     n_eff_mean_corr,
@@ -138,33 +139,39 @@ def _paths(seed: int = 3) -> np.ndarray:
     return np.random.default_rng(seed).normal(0, 1, (400, 6))
 
 
+def _pr(x: object, **kw: object) -> NEffParticipation:
+    """``n_eff_participation`` with the drop policies spelled out (they are required keywords)."""
+    kw = {"constant": "drop", "nonfinite": "drop"} | kw
+    return n_eff_participation(x, **kw)  # type: ignore[arg-type]
+
+
 def test_participation_extremes() -> None:
     one = np.random.default_rng(0).normal(0, 1, 200)
     same = np.column_stack([one, one * 2.0, one + 5.0])
-    assert n_eff_participation(same).n_eff == pytest.approx(1.0, abs=1e-9)
+    assert _pr(same).n_eff == pytest.approx(1.0, abs=1e-9)
     big = np.random.default_rng(1).normal(0, 1, (20000, 4))
-    assert n_eff_participation(big).n_eff == pytest.approx(4.0, rel=2e-2)
+    assert _pr(big).n_eff == pytest.approx(4.0, rel=2e-2)
 
 
 def test_participation_constant_and_nonfinite_columns() -> None:
     x = _paths()
-    base = n_eff_participation(x)
+    base = _pr(x)
     withbad = np.column_stack([x, np.zeros(len(x)), np.full(len(x), np.nan)])
-    got = n_eff_participation(withbad)
+    got = _pr(withbad)
     assert got.n_eff == base.n_eff
     assert (got.n_columns, got.n_dropped) == (6, 2)
     assert len(got.eigenvalues) == 6
     assert list(got.eigenvalues) == sorted(got.eigenvalues, reverse=True)
     with pytest.raises(ValueError, match="constant"):
-        n_eff_participation(withbad, constant="raise")
+        _pr(withbad, constant="raise")
 
 
 def test_participation_keep_nonfinite_needs_nan_corr_zero() -> None:
     x = _paths()
     x[3, 0] = np.nan
     with pytest.raises(ValueError, match="not finite"):
-        n_eff_participation(x, nonfinite="keep")
-    got = n_eff_participation(x, nonfinite="keep", nan_corr="zero")
+        _pr(x, nonfinite="keep")
+    got = _pr(x, nonfinite="keep", nan_corr="zero")
     assert got.n_columns == 6
     assert got.n_dropped == 0
 
@@ -172,12 +179,55 @@ def test_participation_keep_nonfinite_needs_nan_corr_zero() -> None:
 def test_participation_min_columns() -> None:
     x = _paths()[:, :1]
     with pytest.raises(ValueError, match="at least 2"):
-        n_eff_participation(x)
-    assert n_eff_participation(x, min_columns=1).n_eff == 1.0
+        _pr(x)
+    assert _pr(x, min_columns=1).n_eff == 1.0
     z = np.zeros((10, 3))
-    assert n_eff_participation(z, min_columns=0).n_eff == 0.0
+    assert _pr(z, min_columns=0).n_eff == 0.0
     with pytest.raises(ValueError, match="2-D"):
-        n_eff_participation(np.zeros(5))
+        _pr(np.zeros(5))
+
+
+def test_participation_policies_are_required() -> None:
+    """Dropping NaN/inf paths lowers N_eff (laxer DSR): the caller must say so."""
+    x = _paths()
+    with pytest.raises(TypeError):
+        n_eff_participation(x)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        n_eff_participation(x, constant="drop")  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        n_eff_participation(x, nonfinite="drop")  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="nonfinite must be"):
+        n_eff_participation(x, constant="drop", nonfinite="skip")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="constant must be"):
+        n_eff_participation(x, constant="skip", nonfinite="drop")  # type: ignore[arg-type]
+    # the silent-drop reproducer: a NaN-poisoned path set reads lower than the clean one under 'drop'
+    p = pd.DataFrame(np.random.default_rng(0).normal(size=(200, 10)))
+    q = p.copy()
+    q.iloc[3, 4:] = np.nan
+    assert _pr(p).n_eff > _pr(q).n_eff
+    assert _pr(q).n_dropped == 6
+
+
+@pytest.mark.parametrize("rows", [0, 1, 2])
+def test_participation_needs_three_days(rows: int) -> None:
+    x = np.random.default_rng(0).normal(size=(rows, 4))
+    with pytest.raises(ValueError, match=">= 3 days"):
+        _pr(x)
+    with pytest.raises(ValueError, match=">= 3 days"):
+        _pr(x, min_columns=0)
+    assert _pr(np.random.default_rng(0).normal(size=(3, 4))).n_columns == 4
+
+
+def test_dsr_inputs_infinite_entry_message() -> None:
+    r = _returns()
+    r.iloc[4] = np.inf
+    with pytest.raises(ValueError, match="infinite entry"):
+        dsr_inputs(r, constant="raise")
+    assert dsr_inputs(r, constant="none") is None
+    with pytest.raises(ValueError, match="zero sample SD"):
+        dsr_inputs(np.zeros(20), constant="raise")
+    with pytest.raises(ValueError, match="fewer than 2"):
+        dsr_inputs(np.array([0.01]), constant="raise")
 
 
 def test_mean_corr_is_a_different_statistic() -> None:
@@ -189,4 +239,4 @@ def test_mean_corr_is_a_different_statistic() -> None:
         n_eff_mean_corr(math.nan, 10)
     x = _paths()
     rho = (np.corrcoef(x, rowvar=False).sum() - 6) / 30
-    assert n_eff_participation(x).n_eff != float(n_eff_mean_corr(rho, 6))
+    assert _pr(x).n_eff != float(n_eff_mean_corr(rho, 6))

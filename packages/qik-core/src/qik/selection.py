@@ -10,8 +10,9 @@ Project copies of these helpers differ in small, deliberate ways, so each differ
 * ``trial_sharpe_variance(nonfinite=)``: non-finite trial Sharpes either raise or are dropped.
 * ``deflated_sharpe_from_returns(clamp_n=)``: ``max(n_trials, 1)`` or ``n_trials`` as given.
 * ``pbo_summary(localize_tz=)``: strict date-index contract with tz stripped, or coerce and normalize only.
-* ``n_eff_participation(nonfinite=, nan_corr=, min_columns=)``: which columns count and what a NaN
-  correlation does.
+* ``n_eff_participation(constant=, nonfinite=, nan_corr=, min_columns=)``: which columns count and what a
+  NaN correlation does. ``constant`` and ``nonfinite`` have no default: dropping a column lowers N_eff,
+  which deflates the DSR less, so the caller must choose it.
 
 ``n_eff_participation`` (eigenvalue participation ratio of the return-path correlation matrix) and
 ``n_eff_mean_corr`` (``ceil(rho + (1 - rho) * N)`` from the mean off-diagonal correlation) are DIFFERENT
@@ -19,6 +20,9 @@ statistics and give different numbers; keep them apart and say which one a repor
 
 Moments are z-score moments (``mean(z**3)``, ``mean(z**4)`` with ``z = (r - mean) / std(ddof=0)``).
 ``mean(c**3) / m2**1.5`` differs by an ulp; copies using it are not covered.
+
+Not covered: P081 ``n_eff_from_paths`` answers ``float(k)`` (``None`` for ``k = 0``) with a note when it
+has fewer than 3 rows or fewer than 2 usable paths; ``n_eff_participation`` raises instead.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, overload
+from typing import Any, Literal, cast, overload
 
 import numpy as np
 import pandas as pd
@@ -64,8 +68,11 @@ def dsr_inputs(returns: Any, *, constant: Literal["none"]) -> DsrInputs | None: 
 def dsr_inputs(returns: Any, *, constant: Literal["raise", "none"]) -> DsrInputs | None:
     """Sharpe (mean / sample SD, not annualized), n, z-score skew and raw kurtosis of ``returns``.
 
-    NaN entries are dropped first. A series with fewer than two observations or zero sample SD has an
-    undefined Sharpe: ``constant="raise"`` raises ``ValueError``, ``"none"`` returns ``None``.
+    NaN entries are dropped first (P079 instead calls a column with any NaN undefined: callers matching
+    it must drop such columns themselves). A series with fewer than two observations, zero sample SD or a
+    NaN sample SD (an infinite entry) has an undefined Sharpe: ``constant="raise"`` raises ``ValueError``,
+    ``"none"`` returns ``None`` (as P079 does for a constant series). P076/P105/P097 raise for such
+    a series too, from ``deflated_sharpe``.
     """
     if constant not in ("raise", "none"):
         raise ValueError("constant must be 'raise' or 'none'")
@@ -73,7 +80,13 @@ def dsr_inputs(returns: Any, *, constant: Literal["raise", "none"]) -> DsrInputs
     sd = float(r.std(ddof=1)) if len(r) > 1 else 0.0
     if not sd > 0.0:
         if constant == "raise":
-            raise ValueError("returns are constant or too short: Sharpe is undefined")
+            if len(r) < 2:
+                why = "fewer than 2 observations"
+            elif not np.isfinite(r).all():
+                why = "an infinite entry"
+            else:
+                why = "zero sample SD"
+            raise ValueError(f"Sharpe is undefined: returns have {why}")
         return None
     z = (r - r.mean()) / r.std(ddof=0)
     return DsrInputs(
@@ -173,6 +186,12 @@ class PboSummary:
         return out
 
 
+def _midnight(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """``idx.normalize()`` (the type checker's pandas stubs do not declare ``DatetimeIndex.normalize``)."""
+    normalized: pd.DatetimeIndex = cast("Any", idx).normalize()
+    return normalized
+
+
 def pbo_summary(m: pd.DataFrame, *, n_blocks: int = 16, localize_tz: bool) -> PboSummary:
     """``qik.metrics.pbo`` (CSCV) with constant columns dropped from the whole experiment.
 
@@ -184,11 +203,10 @@ def pbo_summary(m: pd.DataFrame, *, n_blocks: int = 16, localize_tz: bool) -> Pb
     if localize_tz:
         if not isinstance(m.index, pd.DatetimeIndex):
             raise TypeError("pbo_summary needs a date-indexed return matrix")
-        x.index = (
-            m.index.tz_localize(None).normalize() if m.index.tz is not None else m.index.normalize()
-        )
+        naive = m.index.tz_localize(None) if m.index.tz is not None else m.index
+        x.index = _midnight(naive)
     else:
-        x.index = pd.DatetimeIndex(m.index).normalize()
+        x.index = _midnight(pd.DatetimeIndex(m.index))
     r = pbo(x, n_blocks=n_blocks, constant_policy="drop")
     return PboSummary(
         pbo=float(r.pbo),
@@ -215,8 +233,8 @@ class NEffParticipation:
 def n_eff_participation(
     paths: pd.DataFrame | np.ndarray,
     *,
-    constant: Literal["drop", "raise"] = "drop",
-    nonfinite: Literal["drop", "keep"] = "drop",
+    constant: Literal["drop", "raise"],
+    nonfinite: Literal["drop", "keep"],
     min_columns: int = 2,
     nan_corr: Literal["raise", "zero"] = "raise",
 ) -> NEffParticipation:
@@ -224,8 +242,16 @@ def n_eff_participation(
 
     ``paths`` is days x trials, one column per trial (identical columns lower it). It reads 1 for
     perfectly correlated paths and the column count for uncorrelated ones. Eigenvalues are clipped at 0.
+    Fewer than 3 rows raise ``ValueError`` (two points always correlate at +-1).
 
-    * ``constant``: constant columns (zero population SD) are dropped or raise.
+    ``constant`` and ``nonfinite`` are required: every dropped column lowers N_eff, which deflates the
+    DSR less, so silently dropping NaN/inf paths is the unsafe direction.
+
+    * ``constant``: constant columns are dropped or raise. Constant means a population SD (``np.nanstd``
+      over the matrix, axis 0) of exactly float zero, with no tolerance, so equal copies of a value are
+      constant only if the reduction rounds to 0.0: ``np.full((10, 2), 0.1)`` gives 1.4e-17 per column
+      and is kept, while ``DataFrame.std(ddof=0)`` gives 0.0 for it (P097 uses the latter, so it
+      drops such a column where this function keeps it).
     * ``nonfinite``: columns with any non-finite value are dropped (they count in ``n_dropped``) or
       kept. A kept column still has NaN correlations, handled by ``nan_corr``; its constancy is then
       judged on its finite values only (as ``DataFrame.std`` does).
@@ -244,6 +270,8 @@ def n_eff_participation(
     x = np.asarray(paths, dtype=float)
     if x.ndim != 2:
         raise ValueError("paths must be a 2-D (days x trials) matrix")
+    if x.shape[0] < 3:
+        raise ValueError("n_eff needs >= 3 days")
     finite = np.isfinite(x).all(axis=0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
