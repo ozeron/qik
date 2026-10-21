@@ -6,6 +6,8 @@ import csv
 import hashlib
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -89,9 +91,43 @@ def test_dedupe_skips_same_and_raises_on_change(tmp_path: Path) -> None:
     assert append_ledger(path, [row(1)], project="P900", when=WHEN, dedupe="none").added == 1
 
 
+def test_dedupe_compares_sharpe_numerically(tmp_path: Path) -> None:
+    path = tmp_path / "trials.csv"
+    data = seed(
+        path,
+        '"2026-10-16","P900","optimize","P900-c1",55,0.54,0,"n"',
+        '"2026-10-16","P900","optimize","P900-c2",55,-0.661459817,0,"n"',
+        '"2026-10-16","P900","optimize","P900-c3",55,nan,0,"n"',
+        '"2026-10-16","P900","optimize","P900-c4",55,"",0,"n"',
+    )
+
+    def same(i: int, sharpe: float | None) -> LedgerReport:
+        r = LedgerRow("optimize", f"P900-c{i}", 55, sharpe, False, "n")
+        return append_ledger(path, [r], project="P900", when=WHEN)
+
+    nan = float("nan")
+    assert same(1, 0.54) == LedgerReport(0, 1)
+    assert same(2, -0.661459817) == LedgerReport(0, 1)
+    assert same(3, nan) == LedgerReport(0, 1) and same(3, None) == LedgerReport(0, 1)
+    assert same(4, None) == LedgerReport(0, 1)
+    for i, sharpe in ((1, 0.55), (2, -0.67), (3, 0.1), (4, 0.0), (1, None)):
+        with pytest.raises(LedgerError, match="other content"):
+            same(i, sharpe)
+    assert path.read_bytes() == data
+
+
 def test_unexpected_header_raises(tmp_path: Path) -> None:
     path = tmp_path / "trials.csv"
     path.write_bytes(b"date,project,stage,variant_id,n_trades,sharpe,is_selected,note\n")
+    before = path.read_bytes()
+    with pytest.raises(LedgerError, match="header"):
+        append_ledger(path, [row(1)], project="P900", when=WHEN)
+    assert path.read_bytes() == before
+
+
+def test_bom_raises_and_leaves_file_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "trials.csv"
+    path.write_bytes(b"\xef\xbb\xbf" + (HEADER_LINE + "\n").encode())
     before = path.read_bytes()
     with pytest.raises(LedgerError, match="header"):
         append_ledger(path, [row(1)], project="P900", when=WHEN)
@@ -135,13 +171,33 @@ def test_real_ledger_guard_under_pytest(tmp_path: Path) -> None:
 def test_temp_trial_log_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST")
     monkeypatch.delitem(sys.modules, "pytest")
-    monkeypatch.setenv("QIK_TRIAL_LOG", str(Path(__import__("tempfile").gettempdir()) / "x.jsonl"))
     path = tmp_path / "notes" / "trials.csv"
-    with pytest.raises(LedgerError, match="temp log"):
-        append_ledger(path, [row(1)], project="P900", when=WHEN)
+    for log in (
+        Path(tempfile.gettempdir()) / "x.jsonl",
+        Path("/tmp/x.jsonl"),
+        Path("/private/tmp/x.jsonl"),
+    ):
+        monkeypatch.setenv("QIK_TRIAL_LOG", str(log))
+        with pytest.raises(LedgerError, match="temp log"):
+            append_ledger(path, [row(1)], project="P900", when=WHEN)
     monkeypatch.delenv("QIK_TRIAL_LOG")
     assert append_ledger(path, [row(1)], project="P900", when=WHEN).added == 1
-    sys.modules["pytest"] = pytest  # monkeypatch undo only restores what it removed
+
+
+def test_real_ledger_guard_matches_resolved_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    seed(notes / "trials.csv")
+    before = (notes / "trials.csv").read_bytes()
+    link = tmp_path / "elsewhere.csv"
+    link.symlink_to(notes / "trials.csv")
+    monkeypatch.chdir(notes)
+    for path in (link, Path("trials.csv"), tmp_path / "Notes" / "Trials.csv"):
+        with pytest.raises(LedgerError, match="pytest"):
+            append_ledger(path, [row(1)], project="P900", when=WHEN)
+    assert (notes / "trials.csv").read_bytes() == before
 
 
 _WORKER = """
@@ -152,8 +208,8 @@ from qik.ledger import LedgerRow, append_ledger
 path, tag, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 for i in range(count):
     note = "x" * 3000
-    append_ledger(path, [LedgerRow("optimize", f"{tag}-{i}", i, 0.5, False, note)] * 1
-                  + [LedgerRow("optimize", f"{tag}-{i}b", i, 0.5, False, note)],
+    append_ledger(path, [LedgerRow("optimize", f"{tag}-{i}", i, 0.5, False, note),
+                   LedgerRow("optimize", f"{tag}-{i}b", i, 0.5, False, note)],
                   project=tag, when="2026-10-21")
 """
 
@@ -172,6 +228,57 @@ def test_concurrent_processes_lose_no_rows(tmp_path: Path) -> None:
     ids = [r[3] for r in got[1:]]
     assert len(ids) == len(set(ids)) == 3 * count * 2
     assert all(len(r) == len(HEADER) for r in got)
+
+
+_RACE = """
+import sys, time
+from pathlib import Path
+import qik.ledger as L
+
+path, start = Path(sys.argv[1]), float(sys.argv[2])
+orig = L._read_existing
+
+def slow(*args):  # widen the window between reading the file and writing
+    result = orig(*args)
+    time.sleep(0.3)
+    return result
+
+L._read_existing = slow
+while time.time() < start:
+    pass
+print(L.append_ledger(path, [L.LedgerRow("optimize", "MYX-new", 5, 0.5, False, "n")],
+                      project="MYX", when="2026-10-21"))
+"""
+
+
+def _race(path: Path) -> list[str]:
+    start = str(time.time() + 3)  # noqa: TID251 (barrier; time for both to import qik)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _RACE, str(path), start], stdout=subprocess.PIPE, text=True
+        )
+        for _ in range(2)
+    ]
+    outs = [p.communicate(timeout=120)[0].strip() for p in procs]
+    assert [p.returncode for p in procs] == [0, 0]
+    return outs
+
+
+def test_race_same_new_id_adds_exactly_once(tmp_path: Path) -> None:
+    path = tmp_path / "trials.csv"
+    seed(path)
+    outs = _race(path)
+    assert sorted(outs) == ["LedgerReport(added=0, skipped=1)", "LedgerReport(added=1, skipped=0)"]
+    got = parse(path)
+    assert [r[3] for r in got[1:]] == ["MYX-new"]
+
+
+def test_race_creating_missing_ledger_writes_one_header(tmp_path: Path) -> None:
+    path = tmp_path / "sub" / "trials.csv"
+    outs = _race(path)
+    assert sorted(outs) == ["LedgerReport(added=0, skipped=1)", "LedgerReport(added=1, skipped=0)"]
+    got = parse(path)
+    assert got[0] == list(HEADER) and [r[3] for r in got[1:]] == ["MYX-new"]
 
 
 # ---- parsed fields equal what the legacy project writers produce ---------------------------------

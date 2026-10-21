@@ -23,17 +23,16 @@ Differences from the legacy per-project writers (parsed fields are what matters,
   is written only when the file is new or empty.
 
 ``when`` is required (the caller owns the clock). ``path`` is always an argument: qik knows no
-repo-root constants. Concurrent writers are serialised by ``qik.trial_storage.append_record``
-(advisory ``flock`` on the file, newline check made under that lock, one append per call, so a
-batch is never interleaved). Dedupe reads the file before taking that lock, so two writers
-adding the same NEW ``variant_id`` at the same moment can both succeed; creating a missing
-ledger concurrently can likewise write two headers. Neither happens when ids are owned by one
-project, which is the contract of ``variant_id``.
+repo-root constants. Concurrent writers are serialised by an advisory ``flock`` on the file: the
+read, the header decision, the dedupe and the single append of a call all happen under that one
+lock, so two writers adding the same NEW ``variant_id`` add it once and a missing ledger gets one
+header. A call never interleaves with another's batch.
 """
 
 from __future__ import annotations
 
 import csv
+import fcntl
 import io
 import math
 import os
@@ -45,7 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from qik.trial_storage import append_record
+from qik.trial_storage import sync_directory
 
 HEADER: tuple[str, ...] = (
     "date",
@@ -102,27 +101,47 @@ def _fields(row: LedgerRow, project: str, when: str) -> list[str | int]:
     ]
 
 
+def _is_real_ledger(path: Path) -> bool:
+    """True when ``path``, as spelled or after symlinks / cwd resolution, is ``notes/trials.csv``."""
+    for candidate in (Path(os.path.abspath(path)), path.resolve()):
+        if tuple(part.lower() for part in candidate.parts[-2:]) == _REAL_LEDGER:
+            return True
+    return False
+
+
+def _is_temp(path: Path) -> bool:
+    roots = {Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve(), Path("/private/tmp")}
+    return any(path.resolve().is_relative_to(root) for root in roots)
+
+
 def _guard(path: Path, allow_real_ledger: bool) -> None:
-    """Refuse to touch the real ``notes/trials.csv`` from a test or with a temp trial log."""
-    if allow_real_ledger or path.parts[-2:] != _REAL_LEDGER:
+    """Refuse to touch the real ``notes/trials.csv`` from a test or with a temp trial log.
+
+    The ledger is recognised by resolved name: the last two parts ``notes/trials.csv``, compared
+    case-insensitively, on the path as given (made absolute against the cwd) and on the path
+    after symlinks are followed.
+    """
+    if allow_real_ledger or not _is_real_ledger(path):
         return
     if "pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST"):
         raise LedgerError(f"refusing to write {path} under pytest (allow_real_ledger=True)")
     log = os.environ.get("QIK_TRIAL_LOG")
-    if log and Path(log).resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
+    if log and _is_temp(Path(log)):
         raise LedgerError(
             f"refusing to write {path} while QIK_TRIAL_LOG={log} is a temp log "
             "(allow_real_ledger=True)"
         )
 
 
-def _read_existing(path: Path) -> dict[str, list[list[str]]]:
-    """Validate header and tail; return the parsed rows keyed by ``variant_id``."""
-    with path.open("rb") as stream:
-        data = stream.read()
+def _read_existing(path: Path, data: bytes) -> dict[str, list[list[str]]]:
+    """Validate header and tail of ``data`` (the bytes of ``path``); return rows by ``variant_id``."""
     if not data.endswith(b"\n"):
         raise LedgerError(f"ledger tail is not newline-terminated: {path} (not repaired)")
-    reader = csv.reader(io.StringIO(data.decode("utf-8"), newline=""))
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LedgerError(f"ledger is not UTF-8: {path}") from exc
+    reader = csv.reader(io.StringIO(text, newline=""))
     if tuple(next(reader)) != HEADER:
         raise LedgerError(f"unexpected ledger header in {path}")
     by_id: dict[str, list[list[str]]] = {}
@@ -135,9 +154,41 @@ def _read_existing(path: Path) -> dict[str, list[list[str]]]:
     return by_id
 
 
+_SHARPE = 5  # column of sharpe_is
+_SHARPE_TOL = 1e-4  # new rows are written with 4 decimals; older rows kept more or fewer
+
+
+def _sharpe_value(text: str) -> float | None:
+    try:
+        value = float(text) if text.strip() else math.nan
+    except ValueError:
+        return None
+    return value
+
+
+def _same_sharpe(old: str, new: str) -> bool:
+    a, b = _sharpe_value(old), _sharpe_value(new)
+    if a is None or b is None:
+        return False
+    if math.isnan(a) or math.isnan(b):
+        return math.isnan(a) and math.isnan(b)
+    return abs(a - b) <= _SHARPE_TOL
+
+
 def _same_row(existing: Sequence[str], new: Sequence[str | int]) -> bool:
-    """Everything but the date (a re-run on another day is the same trial)."""
-    return list(existing[1:]) == [str(v) for v in new[1:]]
+    """Everything but the date (a re-run on another day is the same trial).
+
+    ``sharpe_is`` is compared as a number (the file has 0.54, -0.661459817 and ``nan`` next to
+    4-decimal values; empty and ``nan`` are the same), every other column as text.
+    """
+    fresh = [str(v) for v in new]
+    if len(existing) != len(fresh):
+        return False
+    return all(
+        _same_sharpe(old, value) if i == _SHARPE else old == value
+        for i, (old, value) in enumerate(zip(existing, fresh, strict=True))
+        if i != 0
+    )
 
 
 def append_ledger(
@@ -162,33 +213,41 @@ def append_ledger(
     if not project:
         raise LedgerError("project must be non-empty")
     _guard(path, allow_real_ledger)
-    fresh = not path.exists() or path.stat().st_size == 0
-    seen = {} if fresh else _read_existing(path)
-    new: list[list[str | int]] = []
-    skipped = 0
-    for row in rows:
-        fields = _fields(row, project, when)
-        if dedupe == "variant_id":
-            known = seen.get(row.variant_id, [])
-            if known:
-                if not any(_same_row(old, fields) for old in known):
-                    raise LedgerError(
-                        f"variant_id already in ledger with other content: {row.variant_id}"
-                    )
-                skipped += 1
-                continue
-            seen[row.variant_id] = [[str(v) for v in fields]]
-        new.append(fields)
-    if not new:
-        return LedgerReport(0, skipped)
-    out = io.StringIO(newline="")
-    writer = csv.writer(out, quoting=csv.QUOTE_NONNUMERIC, lineterminator="\n")
-    if fresh:
-        out.write(",".join(HEADER) + "\n")  # bare, like the header of the real ledger
-    writer.writerows(new)
+    fielded = [(row, _fields(row, project, when)) for row in rows]
+    if not fielded:
+        return LedgerReport(0, 0)
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        append_record(path, out.getvalue().encode("utf-8"), strict=True)
-    except ValueError as exc:  # strict append: a writer left a partial line since we looked
-        raise LedgerError(f"ledger tail is not newline-terminated: {path} (not repaired)") from exc
+    created = not path.exists()
+    with path.open("a+b") as handle:  # O_APPEND: every write lands at the end
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)  # read, dedupe, header and write: one lock
+        handle.seek(0)
+        data = handle.read()
+        fresh = not data
+        seen = {} if fresh else _read_existing(path, data)
+        new: list[list[str | int]] = []
+        skipped = 0
+        for row, fields in fielded:
+            if dedupe == "variant_id":
+                known = seen.get(row.variant_id, [])
+                if known:
+                    if not any(_same_row(old, fields) for old in known):
+                        raise LedgerError(
+                            f"variant_id already in ledger with other content: {row.variant_id}"
+                        )
+                    skipped += 1
+                    continue
+                seen[row.variant_id] = [[str(v) for v in fields]]
+            new.append(fields)
+        if not new:
+            return LedgerReport(0, skipped)
+        out = io.StringIO(newline="")
+        writer = csv.writer(out, quoting=csv.QUOTE_NONNUMERIC, lineterminator="\n")
+        if fresh:
+            out.write(",".join(HEADER) + "\n")  # bare, like the header of the real ledger
+        writer.writerows(new)
+        handle.write(out.getvalue().encode("utf-8"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    if created:
+        sync_directory(path.parent)
     return LedgerReport(len(new), skipped)
