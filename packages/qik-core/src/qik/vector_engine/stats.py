@@ -8,7 +8,9 @@ so a config's flat sessions count as zero-return sessions in its Sharpe.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from collections.abc import Sequence
+from datetime import date
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
 __all__ = ["summarize"]
 
 
-def _session_dates(ts: pd.DatetimeIndex | pd.Series, tz: str) -> Any:
+def _session_dates(ts: pd.DatetimeIndex | pd.Series, tz: str) -> pd.DatetimeIndex:
     stamps = pd.DatetimeIndex(ts)
     if stamps.tz is not None:
         stamps = stamps.tz_convert(tz)
@@ -30,7 +32,7 @@ def _session_dates(ts: pd.DatetimeIndex | pd.Series, tz: str) -> Any:
 def summarize(
     result: Result,
     *,
-    eligible_sessions: Any = None,
+    eligible_sessions: Sequence[date | pd.Timestamp | str] | None = None,
     session_tz: str = "America/New_York",
     periods_per_year: float | None = None,
 ) -> pd.DataFrame:

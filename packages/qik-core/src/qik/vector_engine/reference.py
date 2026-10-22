@@ -16,8 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from .kernel import (
-    ERR_EXIT_RACE,
     ERR_NONE,
+    ERR_PENDING_NEW_DAY,
     ERR_PROTECT_REJECTED,
     ERR_STALE_BOOK,
     ERR_STOP_IN_MARKET,
@@ -162,8 +162,10 @@ def simulate_column_reference(
     target_pts: np.ndarray | None = None,
     chase_after: int = 1,
     protect_flatten: bool = False,
+    new_day: np.ndarray | None = None,
 ) -> RefColumn:
     n = len(o)
+    starts_day = np.zeros(n, bool) if new_day is None else new_day
     nan = np.full(n, np.nan)
     lim_sig = nan if entry_limit is None else entry_limit
     stop_pts_sig = nan if stop_pts is None else stop_pts
@@ -180,6 +182,10 @@ def simulate_column_reference(
         busy = False
         book = _Book()
         close = float(c[i])
+        if pending is not None and bool(starts_day[i]):
+            # V2 drops a staged chase on a new calendar day and the DAY limit keeps resting; the
+            # engine does not model that, so the input is refused (A15).
+            return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
         if pending is not None:
             # A resting limit entry fills at its own level once reached, also on a gap (A5). V2
             # places the protection when the fill event arrives, which in a backtest is after the
@@ -202,9 +208,8 @@ def simulate_column_reference(
                 verdict = _protect_at_close(p.side, st, tg, close, protect_flatten)
                 if verdict == REFUSE:
                     return RefColumn(trades, ERR_PROTECT_REJECTED, i, pos, entry_i)
-                if filled and verdict == REASON_TARGET and bool(exit_sig[i]):
-                    # this close's exit and the protection's target fill race: unpinned (A15)
-                    return RefColumn(trades, ERR_EXIT_RACE, i, pos, entry_i)
+                # A target filled at this close leaves nothing for this close's exit signal: V2's
+                # flatten is a reduce-only close_all_positions, rejected on a flat position (A15).
                 if verdict == OPEN:
                     pos, entry_i, entry_px, stop, target = p.side, i, px, st, tg
                 else:

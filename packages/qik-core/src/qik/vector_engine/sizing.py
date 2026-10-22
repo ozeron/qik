@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import numba as nb
 import numpy as np
 
+from ._checks import is_int
+
 __all__ = ["Sizing"]
 
 MODE_CONTRACTS = 0
@@ -50,16 +52,14 @@ class Sizing:
         set_ = [x is not None for x in (self.contracts, self.risk_usd, self.risk_fraction)]
         if sum(set_) != 1:
             raise ValueError("Sizing needs exactly one of contracts, risk_usd, risk_fraction")
-        if self.contracts is not None and (
-            int(self.contracts) != self.contracts or self.contracts < 1
-        ):
+        if self.contracts is not None and (not is_int(self.contracts) or self.contracts < 1):
             raise ValueError(f"contracts must be a positive integer, got {self.contracts!r}")
         if self.risk_usd is not None and not self.risk_usd > 0:
             raise ValueError(f"risk_usd must be positive, got {self.risk_usd!r}")
         if self.risk_fraction is not None and not 0 < self.risk_fraction <= 1:
             raise ValueError(f"risk_fraction must be in (0, 1], got {self.risk_fraction!r}")
         if self.max_contracts is not None and (
-            int(self.max_contracts) != self.max_contracts or self.max_contracts < 1
+            not is_int(self.max_contracts) or self.max_contracts < 1
         ):
             raise ValueError(
                 f"max_contracts must be a positive integer, got {self.max_contracts!r}"
@@ -84,26 +84,37 @@ class Sizing:
 
 
 @nb.njit(cache=True)
-def _one(mode, amount, cap, equity, risk_per_contract):
+def _contracts_for(
+    mode: int, amount: float, cap: int, equity: float, risk_per_contract: float
+) -> np.int64:
     """Contracts for one entry, or a negative error code."""
 
     if mode == MODE_CONTRACTS:
         return np.int64(amount)
     if not (risk_per_contract > 0.0):  # NaN stop
-        return -ERR_NO_STOP
+        return np.int64(-ERR_NO_STOP)
     budget = amount if mode == MODE_RISK_USD else amount * equity
     if not (budget > 0.0):
-        return -ERR_ZERO
+        return np.int64(-ERR_ZERO)
     n = np.int64(np.floor(budget / risk_per_contract + 1e-9))
     if cap > 0 and n > cap:
         n = np.int64(cap)
     if n < 1:
-        return -ERR_ZERO
+        return np.int64(-ERR_ZERO)
     return n
 
 
 @nb.njit(cache=True)
-def size_trades(cfg, net_per_contract, risk_per_contract, mode, amount, cap, initial_cash, k):
+def size_trades(
+    cfg: np.ndarray,
+    net_per_contract: np.ndarray,
+    risk_per_contract: np.ndarray,
+    mode: int,
+    amount: float,
+    cap: int,
+    initial_cash: float,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Sequential sizing of closed trades grouped by config, in time order within each config.
 
     Returns ``(contracts, final_equity[k], err, err_row)``.
@@ -114,22 +125,31 @@ def size_trades(cfg, net_per_contract, risk_per_contract, mode, amount, cap, ini
     final_equity = np.full(k, initial_cash)
     for r in range(m):
         j = cfg[r]
-        n = _one(mode, amount, cap, final_equity[j], risk_per_contract[r])
+        n = _contracts_for(mode, amount, cap, final_equity[j], risk_per_contract[r])
         if n < 0:
-            return contracts, final_equity, -n, r
+            return contracts, final_equity, int(-n), r
         contracts[r] = n
         final_equity[j] += n * net_per_contract[r]
     return contracts, final_equity, ERR_NONE, -1
 
 
 @nb.njit(cache=True)
-def size_open(cfg, equity, risk_per_contract, mode, amount, cap):
+def size_open(
+    cfg: np.ndarray,
+    equity: np.ndarray,
+    risk_per_contract: np.ndarray,
+    mode: int,
+    amount: float,
+    cap: int,
+) -> np.ndarray:
     """Contracts of the positions still open after the last bar (equity = after the last close)."""
 
     m = cfg.shape[0]
     out = np.zeros(m, np.int64)
     for r in range(m):
-        out[r] = _one(mode, amount, cap, equity[cfg[r]], risk_per_contract[r])  # < 0: error code
+        out[r] = _contracts_for(
+            mode, amount, cap, equity[cfg[r]], risk_per_contract[r]
+        )  # < 0: error code
     return out
 
 

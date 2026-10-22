@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .api import Signals
+from .api import SIGNAL_FIELDS, Signals
 
 __all__ = ["grid", "stack"]
 
@@ -49,8 +49,8 @@ def _column(a: Any, n: int, name: str, j: int, dtype: Any) -> np.ndarray:
 def stack(params: pd.DataFrame, build: Callable[..., Signals]) -> Signals:
     """Call ``build(**row)`` for every row of ``params`` and stack the one-config results.
 
-    Column ``j`` of the result is row ``j`` of ``params`` (by position). A config without a stop or
-    target gets NaN levels in a grid where other configs have them.
+    Column ``j`` of the result is row ``j`` of ``params`` (by position). Every ``Signals`` field is
+    stacked; a config without one (say a stop) gets NaN in a grid where other configs have it.
     """
 
     if len(params) == 0:
@@ -73,9 +73,9 @@ def stack(params: pd.DataFrame, build: Callable[..., Signals]) -> Signals:
             return None
         return np.column_stack(columns(name, np.float64))
 
+    lv = {name: levels(name) for name in SIGNAL_FIELDS[2:]}
     return Signals(
-        entry_side=np.column_stack(columns("entry_side", np.int8)),
-        exit=np.column_stack(columns("exit", np.bool_)),
-        stop=levels("stop"),
-        target=levels("target"),
+        np.column_stack(columns("entry_side", np.int8)),
+        np.column_stack(columns("exit", np.bool_)),
+        **lv,
     )

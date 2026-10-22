@@ -75,16 +75,17 @@ def _nan_free(x: float) -> float | None:
 
 def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
-    limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False,
+    limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
     extra = [nan if a is None else a for a in (limit, stop_pts, target_pts)]
+    day = np.zeros(n, np.bool_) if new_day is None else new_day
     out = K.run_columns(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"],
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
         extra[0][None, :], extra[1][None, :], extra[2][None, :],
-        chase, adaptive, reenter, stale_drop, protect_flatten,
+        day, chase, adaptive, reenter, stale_drop, protect_flatten,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, t_stop) = out  # fmt: skip
@@ -244,20 +245,22 @@ def _dense_limit_case(rng: np.random.Generator):
     target = np.where(
         rest & np.isfinite(target), limit + side * rng.integers(1, 6, n) * TICK, target
     )
-    return arrays, side, exit_, stop, target, limit, stop_pts, target_pts, int(rng.integers(1, 4))
+    new_day = rng.random(n) < 0.04
+    return (arrays, side, exit_, stop, target, limit, stop_pts, target_pts,
+            int(rng.integers(1, 4)), new_day)  # fmt: skip
 
 
 LIMIT_OUTCOMES = ("limit_fill", "chase", "marketable", "same_bar_target", "err_protect",
-                  "err_race", "points", "protect_fail")  # fmt: skip
+                  "err_new_day", "target_beats_exit", "fill_bar_exit", "points",
+                  "protect_fail")  # fmt: skip
 
 
 def test_kernel_equals_reference_dense_limit_entries() -> None:
     rng = np.random.default_rng(23)
     seen = dict.fromkeys(LIMIT_OUTCOMES, 0)
     for _ in range(6000):
-        arrays, side, exit_, stop, target, limit, stop_pts, target_pts, chase = _dense_limit_case(
-            rng
-        )
+        (arrays, side, exit_, stop, target, limit, stop_pts, target_pts, chase,
+         new_day) = _dense_limit_case(rng)  # fmt: skip
         adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
         stale_drop = bool(rng.random() < 0.5)
         flat = bool(rng.random() < 0.5)
@@ -265,14 +268,15 @@ def test_kernel_equals_reference_dense_limit_entries() -> None:
             arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
             adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, entry_limit=limit,
             stop_pts=stop_pts, target_pts=target_pts, chase_after=chase, protect_flatten=flat,
+            new_day=new_day,
         )  # fmt: skip
         trades, err, err_bar, final, _ = _run_kernel(
             arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
-            limit, stop_pts, target_pts, chase, flat,
+            limit, stop_pts, target_pts, chase, flat, new_day,
         )  # fmt: skip
         assert (err, err_bar if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
         seen["err_protect"] += err == K.ERR_PROTECT_REJECTED
-        seen["err_race"] += err == K.ERR_EXIT_RACE
+        seen["err_new_day"] += err == K.ERR_PENDING_NEW_DAY
         if err:
             continue
         assert trades == _ref_trades(ref)
@@ -287,6 +291,8 @@ def test_kernel_equals_reference_dense_limit_entries() -> None:
             if side[e] == sd and np.isfinite(limit[e]) and epx == c[e]:
                 seen["marketable"] += (limit[e] >= c[e]) if sd > 0 else (limit[e] <= c[e])
             seen["same_bar_target"] += e == x and why == K.REASON_TARGET
+            seen["target_beats_exit"] += e == x and why == K.REASON_TARGET and bool(exit_[e])
+            seen["fill_bar_exit"] += e == x and why == K.REASON_SIGNAL and epx != c[e]
             seen["protect_fail"] += why == K.REASON_PROTECT_FAIL
             seen["points"] += bool(np.isfinite(stop_pts[e]))
     assert all(v > 0 for v in seen.values()), seen
@@ -378,7 +384,7 @@ def test_signal_validation() -> None:
     with pytest.raises(ValueError, match="costs need an instrument"):
         simulate(bars, Signals(entry_side=np.zeros(3, np.int8), exit=ok_exit), costs=Costs(1.0))
     with pytest.raises(ValueError, match="stale_book"):
-        Rules(stale_book="yes")
+        Rules(stale_book="yes")  # ty: ignore[invalid-argument-type]
 
 
 def test_off_tick_level_refused() -> None:
@@ -387,7 +393,7 @@ def test_off_tick_level_refused() -> None:
         entry_side=np.array([1, 0], np.int8), exit=np.zeros(2, bool), stop=np.array([99.9, np.nan])
     )
     with pytest.raises(ValueError, match="tick grid"):
-        simulate(bars, sig, instrument=Instrument(TICK, 50.0))
+        simulate(bars, sig, instrument=Instrument(TICK, 50.0), costs=Costs())
 
 
 def test_stop_at_close_refused() -> None:
@@ -428,3 +434,60 @@ def test_stale_book_avoided_without_same_bar_reentry() -> None:
     bars, sig = _stale_case()
     res = simulate(bars, sig, rules=Rules(reenter_on_exit_bar=False))
     assert list(res.trades.reason) == ["target"] and res.open_positions.empty
+
+
+# --- limit entries (A15) at the API: what V2 does not do is refused --------------------------------
+def _limit_bars(n_days: int = 1) -> Bars:
+    rows = [(100.0, 100.5, 99.5, 100.0), (100.0, 100.25, 99.75, 100.0),
+            (100.0, 100.25, 99.75, 100.0)]  # fmt: skip
+    o, h, lo, c = (np.array([r[k] for r in rows]) for k in range(4))
+    idx = pd.DatetimeIndex(
+        ["2024-01-02 15:00", "2024-01-02 15:01", "2024-01-03 15:00" if n_days > 1 else
+         "2024-01-02 15:02"], tz="UTC")  # fmt: skip
+    return Bars(o, h, lo, c, index=idx)
+
+
+def _limit_sig(**levels: np.ndarray) -> Signals:
+    nan = np.full(3, np.nan)
+    return Signals(entry_side=np.array([1, 0, 0], np.int8), exit=np.zeros(3, bool),
+                   entry_limit=np.array([99.0, np.nan, np.nan]),
+                   **{k: levels.get(k, nan) for k in ("stop", "target")})  # fmt: skip
+
+
+def test_limit_entry_needs_a_stop_and_dates() -> None:
+    bars = _limit_bars()
+    tgt = np.array([101.0, np.nan, np.nan])
+    with pytest.raises(ValueError, match="needs a stop"):
+        simulate(bars, _limit_sig(target=tgt))  # V2 sends no protection without a stop
+    stop = np.array([98.0, np.nan, np.nan])
+    no_index = Bars(bars.open, bars.high, bars.low, bars.close)
+    with pytest.raises(ValueError, match="index"):
+        simulate(no_index, _limit_sig(stop=stop))
+    assert bars.index is not None
+    naive = Bars(bars.open, bars.high, bars.low, bars.close, index=bars.index.tz_localize(None))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        simulate(naive, _limit_sig(stop=stop))
+    res = simulate(bars, _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
+    assert res.trades.empty and res.open_positions.empty  # never filled, never chased
+
+
+def test_limit_entry_working_into_a_new_day_is_refused() -> None:
+    stop = np.array([98.0, np.nan, np.nan])
+    with pytest.raises(ValueError, match="new New York date"):
+        simulate(_limit_bars(n_days=2), _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
+    cancelled = _limit_sig(stop=stop)
+    exit_ = np.array([False, True, False])  # cancelled before the session ends: fine
+    simulate(_limit_bars(n_days=2), Signals(cancelled.entry_side, exit_, cancelled.stop,
+             entry_limit=cancelled.entry_limit), rules=Rules(limit_chase_bars=5))  # fmt: skip
+
+
+def test_explicit_inputs_are_required() -> None:
+    bars = _bars([(100.0, 101.0, 99.0, 100.0)] * 2)
+    sig = Signals(entry_side=np.array([1, 0], np.int8), exit=np.array([False, True]))
+    with pytest.raises(ValueError, match="costs"):
+        simulate(bars, sig, instrument=Instrument(TICK, 50.0))  # no silent zero costs
+    for bad in ({"commission_per_side": -1.0}, {"slippage_ticks": float("nan")}):
+        with pytest.raises(ValueError, match="non-negative"):
+            Costs(**bad)
+    with pytest.raises(ValueError, match="limit_chase_bars"):
+        Rules(limit_chase_bars=2.0)  # ty: ignore[invalid-argument-type]

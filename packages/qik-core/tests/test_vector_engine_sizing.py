@@ -149,7 +149,9 @@ def test_risk_usd_is_floor_of_budget_over_stop_risk_capped() -> None:
     bars = _tape()
     params = grid(sl=[3, 7, 13])
     sig = stack(params, lambda sl: _signals(bars, sl, 9))
-    res = simulate(bars, sig, instrument=INST, sizing=Sizing(risk_usd=500.0, max_contracts=12))
+    res = simulate(
+        bars, sig, instrument=INST, costs=Costs(), sizing=Sizing(risk_usd=500.0, max_contracts=12)
+    )
     t = res.trades
     stop = _lv(sig.stop)[t.entry_i.to_numpy(), t.config.to_numpy()]
     risk = np.abs(t.entry_px.to_numpy() - stop) * INST.point_value
@@ -192,14 +194,20 @@ def test_risk_fraction_compounds_on_the_equity_before_each_trade() -> None:
 def test_zero_contracts_is_refused() -> None:
     bars = _tape()
     with pytest.raises(ValueError, match="0 contracts"):
-        simulate(bars, _signals(bars, 40, 9), instrument=INST, sizing=Sizing(risk_usd=100.0))
+        simulate(
+            bars,
+            _signals(bars, 40, 9),
+            instrument=INST,
+            costs=Costs(),
+            sizing=Sizing(risk_usd=100.0),
+        )
 
 
 def test_risk_sizing_needs_a_stop() -> None:
     bars = _tape()
     s = _signals(bars, 5, 9)
     with pytest.raises(ValueError, match="no stop"):
-        simulate(bars, Signals(s.entry_side, s.exit, None, s.target), instrument=INST,
+        simulate(bars, Signals(s.entry_side, s.exit, None, s.target), instrument=INST, costs=Costs(),
                  sizing=Sizing(risk_usd=1000.0))  # fmt: skip
 
 
@@ -209,7 +217,7 @@ def test_sizing_needs_instrument_and_fraction_needs_cash() -> None:
     with pytest.raises(ValueError, match="instrument"):
         simulate(bars, sig, sizing=Sizing(contracts=2))
     with pytest.raises(ValueError, match="initial_cash"):
-        simulate(bars, sig, instrument=INST, sizing=Sizing(risk_fraction=0.01))
+        simulate(bars, sig, instrument=INST, costs=Costs(), sizing=Sizing(risk_fraction=0.01))
 
 
 def test_running_out_of_cash_is_refused() -> None:
@@ -228,13 +236,13 @@ def test_liquidity_limit_is_max_of_floor_volume_quarter_and_one() -> None:
         b = Bars(
             bars.open, bars.high, bars.low, bars.close, index=bars.index, volume=np.full(n, volume)
         )
-        simulate(b, sig, instrument=INST, sizing=Sizing(contracts=allowed))
+        simulate(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed))
         with pytest.raises(ValueError, match="liquidity"):
-            simulate(b, sig, instrument=INST, sizing=Sizing(contracts=allowed + 1))
+            simulate(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed + 1))
     no_volume = Bars(bars.open, bars.high, bars.low, bars.close)
-    simulate(no_volume, sig, instrument=INST, sizing=Sizing(contracts=1))
+    simulate(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=1))
     with pytest.raises(ValueError, match="volume"):
-        simulate(no_volume, sig, instrument=INST, sizing=Sizing(contracts=2))
+        simulate(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=2))
 
 
 # -- summary -----------------------------------------------------------------------------------------
@@ -272,7 +280,7 @@ def test_summary_keeps_configs_without_trades() -> None:
     stop, target = _lv(s.stop), _lv(s.target)
     sig = Signals(side, np.zeros(side.shape, bool), np.column_stack([stop, stop]),
                   np.column_stack([target, target]))  # fmt: skip
-    out = simulate(bars, sig, instrument=INST, initial_cash=1e5).summary()
+    out = simulate(bars, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
     assert len(out) == 2 and out.loc[1, "n_trades"] == 0 and out.loc[0, "n_trades"] > 0
 
 
@@ -282,7 +290,31 @@ def test_summary_needs_usd_index_and_cash() -> None:
     with pytest.raises(ValueError, match="instrument"):
         simulate(bars, sig, initial_cash=1e5).summary()
     with pytest.raises(ValueError, match="initial_cash"):
-        simulate(bars, sig, instrument=INST).summary()
+        simulate(bars, sig, instrument=INST, costs=Costs()).summary()
     plain = Bars(bars.open, bars.high, bars.low, bars.close)
     with pytest.raises(ValueError, match="index"):
-        simulate(plain, sig, instrument=INST, initial_cash=1e5).summary()
+        simulate(plain, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
+
+
+def test_stack_keeps_every_signal_field() -> None:
+    n = 4
+
+    def build(off: int) -> Signals:
+        lim = np.full(n, np.nan)
+        lim[0] = 100.0 - off * TICK
+        pts = np.where(np.isfinite(lim), 1.0, np.nan)
+        return Signals(np.array([1, 0, 0, 0], np.int8), np.zeros(n, bool), entry_limit=lim,
+                       stop_points=pts, target_points=pts)  # fmt: skip
+
+    sig = stack(grid(off=[1, 2]), build)
+    assert sig.entry_limit is not None and sig.stop_points is not None
+    assert sig.target_points is not None and sig.stop is None and sig.target is None
+    np.testing.assert_array_equal(sig.entry_limit[0], [100.0 - TICK, 100.0 - 2 * TICK])
+
+
+def test_sizing_integers_must_be_integers() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        Sizing(contracts=2.0)  # ty: ignore[invalid-argument-type]
+    with pytest.raises(ValueError, match="positive integer"):
+        Sizing(risk_usd=100.0, max_contracts=True)
+    assert Sizing(contracts=np.int64(2)).amount == 2  # ty: ignore[invalid-argument-type]

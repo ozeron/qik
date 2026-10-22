@@ -15,17 +15,30 @@ non-finite prices, inconsistent OHLC) raise ``ValueError`` naming the config and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Sequence
+from dataclasses import dataclass, fields
+from datetime import date
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
 from . import kernel as K
 from . import sizing as S
+from ._checks import is_int
 from .sizing import Sizing
 
-__all__ = ["Bars", "Costs", "Instrument", "Result", "Rules", "Signals", "Sizing", "simulate"]
+__all__ = [
+    "SIGNAL_FIELDS",
+    "Bars",
+    "Costs",
+    "Instrument",
+    "Result",
+    "Rules",
+    "Signals",
+    "Sizing",
+    "simulate",
+]
 
 REASON_NAMES = {
     K.REASON_SIGNAL: "signal",
@@ -53,6 +66,12 @@ class Costs:
     commission_per_side: float = 0.0
     slippage_ticks: float = 0.0
 
+    def __post_init__(self) -> None:
+        for name in ("commission_per_side", "slippage_ticks"):
+            v = getattr(self, name)
+            if not (np.isfinite(v) and v >= 0):
+                raise ValueError(f"{name} must be finite and non-negative, got {v!r}")
+
 
 @dataclass(frozen=True)
 class Rules:
@@ -66,10 +85,10 @@ class Rules:
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
     reenter_on_exit_bar: bool = True  # may a new entry follow an exit on the same bar's close
-    stale_book: str = "error"
+    stale_book: Literal["error", "nautilus"] = "error"
     limit_chase_bars: int = 1  # LimitThenMarket.chase_after_bars for Signals.entry_limit (A15)
     # a limit entry's stop at or through its fill bar's close: "error", or "flatten" as V2 does
-    protect_rejected: str = "error"
+    protect_rejected: Literal["error", "flatten"] = "error"
 
     def __post_init__(self) -> None:
         if self.stale_book not in ("error", "nautilus"):
@@ -78,7 +97,7 @@ class Rules:
             raise ValueError(
                 f"protect_rejected must be 'error' or 'flatten', got {self.protect_rejected!r}"
             )
-        if int(self.limit_chase_bars) != self.limit_chase_bars or self.limit_chase_bars < 1:
+        if not is_int(self.limit_chase_bars) or self.limit_chase_bars < 1:
             raise ValueError(
                 f"limit_chase_bars must be an integer >= 1, got {self.limit_chase_bars!r}"
             )
@@ -151,7 +170,9 @@ class Signals:
     price, chased with a market order at the close ``Rules.limit_chase_bars`` bars later if still
     unfilled (A15). ``stop_points`` / ``target_points`` give a level as a distance from the entry
     instead (``Stop.points``): from the limit price when the limit fills, from the fill otherwise.
-    Each leg is either a level or points, never both.
+    Each leg is either a level or points, never both. A limit entry needs a stop (V2 sends no
+    protection without one) and ``Bars.index`` (a limit still working when the New York date
+    changes is refused).
     """
 
     entry_side: np.ndarray
@@ -161,6 +182,9 @@ class Signals:
     entry_limit: np.ndarray | None = None
     stop_points: np.ndarray | None = None
     target_points: np.ndarray | None = None
+
+
+SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
 
 
 @dataclass
@@ -175,7 +199,7 @@ class Result:
     def summary(
         self,
         *,
-        eligible_sessions: Any = None,
+        eligible_sessions: Sequence[date | pd.Timestamp | str] | None = None,
         session_tz: str = "America/New_York",
         periods_per_year: float | None = None,
     ) -> pd.DataFrame:
@@ -250,6 +274,8 @@ def simulate(
             raise ValueError(f"bar {i}, config {j}: {leg}_points must be positive")
     if costs is not None and instrument is None:
         raise ValueError("costs need an instrument (tick, point_value)")
+    if instrument is not None and costs is None:
+        raise ValueError("USD P&L needs costs: pass costs=Costs(...) (Costs() for none)")
     if sizing is not None and instrument is None:
         raise ValueError("sizing needs an instrument (point_value)")
     if initial_cash is not None and not (np.isfinite(initial_cash) and initial_cash > 0):
@@ -261,46 +287,23 @@ def simulate(
                                      "target_points"), strict=True):  # fmt: skip
             _check_tick(a, entries, instrument.tick, name)
 
+    new_day = np.zeros(n, np.bool_)
+    if np.isfinite(limit).any():
+        new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
     t = np.ascontiguousarray
     out = K.run_columns(
         bars.open, bars.high, bars.low, bars.close,
         t(side.T), t(exit_.T), t(stop.T), t(target.T), t(limit.T), t(stop_pts.T), t(target_pts.T),
-        int(rules.limit_chase_bars), rules.adaptive_high_low_ordering, rules.reenter_on_exit_bar,
-        rules.stale_book == "nautilus", rules.protect_rejected == "flatten",
+        new_day, int(rules.limit_chase_bars), rules.adaptive_high_low_ordering,
+        rules.reenter_on_exit_bar, rules.stale_book == "nautilus",
+        rules.protect_rejected == "flatten",
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip
     bad = np.flatnonzero(errs)
     if bad.size:
         j = int(bad[0])
-        if errs[j] == K.ERR_PROTECT_REJECTED:
-            raise ValueError(
-                f"stop for the limit entry filled at bar {int(err_bar[j])}, config {j} is at or "
-                f"through that bar's close ({bars.close[int(err_bar[j])]}): the protection goes out "
-                f"after the bar, Nautilus rejects the stop and the position runs naked "
-                f"(docs/vector-engine.md A15). Widen the stop, place the limit further away, or "
-                f"take V2's answer with Rules(protect_rejected='flatten') (exit at that close)"
-            )
-        if errs[j] == K.ERR_EXIT_RACE:
-            raise ValueError(
-                f"exit signal at bar {int(err_bar[j])}, config {j} on the bar its resting limit entry "
-                f"filled with the target already through the close: the exit and the target fill "
-                f"race at that close and Nautilus can fill both (docs/vector-engine.md A15). Stop "
-                f"new entries a few bars before the exit (an entry cutoff)"
-            )
-        if errs[j] == K.ERR_STALE_BOOK:
-            raise ValueError(
-                f"stop at bar {int(err_bar[j])}, config {j} sits inside the quote left stale by a limit "
-                f"fill earlier in the same bar: Nautilus would reject it and cancel the linked target "
-                f"(docs/vector-engine.md A13). Move the stop, skip same-bar re-entry "
-                f"(Rules(reenter_on_exit_bar=False)), or opt in with Rules(stale_book='nautilus')"
-            )
-        kind = "stop" if errs[j] == K.ERR_STOP_IN_MARKET else "target"
-        raise ValueError(
-            f"{kind} level at bar {int(err_bar[j])}, config {j} is not beyond the entry close "
-            f"({bars.close[int(err_bar[j])]}): Nautilus would reject a stop there and fill a "
-            f"limit there immediately; the engine refuses both"
-        )
+        _raise_kernel_error(int(errs[j]), int(err_bar[j]), j, float(bars.close[int(err_bar[j])]))
     cfg = np.repeat(np.arange(k, dtype=np.int64), counts)
     trades = pd.DataFrame(
         {
@@ -330,8 +333,8 @@ def simulate(
             "stop": final_stop[held],
         }
     )
-    if instrument is not None:
-        c = costs or Costs()
+    if instrument is not None and costs is not None:
+        c = costs
         per_contract_cost = 2.0 * (
             c.commission_per_side + c.slippage_ticks * instrument.tick * instrument.point_value
         )
@@ -344,7 +347,7 @@ def simulate(
             o_cfg = open_positions["config"].to_numpy()
             o_entry = open_positions["entry_i"].to_numpy()
             o_risk = np.abs(open_positions["entry_px"].to_numpy() - final_stop[held]) * pv
-            cash = float(initial_cash) if initial_cash is not None else 0.0
+            cash = float(initial_cash) if initial_cash is not None else np.nan  # risk_usd: unused
             contracts, final_equity, err, row = S.size_trades(
                 cfg, net_1, risk, sizing.mode, sizing.amount, sizing.cap, cash, k
             )
@@ -379,6 +382,73 @@ def simulate(
                 )
         open_positions["contracts"] = open_contracts
     return Result(trades, open_positions, n, k, bars.index, initial_cash)
+
+
+def _limit_entry_checks(
+    bars: Bars,
+    entries: np.ndarray,
+    limit: np.ndarray,
+    stop: np.ndarray,
+    stop_pts: np.ndarray,
+) -> np.ndarray:
+    """Refuse limit entries V2 would treat differently; return the bars starting a New York date."""
+
+    rows = entries & np.isfinite(limit)
+    naked = np.argwhere(rows & np.isnan(stop) & np.isnan(stop_pts))
+    if naked.size:
+        i, j = (int(x) for x in naked[0])
+        raise ValueError(
+            f"bar {i}, config {j}: a limit entry needs a stop: V2 sends no protection at all "
+            f"without one (not even the target), so the engine cannot know what it holds"
+        )
+    if bars.index is None:
+        raise ValueError(
+            "limit entries need Bars(index=...): a limit still working when the New York date "
+            "changes is refused, and the engine needs the dates to see it"
+        )
+    stamps = pd.DatetimeIndex(bars.index)
+    if stamps.tz is None:
+        raise ValueError("Bars.index must be timezone-aware for limit entries")
+    days = pd.Series(stamps.tz_convert("America/New_York")).dt.date.to_numpy()
+    new_day = np.zeros(len(bars), np.bool_)
+    new_day[1:] = days[1:] != days[:-1]
+    return new_day
+
+
+_KERNEL_ERRORS = {
+    K.ERR_PROTECT_REJECTED: (
+        "stop for the limit entry filled at bar {bar}, config {j} is at or through that bar's "
+        "close ({close}): the protection goes out after the bar, Nautilus rejects the stop and the "
+        "position runs naked (docs/vector-engine.md A15). Widen the stop, place the limit further "
+        "away, or take V2's answer with Rules(protect_rejected='flatten') (exit at that close)"
+    ),
+    K.ERR_PENDING_NEW_DAY: (
+        "the limit entry of config {j} is still working at bar {bar}, the first bar of a new New "
+        "York date: V2 drops its chase there and leaves the DAY limit resting, which the engine "
+        "does not model (docs/vector-engine.md A15). Exit (cancel) it before the session ends"
+    ),
+    K.ERR_STALE_BOOK: (
+        "stop at bar {bar}, config {j} sits inside the quote left stale by a limit fill earlier in "
+        "the same bar: Nautilus would reject it and cancel the linked target "
+        "(docs/vector-engine.md A13). Move the stop, skip same-bar re-entry "
+        "(Rules(reenter_on_exit_bar=False)), or opt in with Rules(stale_book='nautilus')"
+    ),
+    K.ERR_STOP_IN_MARKET: (
+        "stop level at bar {bar}, config {j} is not beyond the entry close ({close}): Nautilus "
+        "would reject a stop there and fill a limit there immediately; the engine refuses both"
+    ),
+    K.ERR_TARGET_IN_MARKET: (
+        "target level at bar {bar}, config {j} is not beyond the entry close ({close}): Nautilus "
+        "would reject a stop there and fill a limit there immediately; the engine refuses both"
+    ),
+}
+
+
+def _raise_kernel_error(code: int, bar: int, j: int, close: float) -> None:
+    template = _KERNEL_ERRORS.get(code)
+    if template is None:
+        raise RuntimeError(f"kernel returned unknown error code {code} (bar {bar}, config {j})")
+    raise ValueError(template.format(bar=bar, j=j, close=close))
 
 
 def _sizing_error(err: int, config: int, bar: int) -> None:

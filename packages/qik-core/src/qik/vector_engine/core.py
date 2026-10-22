@@ -28,7 +28,7 @@ from typing import NamedTuple, Protocol
 import numpy as np
 import pandas as pd
 
-from .api import Bars, Signals
+from .api import SIGNAL_FIELDS, Bars, Signals
 
 __all__ = ["BarView", "Core", "Decision", "check_causal", "signals_from_core"]
 
@@ -49,10 +49,13 @@ class BarView(NamedTuple):
 class Decision:
     """What to do at this bar's close; the same fields as one row of ``Signals``."""
 
-    side: int = 0  # +1 / -1: market entry at this close when flat
-    exit: bool = False  # market exit at this close when in a position
+    side: int = 0  # +1 / -1: entry at this close when flat (market, or the limit below)
+    exit: bool = False  # market exit at this close when in a position; cancels a working entry
     stop: float = math.nan  # absolute level placed with this bar's entry
     target: float = math.nan
+    entry_limit: float = math.nan  # LimitThenMarket price for this bar's entry (A15)
+    stop_points: float = math.nan  # stop as points from the entry anchor instead of a level
+    target_points: float = math.nan
 
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):
@@ -63,15 +66,20 @@ class Core(Protocol):
     def step(self, bar: BarView) -> Decision: ...
 
 
+_LEVELS = ("stop", "target", "entry_limit", "stop_points", "target_points")
+
+
 def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
-    """Run a fresh core over every bar and collect its decisions as one-config ``Signals``."""
+    """Run a fresh core over every bar and collect its decisions as one-config ``Signals``.
+
+    A level field no decision ever sets is left ``None``.
+    """
 
     core = make()
     n = len(bars)
     side = np.zeros(n, np.int8)
     exit_ = np.zeros(n, np.bool_)
-    stop = np.full(n, np.nan)
-    target = np.full(n, np.nan)
+    levels = {name: np.full(n, np.nan) for name in _LEVELS}
     vol = bars.volume if bars.volume is not None else np.full(n, np.nan)
     for i in range(n):
         ts = bars.index[i] if bars.index is not None else None
@@ -82,9 +90,10 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
             raise TypeError(f"bar {i}: step must return a Decision, got {type(d).__name__}")
         side[i] = d.side
         exit_[i] = d.exit
-        stop[i] = d.stop
-        target[i] = d.target
-    return Signals(side, exit_, stop, target)
+        for name, arr in levels.items():
+            arr[i] = getattr(d, name)
+    used = {name: (arr if np.isfinite(arr).any() else None) for name, arr in levels.items()}
+    return Signals(side, exit_, **used)
 
 
 def _prefix(bars: Bars, m: int) -> Bars:
@@ -99,9 +108,13 @@ def _prefix(bars: Bars, m: int) -> Bars:
 
 
 def _rows(sig: Signals, m: int) -> list[np.ndarray]:
+    """The first ``m`` rows of every ``Signals`` field as float; a missing level is all NaN."""
+
+    shape = np.asarray(sig.entry_side).shape
     out = []
-    for a in (sig.entry_side, sig.exit, sig.stop, sig.target):
-        arr = np.zeros(0) if a is None else np.asarray(a, dtype=np.float64)
+    for name in SIGNAL_FIELDS:
+        a = getattr(sig, name)
+        arr = np.full(shape, np.nan) if a is None else np.asarray(a, dtype=np.float64)
         out.append(arr[:m])
     return out
 
@@ -135,14 +148,15 @@ def check_causal(
         grid_cuts = np.linspace(1, n - 1, num=min(spaced, n - 1), dtype=np.int64)
         cut_set = set((_decision_rows(full) + 1).tolist()) | set(grid_cuts.tolist())
         cuts = sorted(m for m in cut_set if 0 < m < n)
-    names = ("entry_side", "exit", "stop", "target")
     for m in cuts:
         if not 0 < m < n:
             raise ValueError(f"cut {m} must be inside (0, {n})")
         part = fn(_prefix(bars, m))
-        for name, a, b in zip(names, _rows(full, m), _rows(part, m), strict=True):
+        for name, a, b in zip(SIGNAL_FIELDS, _rows(full, m), _rows(part, m), strict=True):
             if a.shape != b.shape:
-                raise ValueError(f"{name}: present in one run and missing in the other")
+                raise ValueError(
+                    f"{name}: shape {a.shape} with the full tape but {b.shape} with {m} bars"
+                )
             bad = ~((a == b) | (np.isnan(a) & np.isnan(b)))
             if bad.any():
                 where = np.argwhere(bad.reshape(bad.shape[0], -1))[0]

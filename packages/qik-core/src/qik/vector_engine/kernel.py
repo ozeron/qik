@@ -22,10 +22,8 @@ ERR_NONE = 0
 ERR_STOP_IN_MARKET = 1  # stop level not strictly beyond the entry close (Nautilus rejects it)
 ERR_TARGET_IN_MARKET = 2  # target level not strictly beyond the entry close (would fill at once)
 ERR_STALE_BOOK = 3  # new stop falls inside the stale quote a same-bar limit fill left (A13)
-ERR_EXIT_RACE = (
-    5  # exit signal on the bar a resting limit filled and its target filled at the close
-)
 ERR_PROTECT_REJECTED = 4  # limit-then-market entry's stop at or through its fill bar's close (A15)
+ERR_PENDING_NEW_DAY = 5  # a limit entry still working when the New York date changes (A15)
 
 
 @nb.njit(cache=True, nogil=True)
@@ -109,6 +107,7 @@ def _column(
     entry_limit,
     stop_pts,
     target_pts,
+    new_day,
     chase,
     adaptive,
     reenter,
@@ -150,6 +149,9 @@ def _column(
         stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
         stale_px = 0.0
         ci = c[i]
+        if pend != 0 and new_day[i]:
+            # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
+            return cnt, ERR_PENDING_NEW_DAY, i, pos, entry_i, entry_px, stop
         if pend != 0:
             s = pend
             # A resting limit fills at its own level once any path point reaches it (A5); the
@@ -169,9 +171,8 @@ def _column(
                 )  # fmt: skip
                 if err:
                     return cnt, err, i, pos, entry_i, entry_px, stop
-                if filled and why == REASON_TARGET and exit_sig[i]:
-                    # the sleeve's flatten and the protection race at this close: unpinned (A15)
-                    return cnt, ERR_EXIT_RACE, i, pos, entry_i, entry_px, stop
+                # A target that fills at this close beats an exit signal on it: V2's flatten is a
+                # reduce-only close_all_positions, which Nautilus then rejects (A15).
                 if why:
                     cnt += 1
                     exited = True
@@ -321,9 +322,10 @@ def _column(
 @nb.njit(parallel=True, cache=True)
 def run_columns(
     o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts,
-    chase, adaptive, reenter, stale_drop, protect_flatten,
+    new_day, chase, adaptive, reenter, stale_drop, protect_flatten,
 ):  # fmt: skip
-    """All columns in parallel. Signal arrays have shape ``(k, n)``; prices shape ``(n,)``.
+    """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
+    bar starts a New York date) shape ``(n,)``.
 
     Two passes over the same ``_column`` function (count, then fill), so the trade table is exact
     without over-allocating ``k * n`` rows.
@@ -343,7 +345,7 @@ def run_columns(
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
         cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
-            entry_limit[j], stop_pts[j], target_pts[j], chase,
+            entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
             adaptive, reenter, stale_drop, protect_flatten, True, e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -368,7 +370,7 @@ def run_columns(
         if errs[j] == 0:
             _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
-                entry_limit[j], stop_pts[j], target_pts[j], chase,
+                entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
                 adaptive, reenter, stale_drop, protect_flatten, False, entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
