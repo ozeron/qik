@@ -3,8 +3,10 @@
     bars = Bars(open, high, low, close, index=ts)
     sig = Signals(entry_side, exit, stop=levels, target=levels)      # (n,) or (n, k) arrays
     res = simulate(bars, sig, instrument=Instrument(tick=0.25, point_value=50.0),
-                   costs=Costs(commission_per_side=2.5, slippage_ticks=1))
+                   costs=Costs(commission_per_side=2.5, slippage_ticks=1),
+                   sizing=Sizing(risk_fraction=0.01), initial_cash=100_000)
     res.trades        # one row per closed trade, all k configs, column ``config``
+    res.summary()     # one row per config: qik.metrics headline stats
 
 Everything is explicit: nothing is rounded, clipped or defaulted for you. Inputs the engine cannot
 execute the way Nautilus would (levels off the tick grid, a stop at or through the entry close,
@@ -20,8 +22,10 @@ import numpy as np
 import pandas as pd
 
 from . import kernel as K
+from . import sizing as S
+from .sizing import Sizing
 
-__all__ = ["Bars", "Costs", "Instrument", "Result", "Rules", "Signals", "simulate"]
+__all__ = ["Bars", "Costs", "Instrument", "Result", "Rules", "Signals", "Sizing", "simulate"]
 
 REASON_NAMES = {
     K.REASON_SIGNAL: "signal",
@@ -70,13 +74,17 @@ class Rules:
 
 @dataclass(frozen=True)
 class Bars:
-    """OHLC arrays, one row per bar, in time order. Prices must be finite, positive and consistent."""
+    """OHLC arrays, one row per bar, in time order. Prices must be finite, positive and consistent.
+
+    ``volume`` is needed only to size above one contract (the liquidity check, ``sizing.py``).
+    """
 
     open: np.ndarray
     high: np.ndarray
     low: np.ndarray
     close: np.ndarray
     index: pd.DatetimeIndex | None = None
+    volume: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         arrays = [
@@ -95,6 +103,13 @@ class Bars:
             )
         if self.index is not None and len(self.index) != n:
             raise ValueError("index length must equal the number of bars")
+        if self.volume is not None:
+            v = np.ascontiguousarray(self.volume, dtype=np.float64)
+            if v.shape != (n,) or not np.isfinite(v).all() or (v < 0).any():
+                raise ValueError(
+                    "volume must be a finite, non-negative array with one value per bar"
+                )
+            object.__setattr__(self, "volume", v)
         for name, a in zip(("open", "high", "low", "close"), arrays, strict=True):
             object.__setattr__(self, name, np.ascontiguousarray(a))
 
@@ -133,6 +148,26 @@ class Result:
     open_positions: pd.DataFrame  # one row per config still in a position after the last bar
     n_bars: int
     n_configs: int
+    index: pd.DatetimeIndex | None = None  # the bars' timestamps
+    initial_cash: float | None = None
+
+    def summary(
+        self,
+        *,
+        eligible_sessions: Any = None,
+        session_tz: str = "America/New_York",
+        periods_per_year: float | None = None,
+    ) -> pd.DataFrame:
+        """Headline stats per config from ``qik.metrics.summarize_trades`` (``stats.py``)."""
+
+        from .stats import summarize
+
+        return summarize(
+            self,
+            eligible_sessions=eligible_sessions,
+            session_tz=session_tz,
+            periods_per_year=periods_per_year,
+        )
 
 
 def _check_tick(levels: np.ndarray, rows: np.ndarray, tick: float, name: str) -> None:
@@ -156,6 +191,8 @@ def simulate(
     instrument: Instrument | None = None,
     rules: Rules = Rules(),
     costs: Costs | None = None,
+    sizing: Sizing | None = None,
+    initial_cash: float | None = None,
 ) -> Result:
     """Run every config of ``signals`` over ``bars`` under the Nautilus-compatible rules."""
 
@@ -174,6 +211,12 @@ def simulate(
         raise ValueError("levels must be finite or NaN")
     if costs is not None and instrument is None:
         raise ValueError("costs need an instrument (tick, point_value)")
+    if sizing is not None and instrument is None:
+        raise ValueError("sizing needs an instrument (point_value)")
+    if initial_cash is not None and not (np.isfinite(initial_cash) and initial_cash > 0):
+        raise ValueError(f"initial_cash must be positive, got {initial_cash!r}")
+    if sizing is not None and sizing.risk_fraction is not None and initial_cash is None:
+        raise ValueError("Sizing(risk_fraction=...) needs initial_cash")
     if instrument is not None:
         _check_tick(stop, side != 0, instrument.tick, "stop")
         _check_tick(target, side != 0, instrument.tick, "target")
@@ -219,13 +262,6 @@ def simulate(
     if bars.index is not None:
         trades["entry_time"] = bars.index[trades["entry_i"].to_numpy()]
         trades["exit_time"] = bars.index[trades["exit_i"].to_numpy()]
-    if instrument is not None:
-        trades["gross_usd"] = trades["gross_points"] * instrument.point_value
-        c = costs or Costs()
-        per_trade = 2.0 * (
-            c.commission_per_side + c.slippage_ticks * instrument.tick * instrument.point_value
-        )
-        trades["pnl_usd"] = trades["gross_usd"] - per_trade
     held = np.flatnonzero(final_side != 0)
     open_positions = pd.DataFrame(
         {
@@ -235,4 +271,93 @@ def simulate(
             "entry_px": bars.close[final_entry[held]],
         }
     )
-    return Result(trades, open_positions, n, k)
+    if instrument is not None:
+        c = costs or Costs()
+        per_contract_cost = 2.0 * (
+            c.commission_per_side + c.slippage_ticks * instrument.tick * instrument.point_value
+        )
+        net_1 = trades["gross_points"].to_numpy() * instrument.point_value - per_contract_cost
+        contracts = np.ones(len(trades), np.int64)
+        open_contracts = np.ones(len(open_positions), np.int64)
+        if sizing is not None:
+            pv = instrument.point_value
+            risk = np.abs(e_px - stop[e_i, cfg]) * pv
+            o_cfg = open_positions["config"].to_numpy()
+            o_entry = open_positions["entry_i"].to_numpy()
+            o_risk = np.abs(open_positions["entry_px"].to_numpy() - stop[o_entry, o_cfg]) * pv
+            cash = float(initial_cash) if initial_cash is not None else 0.0
+            contracts, final_equity, err, row = S.size_trades(
+                cfg, net_1, risk, sizing.mode, sizing.amount, sizing.cap, cash, k
+            )
+            if err:
+                _sizing_error(err, int(cfg[row]), int(e_i[row]))
+            open_contracts = S.size_open(
+                o_cfg, final_equity, o_risk, sizing.mode, sizing.amount, sizing.cap
+            )
+            if (open_contracts < 0).any():
+                r = int(np.flatnonzero(open_contracts < 0)[0])
+                _sizing_error(int(-open_contracts[r]), int(o_cfg[r]), int(o_entry[r]))
+        _check_liquidity(bars, e_i, x_i, cfg, contracts)
+        _check_liquidity(
+            bars,
+            open_positions["entry_i"].to_numpy(),
+            None,
+            open_positions["config"].to_numpy(),
+            open_contracts,
+        )
+        trades["contracts"] = contracts
+        trades["gross_usd"] = trades["gross_points"] * instrument.point_value * contracts
+        trades["pnl_usd"] = net_1 * contracts
+        if initial_cash is not None:
+            trades["equity_usd"] = initial_cash + trades.groupby("config")["pnl_usd"].cumsum()
+            blown = np.flatnonzero(trades["equity_usd"].to_numpy() <= 0)
+            if blown.size:
+                r = int(blown[0])
+                raise ValueError(
+                    f"config {int(cfg[r])} runs out of cash at bar {int(x_i[r])} (equity "
+                    f"{trades['equity_usd'].iat[r]:.2f}): Nautilus would deny every later order; "
+                    f"raise initial_cash or size smaller"
+                )
+        open_positions["contracts"] = open_contracts
+    return Result(trades, open_positions, n, k, bars.index, initial_cash)
+
+
+def _sizing_error(err: int, config: int, bar: int) -> None:
+    if err == S.ERR_NO_STOP:
+        raise ValueError(
+            f"entry at bar {bar}, config {config} has no stop: risk sizing needs a stop on every entry"
+        )
+    raise ValueError(
+        f"sizing gives 0 contracts for the entry at bar {bar}, config {config}: Nautilus would not "
+        f"enter, which changes every later trade of the config; raise the risk, set fixed "
+        f"contracts, or tighten the stop"
+    )
+
+
+def _check_liquidity(
+    bars: Bars,
+    entry_i: np.ndarray,
+    exit_i: np.ndarray | None,
+    cfg: np.ndarray,
+    contracts: np.ndarray,
+) -> None:
+    """Refuse sizes above what Nautilus fills at one price on the entry / exit bar (A14)."""
+
+    if contracts.size == 0 or contracts.max() <= 1:
+        return
+    if bars.volume is None:
+        raise ValueError(
+            "sizing above 1 contract needs Bars(volume=...): Nautilus fills against it"
+        )
+    liq = S.point_liquidity(bars.volume)
+    for where, idx in (("entry", entry_i), ("exit", exit_i)):
+        if idx is None:
+            continue
+        over = np.flatnonzero(contracts > liq[idx])
+        if over.size:
+            r = int(over[0])
+            raise ValueError(
+                f"{int(contracts[r])} contracts at the {where} bar {int(idx[r])}, config {int(cfg[r])} "
+                f"exceed the bar's liquidity ({int(liq[idx[r]])} = max(floor(volume/4), 1)): "
+                f"Nautilus would fill the rest one tick worse (docs/vector-engine.md A14)"
+            )
