@@ -32,6 +32,7 @@ REASON_NAMES = {
     K.REASON_STOP: "stop",
     K.REASON_TARGET: "target",
     K.REASON_STOP_GAP: "stop_gap",
+    K.REASON_PROTECT_FAIL: "protect_fail",
 }
 
 
@@ -66,10 +67,21 @@ class Rules:
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
     reenter_on_exit_bar: bool = True  # may a new entry follow an exit on the same bar's close
     stale_book: str = "error"
+    limit_chase_bars: int = 1  # LimitThenMarket.chase_after_bars for Signals.entry_limit (A15)
+    # a limit entry's stop at or through its fill bar's close: "error", or "flatten" as V2 does
+    protect_rejected: str = "error"
 
     def __post_init__(self) -> None:
         if self.stale_book not in ("error", "nautilus"):
             raise ValueError(f"stale_book must be 'error' or 'nautilus', got {self.stale_book!r}")
+        if self.protect_rejected not in ("error", "flatten"):
+            raise ValueError(
+                f"protect_rejected must be 'error' or 'flatten', got {self.protect_rejected!r}"
+            )
+        if int(self.limit_chase_bars) != self.limit_chase_bars or self.limit_chase_bars < 1:
+            raise ValueError(
+                f"limit_chase_bars must be an integer >= 1, got {self.limit_chase_bars!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -134,12 +146,21 @@ class Signals:
     when flat. ``exit[i]`` is a market exit at bar ``i``'s close while in a position. ``stop[i]`` and
     ``target[i]`` are absolute price levels placed with the entry made on bar ``i`` (NaN = none): a
     resting stop-market and a resting limit, live from bar ``i + 1``, cancelling each other.
+
+    ``entry_limit[i]`` turns that entry into the book's ``LimitThenMarket``: a resting limit at that
+    price, chased with a market order at the close ``Rules.limit_chase_bars`` bars later if still
+    unfilled (A15). ``stop_points`` / ``target_points`` give a level as a distance from the entry
+    instead (``Stop.points``): from the limit price when the limit fills, from the fill otherwise.
+    Each leg is either a level or points, never both.
     """
 
     entry_side: np.ndarray
     exit: np.ndarray
     stop: np.ndarray | None = None
     target: np.ndarray | None = None
+    entry_limit: np.ndarray | None = None
+    stop_points: np.ndarray | None = None
+    target_points: np.ndarray | None = None
 
 
 @dataclass
@@ -201,14 +222,32 @@ def simulate(
     k = side.shape[1]
     exit_ = _as_2d(signals.exit, n, np.bool_, "exit")
     nan = np.full((n, k), np.nan)
-    stop = nan if signals.stop is None else _as_2d(signals.stop, n, np.float64, "stop")
-    target = nan if signals.target is None else _as_2d(signals.target, n, np.float64, "target")
-    if not (exit_.shape[1] == stop.shape[1] == target.shape[1] == k):
+
+    def opt(a: np.ndarray | None, name: str) -> np.ndarray:
+        return nan if a is None else _as_2d(a, n, np.float64, name)
+
+    stop = opt(signals.stop, "stop")
+    target = opt(signals.target, "target")
+    limit = opt(signals.entry_limit, "entry_limit")
+    stop_pts = opt(signals.stop_points, "stop_points")
+    target_pts = opt(signals.target_points, "target_points")
+    levels = (stop, target, limit, stop_pts, target_pts)
+    if not all(a.shape[1] == k for a in (exit_, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():
         raise ValueError("entry_side must be -1, 0 or +1")
-    if np.isinf(stop).any() or np.isinf(target).any():
+    if any(np.isinf(a).any() for a in levels):
         raise ValueError("levels must be finite or NaN")
+    entries = side != 0
+    for lvl, pts, leg in ((stop, stop_pts, "stop"), (target, target_pts, "target")):
+        both = np.argwhere(entries & np.isfinite(lvl) & np.isfinite(pts))
+        if both.size:
+            i, j = (int(x) for x in both[0])
+            raise ValueError(f"bar {i}, config {j}: {leg} is given as a level and as points")
+        neg = np.argwhere(entries & (pts <= 0))
+        if neg.size:
+            i, j = (int(x) for x in neg[0])
+            raise ValueError(f"bar {i}, config {j}: {leg}_points must be positive")
     if costs is not None and instrument is None:
         raise ValueError("costs need an instrument (tick, point_value)")
     if sizing is not None and instrument is None:
@@ -218,19 +257,37 @@ def simulate(
     if sizing is not None and sizing.risk_fraction is not None and initial_cash is None:
         raise ValueError("Sizing(risk_fraction=...) needs initial_cash")
     if instrument is not None:
-        _check_tick(stop, side != 0, instrument.tick, "stop")
-        _check_tick(target, side != 0, instrument.tick, "target")
+        for a, name in zip(levels, ("stop", "target", "entry_limit", "stop_points",
+                                     "target_points"), strict=True):  # fmt: skip
+            _check_tick(a, entries, instrument.tick, name)
 
     t = np.ascontiguousarray
     out = K.run_columns(
         bars.open, bars.high, bars.low, bars.close,
-        t(side.T), t(exit_.T), t(stop.T), t(target.T),
-        rules.adaptive_high_low_ordering, rules.reenter_on_exit_bar, rules.stale_book == "nautilus",
+        t(side.T), t(exit_.T), t(stop.T), t(target.T), t(limit.T), t(stop_pts.T), t(target_pts.T),
+        int(rules.limit_chase_bars), rules.adaptive_high_low_ordering, rules.reenter_on_exit_bar,
+        rules.stale_book == "nautilus", rules.protect_rejected == "flatten",
     )  # fmt: skip
-    counts, offsets, errs, err_bar, final_side, final_entry, e_i, x_i, sd, e_px, x_px, why = out
+    (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
+     e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip
     bad = np.flatnonzero(errs)
     if bad.size:
         j = int(bad[0])
+        if errs[j] == K.ERR_PROTECT_REJECTED:
+            raise ValueError(
+                f"stop for the limit entry filled at bar {int(err_bar[j])}, config {j} is at or "
+                f"through that bar's close ({bars.close[int(err_bar[j])]}): the protection goes out "
+                f"after the bar, Nautilus rejects the stop and the position runs naked "
+                f"(docs/vector-engine.md A15). Widen the stop, place the limit further away, or "
+                f"take V2's answer with Rules(protect_rejected='flatten') (exit at that close)"
+            )
+        if errs[j] == K.ERR_EXIT_RACE:
+            raise ValueError(
+                f"exit signal at bar {int(err_bar[j])}, config {j} on the bar its resting limit entry "
+                f"filled with the target already through the close: the exit and the target fill "
+                f"race at that close and Nautilus can fill both (docs/vector-engine.md A15). Stop "
+                f"new entries a few bars before the exit (an entry cutoff)"
+            )
         if errs[j] == K.ERR_STALE_BOOK:
             raise ValueError(
                 f"stop at bar {int(err_bar[j])}, config {j} sits inside the quote left stale by a limit "
@@ -256,6 +313,7 @@ def simulate(
             "reason": pd.Categorical(
                 [REASON_NAMES[int(r)] for r in why], categories=list(REASON_NAMES.values())
             ),
+            "stop": trade_stop,
         }
     )
     trades["gross_points"] = trades["side"] * (trades["exit_px"] - trades["entry_px"])
@@ -268,7 +326,8 @@ def simulate(
             "config": held.astype(np.int64),
             "side": final_side[held].astype(np.int64),
             "entry_i": final_entry[held].astype(np.int64),
-            "entry_px": bars.close[final_entry[held]],
+            "entry_px": final_px[held],
+            "stop": final_stop[held],
         }
     )
     if instrument is not None:
@@ -281,10 +340,10 @@ def simulate(
         open_contracts = np.ones(len(open_positions), np.int64)
         if sizing is not None:
             pv = instrument.point_value
-            risk = np.abs(e_px - stop[e_i, cfg]) * pv
+            risk = np.abs(e_px - trade_stop) * pv
             o_cfg = open_positions["config"].to_numpy()
             o_entry = open_positions["entry_i"].to_numpy()
-            o_risk = np.abs(open_positions["entry_px"].to_numpy() - stop[o_entry, o_cfg]) * pv
+            o_risk = np.abs(open_positions["entry_px"].to_numpy() - final_stop[held]) * pv
             cash = float(initial_cash) if initial_cash is not None else 0.0
             contracts, final_equity, err, row = S.size_trades(
                 cfg, net_1, risk, sizing.mode, sizing.amount, sizing.cap, cash, k

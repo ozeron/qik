@@ -69,13 +69,25 @@ def _case(draw):
     )
 
 
-def _run_kernel(arrays, side, exit_, stop, target, adaptive, reenter, stale_drop):
+def _nan_free(x: float) -> float | None:
+    return None if np.isnan(x) else float(x)
+
+
+def _run_kernel(
+    arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
+    limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False,
+):  # fmt: skip
+    n = len(side)
+    nan = np.full(n, np.nan)
+    extra = [nan if a is None else a for a in (limit, stop_pts, target_pts)]
     out = K.run_columns(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"],
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
-        adaptive, reenter, stale_drop,
+        extra[0][None, :], extra[1][None, :], extra[2][None, :],
+        chase, adaptive, reenter, stale_drop, protect_flatten,
     )  # fmt: skip
-    counts, _, errs, err_bar, final_side, final_entry, e_i, x_i, sd, e_px, x_px, why = out
+    (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
+     e_i, x_i, sd, e_px, x_px, why, t_stop) = out  # fmt: skip
     trades = list(
         zip(
             e_i.tolist(),
@@ -84,17 +96,39 @@ def _run_kernel(arrays, side, exit_, stop, target, adaptive, reenter, stale_drop
             e_px.tolist(),
             x_px.tolist(),
             why.tolist(),
+            [_nan_free(x) for x in t_stop],
             strict=True,
         )
     )
-    return (
-        trades,
-        int(errs[0]),
-        int(err_bar[0]),
+    final = (
         int(final_side[0]),
         int(final_entry[0]),
-        int(counts[0]),
+        _nan_free(final_px[0]),
+        _nan_free(final_stop[0]),
     )
+    return trades, int(errs[0]), int(err_bar[0]), final, int(counts[0])
+
+
+def _ref_trades(ref) -> list[tuple]:
+    return [
+        (t.entry_i, t.exit_i, t.side, t.entry_px, t.exit_px, t.reason, _nan_free(t.stop))
+        for t in ref.trades
+    ]
+
+
+def _ref_final(ref) -> tuple:
+    held = ref.final_side != 0
+    return (
+        ref.final_side,
+        ref.final_entry_i,
+        _nan_free(ref.final_entry_px) if held else None,
+        _nan_free(ref.final_stop) if held else None,
+    )
+
+
+def _kernel_final(final: tuple) -> tuple:
+    side, entry, px, stop = final
+    return (side, entry, px, stop) if side != 0 else (side, entry, None, None)
 
 
 @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
@@ -105,16 +139,15 @@ def test_kernel_equals_reference(case) -> None:
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
         adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
     )  # fmt: skip
-    trades, err, err_bar, final_side, final_entry, cnt = _run_kernel(*case)
+    trades, err, err_bar, final, cnt = _run_kernel(*case)
     if err:
         # on error the kernel stops; the table is not built (api raises), so compare the verdict
         assert (err, err_bar) == (ref.err, ref.err_bar)
         return
     assert ref.err == 0
     assert cnt == len(ref.trades)
-    expected = [(t.entry_i, t.exit_i, t.side, t.entry_px, t.exit_px, t.reason) for t in ref.trades]
-    assert trades == expected
-    assert (final_side, final_entry) == (ref.final_side, ref.final_entry_i)
+    assert trades == _ref_trades(ref)
+    assert _kernel_final(final) == _ref_final(ref)
 
 
 def _dense_case(rng: np.random.Generator):
@@ -143,17 +176,14 @@ def test_kernel_equals_reference_dense_both_stale_modes() -> None:
                 arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
                 adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
             )  # fmt: skip
-            trades, err, err_bar, final_side, final_entry, _ = _run_kernel(
+            trades, err, err_bar, final, _ = _run_kernel(
                 arrays, side, exit_, stop, target, adaptive, reenter, stale_drop
             )
             assert (err, err_bar if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
             stale_hits += err == K.ERR_STALE_BOOK
             if not err:
-                assert trades == [
-                    (t.entry_i, t.exit_i, t.side, t.entry_px, t.exit_px, t.reason)
-                    for t in ref.trades
-                ]
-                assert (final_side, final_entry) == (ref.final_side, ref.final_entry_i)
+                assert trades == _ref_trades(ref)
+                assert _kernel_final(final) == _ref_final(ref)
     assert stale_hits > 10  # the stale-book branch is really exercised in error mode
 
 
@@ -189,6 +219,76 @@ def test_dense_sampler_reaches_every_outcome() -> None:
         seen["err_stale"] += err == K.ERR_STALE_BOOK
         for t in trades if err == 0 else []:  # an errored column leaves its table unfilled
             seen[names[t[5]]] += 1
+    assert all(v > 0 for v in seen.values()), seen
+
+
+def _dense_limit_case(rng: np.random.Generator):
+    """Dense limit-then-market entries with absolute and point levels, chase 1-3 bars."""
+
+    arrays, side, exit_, stop, target = _dense_case(rng)
+    n = len(side)
+    c = arrays["c"]
+    use_limit = rng.random(n) < 0.7
+    # mostly resting (better than the close), sometimes marketable (at or through it)
+    off = rng.integers(-2, 6, n)
+    limit = np.where((side != 0) & use_limit, c - side * off * TICK, np.nan)
+    pts = rng.random(n) < 0.5
+    stop_pts = np.where((side != 0) & pts, rng.integers(1, 9, n) * TICK, np.nan)
+    target_pts = np.where((side != 0) & pts & (rng.random(n) < 0.7), rng.integers(1, 6, n) * TICK,
+                          np.nan)  # fmt: skip
+    stop = np.where(pts, np.nan, stop)
+    target = np.where(pts, np.nan, target)
+    # absolute levels for resting limits are set from the limit, as a strategy would
+    rest = np.isfinite(limit) & ~pts
+    stop = np.where(rest, limit - side * rng.integers(1, 9, n) * TICK, stop)
+    target = np.where(
+        rest & np.isfinite(target), limit + side * rng.integers(1, 6, n) * TICK, target
+    )
+    return arrays, side, exit_, stop, target, limit, stop_pts, target_pts, int(rng.integers(1, 4))
+
+
+LIMIT_OUTCOMES = ("limit_fill", "chase", "marketable", "same_bar_target", "err_protect",
+                  "err_race", "points", "protect_fail")  # fmt: skip
+
+
+def test_kernel_equals_reference_dense_limit_entries() -> None:
+    rng = np.random.default_rng(23)
+    seen = dict.fromkeys(LIMIT_OUTCOMES, 0)
+    for _ in range(6000):
+        arrays, side, exit_, stop, target, limit, stop_pts, target_pts, chase = _dense_limit_case(
+            rng
+        )
+        adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
+        stale_drop = bool(rng.random() < 0.5)
+        flat = bool(rng.random() < 0.5)
+        ref = simulate_column_reference(
+            arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
+            adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, entry_limit=limit,
+            stop_pts=stop_pts, target_pts=target_pts, chase_after=chase, protect_flatten=flat,
+        )  # fmt: skip
+        trades, err, err_bar, final, _ = _run_kernel(
+            arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
+            limit, stop_pts, target_pts, chase, flat,
+        )  # fmt: skip
+        assert (err, err_bar if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
+        seen["err_protect"] += err == K.ERR_PROTECT_REJECTED
+        seen["err_race"] += err == K.ERR_EXIT_RACE
+        if err:
+            continue
+        assert trades == _ref_trades(ref)
+        assert _kernel_final(final) == _ref_final(ref)
+        c = arrays["c"]
+        for e, x, sd, epx, _xpx, why, _st in trades:
+            if epx != c[e]:  # only a resting limit fills away from its bar's close
+                seen["limit_fill"] += 1
+            j = e - chase
+            if epx == c[e] and j >= 0 and side[j] == sd and np.isfinite(limit[j]) and side[e] == 0:
+                seen["chase"] += 1
+            if side[e] == sd and np.isfinite(limit[e]) and epx == c[e]:
+                seen["marketable"] += (limit[e] >= c[e]) if sd > 0 else (limit[e] <= c[e])
+            seen["same_bar_target"] += e == x and why == K.REASON_TARGET
+            seen["protect_fail"] += why == K.REASON_PROTECT_FAIL
+            seen["points"] += bool(np.isfinite(stop_pts[e]))
     assert all(v > 0 for v in seen.values()), seen
 
 
