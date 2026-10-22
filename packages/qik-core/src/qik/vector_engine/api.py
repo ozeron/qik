@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from datetime import date
+from enum import StrEnum
 from typing import Any, Literal
 
 import numpy as np
@@ -31,12 +32,16 @@ from .sizing import Sizing
 __all__ = [
     "SIGNAL_FIELDS",
     "Bars",
+    "Compliance",
     "Costs",
     "Instrument",
+    "MarketFill",
+    "Profile",
     "Result",
     "Rules",
     "Signals",
     "Sizing",
+    "require_nautilus",
     "simulate",
 ]
 
@@ -47,6 +52,21 @@ REASON_NAMES = {
     K.REASON_STOP_GAP: "stop_gap",
     K.REASON_PROTECT_FAIL: "protect_fail",
 }
+
+
+class Profile(StrEnum):
+    NAUTILUS = "nautilus"
+    TRADINGVIEW = "tradingview"
+
+
+class Compliance(StrEnum):
+    NAUTILUS = "nautilus"
+    REPRO_TRADINGVIEW = "repro:tradingview"
+
+
+class MarketFill(StrEnum):
+    CLOSE = "close"
+    NEXT_OPEN = "next_open"
 
 
 @dataclass(frozen=True)
@@ -75,12 +95,15 @@ class Costs:
 
 @dataclass(frozen=True)
 class Rules:
-    """Execution switches (docs/vector-engine.md, A6, A9 and A13).
+    """Execution switches (docs/vector-engine.md, A6, A9, A13 and repro-only R1).
 
     ``stale_book`` decides what happens when a new entry's stop lands inside the quote a same-bar
     limit fill left stale in Nautilus' L1 book: ``"error"`` (default) refuses the input,
     ``"nautilus"`` reproduces Nautilus: entry fills, stop rejected, linked target cancelled, the
     position runs with no levels. The second is a venue-simulation artifact, not market behaviour.
+
+    NEXT_OPEN is available only under Profile.TRADINGVIEW, for external-author reproduction;
+    it requires timezone-aware Bars.index and excludes limit-then-market entries.
     """
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
@@ -89,8 +112,16 @@ class Rules:
     limit_chase_bars: int = 1  # LimitThenMarket.chase_after_bars for Signals.entry_limit (A15)
     # a limit entry's stop at or through its fill bar's close: "error", or "flatten" as V2 does
     protect_rejected: Literal["error", "flatten"] = "error"
+    profile: Profile = Profile.NAUTILUS
+    market_fill: MarketFill = MarketFill.CLOSE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.profile, Profile):
+            raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
+        if not isinstance(self.market_fill, MarketFill):
+            raise ValueError(f"market_fill must be a MarketFill enum, got {self.market_fill!r}")
+        if self.market_fill is MarketFill.NEXT_OPEN and self.profile is not Profile.TRADINGVIEW:
+            raise ValueError("MarketFill.NEXT_OPEN requires Profile.TRADINGVIEW (repro only)")
         if self.stale_book not in ("error", "nautilus"):
             raise ValueError(f"stale_book must be 'error' or 'nautilus', got {self.stale_book!r}")
         if self.protect_rejected not in ("error", "flatten"):
@@ -161,10 +192,12 @@ def _as_2d(a: Any, n: int, dtype: Any, name: str) -> np.ndarray:
 class Signals:
     """What the strategy decides, one column per config.
 
-    ``entry_side[i]`` (+1 long, -1 short, 0 none) is a market entry at bar ``i``'s close, taken only
-    when flat. ``exit[i]`` is a market exit at bar ``i``'s close while in a position. ``stop[i]`` and
-    ``target[i]`` are absolute price levels placed with the entry made on bar ``i`` (NaN = none): a
-    resting stop-market and a resting limit, live from bar ``i + 1``, cancelling each other.
+    ``entry_side[i]`` (+1 long, -1 short, 0 none) is a market entry decided at bar ``i``'s close,
+    taken only when flat. ``exit[i]`` decides a market exit there while in a position. Markets fill
+    at that close by default, or the next open under repro-only R1. ``stop[i]`` and
+    ``target[i]`` are absolute price levels placed with the entry decided on bar ``i`` (NaN = none): a
+    resting stop-market and a resting limit, live from bar ``i + 1``, cancelling each other (R1:
+    live during that bar after the entry open, with point offsets measured from that open).
 
     ``entry_limit[i]`` turns that entry into the book's ``LimitThenMarket``: a resting limit at that
     price, chased with a market order at the close ``Rules.limit_chase_bars`` bars later if still
@@ -195,6 +228,13 @@ class Result:
     n_configs: int
     index: pd.DatetimeIndex | None = None  # the bars' timestamps
     initial_cash: float | None = None
+    compliance: Compliance = Compliance.NAUTILUS
+
+    @property
+    def deployable(self) -> bool:
+        """Phase 1 has no research-only Nautilus rules: compliance is the whole gate."""
+
+        return self.compliance is Compliance.NAUTILUS
 
     def summary(
         self,
@@ -207,12 +247,21 @@ class Result:
 
         from .stats import summarize
 
-        return summarize(
+        out = summarize(
             self,
             eligible_sessions=eligible_sessions,
             session_tz=session_tz,
             periods_per_year=periods_per_year,
         )
+        out["compliance"] = self.compliance.value
+        return out
+
+
+def require_nautilus(res: Result) -> None:
+    """Refuse reproduction results at a research/selection boundary."""
+
+    if res.compliance is not Compliance.NAUTILUS:
+        raise ValueError(f"Nautilus-compliant result required; got {res.compliance}")
 
 
 def _check_tick(levels: np.ndarray, rows: np.ndarray, tick: float, name: str) -> None:
@@ -239,7 +288,7 @@ def simulate(
     sizing: Sizing | None = None,
     initial_cash: float | None = None,
 ) -> Result:
-    """Run every config of ``signals`` over ``bars`` under the Nautilus-compatible rules."""
+    """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
     n = len(bars)
     side = _as_2d(signals.entry_side, n, np.int8, "entry_side")
@@ -256,6 +305,9 @@ def simulate(
     stop_pts = opt(signals.stop_points, "stop_points")
     target_pts = opt(signals.target_points, "target_points")
     levels = (stop, target, limit, stop_pts, target_pts)
+    next_open = rules.market_fill is MarketFill.NEXT_OPEN
+    if next_open and np.isfinite(limit).any():
+        raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
     if not all(a.shape[1] == k for a in (exit_, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():
@@ -288,7 +340,9 @@ def simulate(
             _check_tick(a, entries, instrument.tick, name)
 
     new_day = np.zeros(n, np.bool_)
-    if np.isfinite(limit).any():
+    if next_open:
+        new_day = _new_york_days(bars, "NEXT_OPEN")
+    elif np.isfinite(limit).any():
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
     t = np.ascontiguousarray
     out = K.run_columns(
@@ -296,14 +350,16 @@ def simulate(
         t(side.T), t(exit_.T), t(stop.T), t(target.T), t(limit.T), t(stop_pts.T), t(target_pts.T),
         new_day, int(rules.limit_chase_bars), rules.adaptive_high_low_ordering,
         rules.reenter_on_exit_bar, rules.stale_book == "nautilus",
-        rules.protect_rejected == "flatten",
+        rules.protect_rejected == "flatten", next_open,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip
     bad = np.flatnonzero(errs)
     if bad.size:
         j = int(bad[0])
-        _raise_kernel_error(int(errs[j]), int(err_bar[j]), j, float(bars.close[int(err_bar[j])]))
+        eb = int(err_bar[j])
+        price = float(bars.open[eb] if next_open else bars.close[eb])
+        _raise_kernel_error(int(errs[j]), eb, j, price, next_open=next_open)
     cfg = np.repeat(np.arange(k, dtype=np.int64), counts)
     trades = pd.DataFrame(
         {
@@ -381,7 +437,10 @@ def simulate(
                     f"raise initial_cash or size smaller"
                 )
         open_positions["contracts"] = open_contracts
-    return Result(trades, open_positions, n, k, bars.index, initial_cash)
+    compliance = (
+        Compliance.NAUTILUS if rules.profile is Profile.NAUTILUS else Compliance.REPRO_TRADINGVIEW
+    )
+    return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance)
 
 
 def _limit_entry_checks(
@@ -401,14 +460,17 @@ def _limit_entry_checks(
             f"bar {i}, config {j}: a limit entry needs a stop: V2 sends no protection at all "
             f"without one (not even the target), so the engine cannot know what it holds"
         )
+    return _new_york_days(bars, "limit entries")
+
+
+def _new_york_days(bars: Bars, rule: str) -> np.ndarray:
+    """Shared session boundary calculation for pending limits and next-open market orders."""
+
     if bars.index is None:
-        raise ValueError(
-            "limit entries need Bars(index=...): a limit still working when the New York date "
-            "changes is refused, and the engine needs the dates to see it"
-        )
+        raise ValueError(f"{rule} need timezone-aware Bars(index=...) to detect New York dates")
     stamps = pd.DatetimeIndex(bars.index)
     if stamps.tz is None:
-        raise ValueError("Bars.index must be timezone-aware for limit entries")
+        raise ValueError(f"Bars.index must be timezone-aware for {rule}")
     days = pd.Series(stamps.tz_convert("America/New_York")).dt.date.to_numpy()
     new_day = np.zeros(len(bars), np.bool_)
     new_day[1:] = days[1:] != days[:-1]
@@ -416,6 +478,10 @@ def _limit_entry_checks(
 
 
 _KERNEL_ERRORS = {
+    K.ERR_NEXT_OPEN_SESSION_END: (
+        "NEXT_OPEN decision at bar {bar}, config {j} is at session end: the next bar is absent "
+        "or starts a new New York date; no cross-session market fills (docs/vector-engine.md R1)"
+    ),
     K.ERR_PROTECT_REJECTED: (
         "stop for the limit entry filled at bar {bar}, config {j} is at or through that bar's "
         "close ({close}): the protection goes out after the bar, Nautilus rejects the stop and the "
@@ -444,7 +510,15 @@ _KERNEL_ERRORS = {
 }
 
 
-def _raise_kernel_error(code: int, bar: int, j: int, close: float) -> None:
+def _raise_kernel_error(
+    code: int, bar: int, j: int, close: float, *, next_open: bool = False
+) -> None:
+    if next_open and code in (K.ERR_STOP_IN_MARKET, K.ERR_TARGET_IN_MARKET):
+        leg = "stop" if code == K.ERR_STOP_IN_MARKET else "target"
+        raise ValueError(
+            f"{leg} level at bar {bar}, config {j} is not beyond the entry fill at the open "
+            f"({close}): R1 refuses already-marketable protection on the entry bar"
+        )
     template = _KERNEL_ERRORS.get(code)
     if template is None:
         raise RuntimeError(f"kernel returned unknown error code {code} (bar {bar}, config {j})")

@@ -1,6 +1,6 @@
 """Numba kernel: closed-form per-bar execution rules, one column (config) at a time.
 
-The rules are written down in ``docs/vector-engine.md`` (assumptions A1-A15). ``reference.py`` is an
+The rules are written down in ``docs/vector-engine.md`` (A1-A15 and repro-only R1). ``reference.py`` is an
 independent, slow implementation of the same spec that matches orders price point by price point;
 ``tests`` check the two agree exactly and that both reproduce Nautilus golden data.
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 
-REASON_SIGNAL = 1  # market exit at the decision bar's close
+REASON_SIGNAL = 1  # market exit at the decision close (R1: the next open)
 REASON_STOP = 2  # resting stop-market hit during a bar, filled at the stop level
 REASON_TARGET = 3  # resting limit hit during a bar, filled at the limit level
 REASON_STOP_GAP = 4  # resting stop already through at the bar's open, filled at the open
@@ -24,6 +24,7 @@ ERR_TARGET_IN_MARKET = 2  # target level not strictly beyond the entry close (wo
 ERR_STALE_BOOK = 3  # new stop falls inside the stale quote a same-bar limit fill left (A13)
 ERR_PROTECT_REJECTED = 4  # limit-then-market entry's stop at or through its fill bar's close (A15)
 ERR_PENDING_NEW_DAY = 5  # a limit entry still working when the New York date changes (A15)
+ERR_NEXT_OPEN_SESSION_END = 6  # R1 decision has no following bar on the same New York date
 
 
 @nb.njit(cache=True, nogil=True)
@@ -113,6 +114,7 @@ def _column(
     reenter,
     stale_drop,
     protect_flatten,
+    next_open,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -143,12 +145,45 @@ def _column(
     p_tg = np.nan
     p_stp = np.nan
     p_tgp = np.nan
+    market_entry = -1  # R1: decision bar whose market entry will fill at the next open
+    market_exit = False
     for i in range(n):
         exited = False
         busy = False  # a working entry resolved on this bar: the sleeve could not act (A15)
         stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
         stale_px = 0.0
         ci = c[i]
+        if market_exit:
+            if not count_only:
+                k = base + cnt
+                out_entry_i[k] = entry_i
+                out_exit_i[k] = i
+                out_side[k] = pos
+                out_entry_px[k] = entry_px
+                out_exit_px[k] = o[i]
+                out_reason[k] = REASON_SIGNAL
+                out_stop[k] = stop
+            cnt += 1
+            pos = 0
+            exited = True
+            market_exit = False
+        if market_entry >= 0:
+            d = market_entry
+            s = side_sig[d]
+            st = _level(s, o[i], entry_stop[d], stop_pts[d], -1.0)
+            tg = _level(s, o[i], entry_target[d], target_pts[d], 1.0)
+            # Newly placed protection is validated at the actual entry open. A4's resting-stop
+            # gap rule cannot be applied retroactively across this entry fill (R1).
+            if _in_market(s, st, o[i], True):
+                return cnt, ERR_STOP_IN_MARKET, i, pos, entry_i, entry_px, stop
+            if _in_market(s, tg, o[i], False):
+                return cnt, ERR_TARGET_IN_MARKET, i, pos, entry_i, entry_px, stop
+            pos = s
+            entry_i = i
+            entry_px = o[i]
+            stop = st
+            target = tg
+            market_entry = -1
         if pend != 0 and new_day[i]:
             # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
             return cnt, ERR_PENDING_NEW_DAY, i, pos, entry_i, entry_px, stop
@@ -245,6 +280,21 @@ def _column(
                         stale_px = px
                 pos = 0
                 exited = True
+        if next_open:
+            # R1 decisions remain at the close; stage only actionable orders. At the following
+            # open a market exit executes before a replacement entry and before the price sweep.
+            market_exit = exit_sig[i] and pos != 0
+            enter = (
+                (pos == 0 or (market_exit and reenter))
+                and side_sig[i] != 0
+                and (reenter or not exited)
+            )
+            if market_exit or enter:
+                if i + 1 == n or new_day[i + 1]:
+                    return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
+                if enter:
+                    market_entry = i
+            continue
         # --- decisions at bar i's close (on_bar): market orders fill at c[i] ---
         if exit_sig[i]:
             if pos != 0:
@@ -322,7 +372,7 @@ def _column(
 @nb.njit(parallel=True, cache=True)
 def run_columns(
     o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts,
-    new_day, chase, adaptive, reenter, stale_drop, protect_flatten,
+    new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -346,7 +396,8 @@ def run_columns(
         cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, True, e0, e0, s0, f0, f0, s0, f0, 0,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, True,
+            e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
         errs[j] = err
@@ -371,7 +422,8 @@ def run_columns(
             _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, False, entry_i, exit_i, side, entry_px,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, False,
+                entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
             )  # fmt: skip

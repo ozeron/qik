@@ -49,8 +49,8 @@ class BarView(NamedTuple):
 class Decision:
     """What to do at this bar's close; the same fields as one row of ``Signals``."""
 
-    side: int = 0  # +1 / -1: entry at this close when flat (market, or the limit below)
-    exit: bool = False  # market exit at this close when in a position; cancels a working entry
+    side: int = 0  # +1 / -1: entry decided at this close when flat (market, or the limit below)
+    exit: bool = False  # exit decided at this close when in a position; cancels a working entry
     stop: float = math.nan  # absolute level placed with this bar's entry
     target: float = math.nan
     entry_limit: float = math.nan  # LimitThenMarket price for this bar's entry (A15)

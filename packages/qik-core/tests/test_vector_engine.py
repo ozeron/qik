@@ -11,7 +11,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from qik.vector_engine import Bars, Costs, Instrument, Rules, Signals, simulate
+from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules, Signals, simulate
 from qik.vector_engine import kernel as K
 from qik.vector_engine.reference import simulate_column_reference
 
@@ -76,6 +76,7 @@ def _nan_free(x: float) -> float | None:
 def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
     limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
+    next_open=False,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
@@ -85,7 +86,7 @@ def _run_kernel(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"],
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
         extra[0][None, :], extra[1][None, :], extra[2][None, :],
-        day, chase, adaptive, reenter, stale_drop, protect_flatten,
+        day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, t_stop) = out  # fmt: skip
@@ -132,15 +133,16 @@ def _kernel_final(final: tuple) -> tuple:
     return (side, entry, px, stop) if side != 0 else (side, entry, None, None)
 
 
+@pytest.mark.parametrize("next_open", [False, True])
 @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(_case())
-def test_kernel_equals_reference(case) -> None:
+@given(case=_case())
+def test_kernel_equals_reference(case, next_open: bool) -> None:
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop = case
     ref = simulate_column_reference(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
-        adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
+        adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open,
     )  # fmt: skip
-    trades, err, err_bar, final, cnt = _run_kernel(*case)
+    trades, err, err_bar, final, cnt = _run_kernel(*case, next_open=next_open)
     if err:
         # on error the kernel stops; the table is not built (api raises), so compare the verdict
         assert (err, err_bar) == (ref.err, ref.err_bar)
@@ -166,26 +168,90 @@ def _dense_case(rng: np.random.Generator):
     return dict(o=o, h=h, lo=lo, c=c), side, exit_, stop, target
 
 
-def test_kernel_equals_reference_dense_both_stale_modes() -> None:
+@settings(max_examples=300, deadline=None)
+@given(
+    st.lists(
+        st.tuples(st.integers(90, 110), st.sampled_from([-1, 0, 1]), st.booleans()),
+        min_size=2,
+        max_size=30,
+    )
+)
+def test_next_open_equals_shifted_close_for_unprotected_markets(
+    rows: list[tuple[int, int, bool]],
+) -> None:
+    """With no intrabar protection, shift decisions one bar and set the fill close to that open.
+
+    Protection and reentry suppression after intrabar fills are deliberately outside this
+    equivalence: a CLOSE entry cannot activate protection during its own bar.
+    """
+
+    price, side, exit_ = (np.array(values) for values in zip(*rows, strict=True))
+    side[-1], exit_[-1] = 0, False  # no order without a following fill bar
+    index = pd.date_range("2023-01-03 10:00", periods=len(rows), freq="min", tz="UTC")
+    # Decision closes differ from fill opens, to catch accidentally filling at the decision price.
+    bars = Bars(price, price + 2, price - 2, price + 1, index=index)
+    repro = simulate(
+        bars,
+        Signals(side, exit_),
+        rules=Rules(
+            profile=Profile.TRADINGVIEW,
+            market_fill=MarketFill.NEXT_OPEN,
+        ),
+    )
+    close = simulate(
+        Bars(price, price + 2, price - 2, price, index=index),
+        Signals(np.r_[0, side[:-1]], np.r_[False, exit_[:-1]]),
+    )
+    pd.testing.assert_frame_equal(repro.trades, close.trades)
+    pd.testing.assert_frame_equal(repro.open_positions, close.open_positions)
+
+
+@pytest.mark.parametrize("next_open", [False, True])
+def test_kernel_equals_reference_dense_both_stale_modes(next_open: bool) -> None:
     rng = np.random.default_rng(11)
     stale_hits = 0
     for stale_drop in (False, True):
         for _ in range(2500):
             arrays, side, exit_, stop, target = _dense_case(rng)
             adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
+            new_day = rng.random(len(side)) < 0.04 if next_open else None
+            # Mixed absolute/point protection, with occasional no levels, in next-open mode.
+            stop_pts = target_pts = None
+            if next_open:
+                points = rng.random(len(side)) < 0.5
+                stop_pts = np.where(points, rng.integers(1, 9, len(side)) * TICK, np.nan)
+                target_pts = np.where(points, rng.integers(1, 5, len(side)) * TICK, np.nan)
+                stop, target = np.where(points, np.nan, stop), np.where(points, np.nan, target)
+                naked = rng.random(len(side)) < 0.2
+                stop[naked] = target[naked] = stop_pts[naked] = target_pts[naked] = np.nan
             ref = simulate_column_reference(
                 arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
                 adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
+                next_open=next_open, new_day=new_day, stop_pts=stop_pts, target_pts=target_pts,
             )  # fmt: skip
             trades, err, err_bar, final, _ = _run_kernel(
-                arrays, side, exit_, stop, target, adaptive, reenter, stale_drop
+                arrays,
+                side,
+                exit_,
+                stop,
+                target,
+                adaptive,
+                reenter,
+                stale_drop,
+                next_open=next_open,
+                new_day=new_day,
+                stop_pts=stop_pts,
+                target_pts=target_pts,
             )
             assert (err, err_bar if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
             stale_hits += err == K.ERR_STALE_BOOK
             if not err:
                 assert trades == _ref_trades(ref)
                 assert _kernel_final(final) == _ref_final(ref)
-    assert stale_hits > 10  # the stale-book branch is really exercised in error mode
+    if not next_open:
+        assert stale_hits > 10  # the stale-book branch is really exercised in error mode
+    else:
+        assert stale_hits == 0  # next-open entries never use the preceding close's stale book
 
 
 def test_dense_sampler_reaches_every_outcome() -> None:

@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .kernel import (
+    ERR_NEXT_OPEN_SESSION_END,
     ERR_NONE,
     ERR_PENDING_NEW_DAY,
     ERR_PROTECT_REJECTED,
@@ -144,6 +145,17 @@ class _Pending:
     target_pts: float
 
 
+@dataclass
+class _MarketEntry:
+    """R1 entry decided at a close, held until the following open."""
+
+    side: int
+    stop: float
+    target: float
+    stop_pts: float
+    target_pts: float
+
+
 def simulate_column_reference(
     o: np.ndarray,
     h: np.ndarray,
@@ -163,6 +175,7 @@ def simulate_column_reference(
     chase_after: int = 1,
     protect_flatten: bool = False,
     new_day: np.ndarray | None = None,
+    next_open: bool = False,
 ) -> RefColumn:
     n = len(o)
     starts_day = np.zeros(n, bool) if new_day is None else new_day
@@ -177,11 +190,29 @@ def simulate_column_reference(
     stop = math.nan
     target = math.nan
     pending: _Pending | None = None
+    market_entry: _MarketEntry | None = None
+    market_exit = False
     for i in range(n):
         exited = False
         busy = False
         book = _Book()
         close = float(c[i])
+        if market_exit:
+            trades.append(RefTrade(entry_i, i, pos, entry_px, float(o[i]), REASON_SIGNAL, stop))
+            pos = 0
+            exited = True
+            market_exit = False
+        if market_entry is not None:
+            m = market_entry
+            px = float(o[i])
+            st, tg = _levels(m.side, px, m.stop, m.target, m.stop_pts, m.target_pts)
+            # R1's newly placed protection cannot retroactively gap-fill across the entry open.
+            if not math.isnan(st) and (st >= px if m.side > 0 else st <= px):
+                return RefColumn(trades, ERR_STOP_IN_MARKET, i, pos, entry_i)
+            if not math.isnan(tg) and (tg <= px if m.side > 0 else tg >= px):
+                return RefColumn(trades, ERR_TARGET_IN_MARKET, i, pos, entry_i)
+            pos, entry_i, entry_px, stop, target = m.side, i, px, st, tg
+            market_entry = None
         if pending is not None and bool(starts_day[i]):
             # V2 drops a staged chase on a new calendar day and the DAY limit keeps resting; the
             # engine does not model that, so the input is refused (A15).
@@ -238,6 +269,27 @@ def simulate_column_reference(
                 trades.append(RefTrade(entry_i, i, pos, entry_px, fill[1], fill[0], stop))
                 pos = 0
                 exited = True
+        if next_open:
+            # Gate at decision time. An exit can stage a replacement entry at the same open;
+            # unrelated entry signals while holding are still ignored (one NETTING position).
+            market_exit = bool(exit_sig[i]) and pos != 0
+            enter = (
+                (pos == 0 or (market_exit and reenter))
+                and int(side_sig[i]) != 0
+                and (reenter or not exited)
+            )
+            if market_exit or enter:
+                if i + 1 == n or bool(starts_day[i + 1]):
+                    return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
+                if enter:
+                    market_entry = _MarketEntry(
+                        int(side_sig[i]),
+                        float(entry_stop[i]),
+                        float(entry_target[i]),
+                        float(stop_pts_sig[i]),
+                        float(tgt_pts_sig[i]),
+                    )
+            continue
         if bool(exit_sig[i]):
             if pos != 0:
                 trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
