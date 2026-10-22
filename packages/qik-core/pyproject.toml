@@ -5,7 +5,7 @@ description = "Quant Infrastructure Kit core: strategy metrics, blotter contract
 authors = [{ name = "Alex Lapchenko", email = "ozeron@me.com" }]
 license = "MIT"
 requires-python = ">=3.13"
-dependencies = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=19"]  # pyarrow: qik.runs writes parquet
+dependencies = ["numpy>=2.0", "pandas>=2.2", "pyarrow>=19", "numba>=0.62"]  # pyarrow: qik.runs writes parquet; numba: qik.vector_engine
 
 [project.optional-dependencies]
 reports = ["quantstats>=0.0.81", "matplotlib>=3.8"]
