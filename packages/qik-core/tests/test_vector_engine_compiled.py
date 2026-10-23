@@ -462,3 +462,128 @@ def test_view_has_no_working_protection_until_callback_order_settles(slots):
     np.testing.assert_array_equal(observed[:, 0], [0, 0, 1, 1, 1, 1, 0])
     assert np.isnan(observed[2, 4:6]).all()
     np.testing.assert_array_equal(observed[3:6, 4:6], [[95, 110]] * 3)
+
+
+@pytest.mark.parametrize("target", [110.0, 99.5])
+@pytest.mark.parametrize("slots", [False, True])
+def test_resting_limit_view_precedes_callback_protection(slots, target):
+    c = np.full(4, 100.0)
+    bars = Bars(
+        c,
+        c + 1,
+        np.array([100.0, 98.0, 100.0, 100.0]),
+        c,
+        index=pd.date_range("2023-01-03 15:00", periods=4, freq="min", tz="UTC"),
+    )
+    signals = np.full((4, 15), np.nan)
+    signals[:, (0, 1, 12, 13, 14)] = 0
+    signals[0, [0, 2, 3, 4]] = [1, 95, target, 99]
+    signals[2, 1] = 1
+    observed, clock = np.full((4, 12), np.nan), np.zeros(4, np.int64)
+    fields = ("entry_side", "exit", "stop", "target", "entry_limit")
+    result = run(
+        CaptureCore,
+        bars,
+        features={"signals": signals, "observed": observed, "clock": clock},
+        signal_fields=fields + (("stop_update",) if slots else ()),
+    )[0]
+    assert observed[1, 0] == 1
+    assert observed[1, 3] == 99
+    assert np.isnan(observed[1, 4:6]).all()
+    assert observed[1, 8] == -1
+    # The callback may fill a newly accepted target at the same close. The decision
+    # must precede that settlement, but the batch trade remains field-exact.
+    expected = simulate(
+        bars,
+        Signals(
+            signals[:, 0].astype(np.int8),
+            signals[:, 1].astype(bool),
+            stop=signals[:, 2],
+            target=signals[:, 3],
+            entry_limit=signals[:, 4],
+        ),
+    )
+    pd.testing.assert_frame_equal(result.trades, expected.trades, check_exact=True)
+
+
+def test_declared_inactive_calendar_fields_allow_naive_last_close():
+    from qik.vector_engine import Flatten, Profile
+
+    c = np.full(4, 100.0)
+    bars = Bars(c, c + 1, c - 1, c, index=pd.date_range("2023-01-03", periods=4, freq="min"))
+    signals = np.full((4, 15), np.nan)
+    signals[:, (0, 1, 12, 13, 14)] = 0
+    signals[0, 0], signals[2, 12] = 1, 1
+    rules = Rules(profile=Profile.REPRO, flatten=Flatten.LAST_BAR_CLOSE)
+    actual = run(ReplayCore, bars, features={"signals": signals}, rules=rules)[0]
+    expected = simulate(
+        bars,
+        Signals(
+            signals[:, 0].astype(np.int8),
+            signals[:, 1].astype(bool),
+            flatten=signals[:, 12].astype(bool),
+        ),
+        rules=rules,
+    )
+    pd.testing.assert_frame_equal(actual.trades, expected.trades, check_exact=True)
+
+
+def test_pending_limit_refuses_explicit_session_boundary_without_index():
+    from qik.vector_engine import Profile
+
+    c = np.full(3, 100.0)
+    bars = Bars(c, c + 1, np.array([100.0, 98.0, 100.0]), c, session_labels=np.array([0, 1, 1]))
+    signals = np.full((3, 15), np.nan)
+    signals[:, (0, 1, 12, 13, 14)] = 0
+    signals[0, [0, 2, 4]], signals[2, 1] = [1, 95, 99], 1
+    rules = Rules(profile=Profile.REPRO)
+    with pytest.raises(ValueError, match="pending|New York|DAY"):
+        run(ReplayCore, bars, features={"signals": signals}, rules=rules)
+    with pytest.raises(ValueError, match="pending|New York|DAY"):
+        simulate(
+            bars,
+            Signals(
+                signals[:, 0].astype(np.int8),
+                signals[:, 1].astype(bool),
+                stop=signals[:, 2],
+                entry_limit=signals[:, 4],
+            ),
+            rules=rules,
+        )
+
+
+def test_sequential_cash_is_opt_in_and_default_is_batch_exact():
+    from itertools import accumulate
+
+    from qik.vector_engine import Costs, Instrument, Sizing
+
+    c = np.tile([100.0, 100.25], 10)
+    bars = Bars(c, c + 0.25, c - 0.25, c)
+    signals = np.full((len(c), 15), np.nan)
+    signals[:, (0, 1, 12, 13, 14)] = 0
+    signals[::2, 0], signals[1::2, 1] = 1, 1
+    kw = dict(
+        instrument=Instrument(0.25, 2.0),
+        costs=Costs(commission_per_side=0.1),
+        sizing=Sizing(contracts=1),
+        initial_cash=100000.0,
+    )
+    fields = ("entry_side", "exit")
+    default = run(ReplayCore, bars, features={"signals": signals}, signal_fields=fields, **kw)[0]
+    sequential = run(
+        ReplayCore,
+        bars,
+        features={"signals": signals},
+        signal_fields=fields,
+        cash_accumulation="sequential",
+        **kw,
+    )[0]
+    batch = simulate(bars, Signals(signals[:, 0].astype(np.int8), signals[:, 1].astype(bool)), **kw)
+    pd.testing.assert_frame_equal(default.trades, batch.trades, check_exact=True)
+    pd.testing.assert_frame_equal(default.open_positions, batch.open_positions, check_exact=True)
+    expected = batch.trades.copy()
+    expected["equity_usd"] = np.fromiter(
+        accumulate(expected.pnl_usd, initial=kw["initial_cash"]), float
+    )[1:]
+    pd.testing.assert_frame_equal(sequential.trades, expected, check_exact=True)
+    assert not np.array_equal(default.trades.equity_usd, sequential.trades.equity_usd)

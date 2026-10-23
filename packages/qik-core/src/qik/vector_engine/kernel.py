@@ -13,6 +13,7 @@ from collections import namedtuple
 
 import numba as nb
 import numpy as np
+from numba.extending import overload
 
 from .sizing import _contracts_for
 
@@ -165,7 +166,7 @@ def _venue_record(
         out_reason[k], out_stop[k] = why, stop
 
 
-@nb.njit(cache=False, nogil=True)
+@nb.njit(cache=True, nogil=True)
 def _venue_column(
     o,
     h,
@@ -213,33 +214,10 @@ def _venue_column(
     """
     commands = [(0, 0, 0)]
     commands.pop()
-    pos, ei, gen = 0, -1, -1
-    ep, stop, target = np.nan, np.nan, np.nan
-    pending = -1
-    resting = False
-    chasing = False
-    protection = 0
-    closing = False
-    close_reason = REASON_SIGNAL
-    rejected_stop = False
-    cnt = 0
     state = VenueState(
-        commands,
-        pos,
-        ei,
-        gen,
-        ep,
-        stop,
-        target,
-        pending,
-        resting,
-        chasing,
-        protection,
-        closing,
-        close_reason,
-        rejected_stop,
-        cnt,
-    )
+        commands, 0, -1, -1, np.nan, np.nan, np.nan, -1,
+        False, False, 0, False, REASON_SIGNAL, False, 0,
+    )  # fmt: skip
     inputs = (
         o,
         h,
@@ -282,42 +260,8 @@ def _venue_column(
     for i in range(len(c)):
         state, err, eb = _venue_column_advance(state, i, inputs, core)
         if err:
-            (
-                commands,
-                pos,
-                ei,
-                gen,
-                ep,
-                stop,
-                target,
-                pending,
-                resting,
-                chasing,
-                protection,
-                closing,
-                close_reason,
-                rejected_stop,
-                cnt,
-            ) = state
-            return cnt, err, eb, pos, ei, ep, stop
-    (
-        commands,
-        pos,
-        ei,
-        gen,
-        ep,
-        stop,
-        target,
-        pending,
-        resting,
-        chasing,
-        protection,
-        closing,
-        close_reason,
-        rejected_stop,
-        cnt,
-    ) = state
-    return cnt, ERR_NONE, -1, pos, ei, ep, stop
+            return state.cnt, err, eb, state.pos, state.ei, state.ep, state.stop
+    return state.cnt, ERR_NONE, -1, state.pos, state.ei, state.ep, state.stop
 
 
 VenueState = namedtuple(
@@ -326,7 +270,7 @@ VenueState = namedtuple(
 )
 
 
-@nb.njit(cache=False, nogil=True, inline="always")
+@nb.njit(cache=True, nogil=True, inline="always")
 def _venue_column_advance(state, i, inputs, core=None):
     (
         o,
@@ -827,7 +771,7 @@ def _venue_column_advance(state, i, inputs, core=None):
     )
 
 
-@nb.njit(cache=False, nogil=True)
+@nb.njit(cache=True, nogil=True)
 def _column(
     o,
     h,
@@ -879,7 +823,8 @@ def _column(
 
     if latency_bars or one_tick:
         venue_slip = tick if one_tick else 0.0
-        return _venue_column(
+        venue = _venue_driver(core)
+        return venue(
             o,
             h,
             lo,
@@ -920,39 +865,11 @@ def _column(
             core,
         )
     n = o.shape[0]
-    pos = 0
-    entry_i = -1
-    entry_px = 0.0
-    stop = np.nan
-    target = np.nan
-    cnt = 0
-    # working limit-then-market entry (A15): side, limit, chase bar, and its level spec
-    pend = 0
-    p_lim = 0.0
-    p_chase = -1
-    p_st = np.nan
-    p_tg = np.nan
-    p_stp = np.nan
-    p_tgp = np.nan
-    market_entry = -1  # R1: decision bar whose market entry will fill at the next open
-    market_exit = False
+    # Flat position, no working limit or next-open market commands.
     state = ColumnState(
-        pos,
-        entry_i,
-        entry_px,
-        stop,
-        target,
-        cnt,
-        pend,
-        p_lim,
-        p_chase,
-        p_st,
-        p_tg,
-        p_stp,
-        p_tgp,
-        market_entry,
-        market_exit,
-    )
+        0, -1, 0.0, np.nan, np.nan, 0, 0, 0.0, -1,
+        np.nan, np.nan, np.nan, np.nan, -1, False,
+    )  # fmt: skip
     inputs = (
         o,
         h,
@@ -999,42 +916,8 @@ def _column(
     for i in range(n):
         state, err, eb = _column_advance(state, i, inputs, core)
         if err:
-            (
-                pos,
-                entry_i,
-                entry_px,
-                stop,
-                target,
-                cnt,
-                pend,
-                p_lim,
-                p_chase,
-                p_st,
-                p_tg,
-                p_stp,
-                p_tgp,
-                market_entry,
-                market_exit,
-            ) = state
-            return cnt, err, eb, pos, entry_i, entry_px, stop
-    (
-        pos,
-        entry_i,
-        entry_px,
-        stop,
-        target,
-        cnt,
-        pend,
-        p_lim,
-        p_chase,
-        p_st,
-        p_tg,
-        p_stp,
-        p_tgp,
-        market_entry,
-        market_exit,
-    ) = state
-    return cnt, ERR_NONE, -1, pos, entry_i, entry_px, stop
+            return state.cnt, err, eb, state.pos, state.entry_i, state.entry_px, state.stop
+    return state.cnt, ERR_NONE, -1, state.pos, state.entry_i, state.entry_px, state.stop
 
 
 ColumnState = namedtuple(
@@ -1043,7 +926,7 @@ ColumnState = namedtuple(
 )
 
 
-@nb.njit(cache=False, nogil=True, inline="always")
+@nb.njit(cache=True, nogil=True, inline="always")
 def _column_advance(state, i, inputs, core=None):
     (
         o,
@@ -1309,6 +1192,36 @@ def _column_advance(state, i, inputs, core=None):
                 round_tick,
                 tick_round,
             )
+            if core is not None and filled:
+                # The resting entry has printed, but its callback protection is a close
+                # command. Observe the position before accepting/rejecting those legs.
+                _core_decision(
+                    core,
+                    i,
+                    o[i],
+                    h[i],
+                    lo[i],
+                    ci,
+                    s,
+                    i,
+                    px,
+                    np.nan,
+                    np.nan,
+                    0,
+                    np.nan,
+                    st,
+                    cnt,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                core_called = True
+                long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
+                close_mask, open_flatten = core.force_close[i], core.force_open[i]
             err, why = _fill_then_protect(
                 s, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i, out_exit_i,
                 out_side, out_entry_px, out_exit_px, out_reason, out_stop, base + cnt,
@@ -2072,7 +1985,7 @@ def run_columns(
     )  # fmt: skip
 
 
-@nb.njit(cache=False, nogil=True)
+@nb.njit(cache=True, nogil=True)
 def _slots_column(
     o,
     h,
@@ -2129,28 +2042,10 @@ def _slots_column(
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
     queue.pop()
-    pos, ei, gen, pending = 0, -1, -1, -1
-    ep, stop, target, risk_stop = np.nan, np.nan, np.nan, np.nan
-    live, resting, chasing, closing, be_done = False, False, False, False, False
-    cnt, error = 0, ERR_NONE
     state = SlotsState(
-        queue,
-        pos,
-        ei,
-        gen,
-        pending,
-        ep,
-        stop,
-        target,
-        risk_stop,
-        live,
-        resting,
-        chasing,
-        closing,
-        be_done,
-        cnt,
-        error,
-    )
+        queue, 0, -1, -1, -1, np.nan, np.nan, np.nan, np.nan,
+        False, False, False, False, False, 0, ERR_NONE,
+    )  # fmt: skip
     inputs = (
         o,
         h,
@@ -2206,44 +2101,8 @@ def _slots_column(
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
         if err:
-            (
-                queue,
-                pos,
-                ei,
-                gen,
-                pending,
-                ep,
-                stop,
-                target,
-                risk_stop,
-                live,
-                resting,
-                chasing,
-                closing,
-                be_done,
-                cnt,
-                error,
-            ) = state
-            return cnt, err, eb, pos, ei, ep, risk_stop
-    (
-        queue,
-        pos,
-        ei,
-        gen,
-        pending,
-        ep,
-        stop,
-        target,
-        risk_stop,
-        live,
-        resting,
-        chasing,
-        closing,
-        be_done,
-        cnt,
-        error,
-    ) = state
-    return cnt, ERR_NONE, -1, pos, ei, ep, risk_stop
+            return state.cnt, err, eb, state.pos, state.ei, state.ep, state.risk_stop
+    return state.cnt, ERR_NONE, -1, state.pos, state.ei, state.ep, state.risk_stop
 
 
 SlotsState = namedtuple(
@@ -2252,7 +2111,7 @@ SlotsState = namedtuple(
 )
 
 
-@nb.njit(cache=False, nogil=True, inline="always")
+@nb.njit(cache=True, nogil=True, inline="always")
 def _slots_column_advance(state, i, inputs, core=None):
     (
         o,
@@ -3034,3 +2893,35 @@ def _optional_at(a, i, default):
     if a is None:
         return default
     return a[i]
+
+
+# Keep external callback/jitclass signatures out of numeric batch cache indices.
+# Both dispatchers compile the same source; the matcher is never copied.
+_compiled_venue_column = nb.njit(cache=False, nogil=True)(
+    getattr(_venue_column, "py_func", _venue_column)
+)
+_compiled_column = nb.njit(cache=False, nogil=True)(getattr(_column, "py_func", _column))
+_compiled_slots_column = nb.njit(cache=False, nogil=True)(
+    getattr(_slots_column, "py_func", _slots_column)
+)
+
+
+def _venue_driver(core):
+    return _venue_column if core is None else _compiled_venue_column
+
+
+@overload(_venue_driver)
+def _venue_driver_type(core):
+    # Select a dispatcher at typing time: a first-class-function union loses
+    # Numba's omitted-default argument specialization for the numeric driver.
+    if isinstance(core, nb.types.NoneType):
+
+        def numeric(core):
+            return _venue_column
+
+        return numeric
+
+    def generic(core):
+        return _compiled_venue_column
+
+    return generic

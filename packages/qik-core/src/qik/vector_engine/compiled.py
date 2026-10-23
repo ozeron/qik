@@ -132,7 +132,7 @@ def _run(
         a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
         slip = rules[9] if rules[8] else 0.0
         if slots:
-            result = K._slots_column(
+            result = K._compiled_slots_column(
                 o,
                 h,
                 lo,
@@ -186,7 +186,7 @@ def _run(
                 core,
             )
         else:
-            result = K._column(
+            result = K._compiled_column(
                 o,
                 h,
                 lo,
@@ -304,13 +304,21 @@ def _run_arrays(
             }
         )
     )
-    dates_needed = bool(fields & {"entry_limit", "entry_stop", "flatten"}) or (
-        rules.effective_entry_fill is FillTiming.NEXT_OPEN
-        or rules.effective_exit_fill is FillTiming.NEXT_OPEN
+    dates_needed = (
+        bool(fields & {"entry_limit", "entry_stop"})
+        or ("flatten" in fields and rules.flatten is Flatten.NEXT_OPEN)
+        or (
+            rules.effective_entry_fill is FillTiming.NEXT_OPEN
+            or rules.effective_exit_fill is FillTiming.NEXT_OPEN
+        )
     )
     days = (
         _new_york_days(bars, "compiled run")
-        if dates_needed and bars.index is not None
+        if dates_needed
+        and (
+            bars.session_labels is not None
+            or (bars.index is not None and bars.index.tz is not None)
+        )
         else np.zeros(len(bars), bool)
     )
     if bars.session_labels is not None:
