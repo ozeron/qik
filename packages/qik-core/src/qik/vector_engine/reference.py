@@ -181,6 +181,7 @@ def simulate_column_reference(
     protect_flatten: bool = False,
     new_day: np.ndarray | None = None,
     next_open: bool = False,
+    exit_next_open: bool | None = None,
     latency_bars: int = 0,
     one_tick: bool = False,
     tick: float = 0.0,
@@ -195,6 +196,7 @@ def simulate_column_reference(
     ratchet: bool = False,
     stop_skip: bool = False,
 ) -> RefColumn:
+    exit_next_open = next_open if exit_next_open is None else exit_next_open
     if (
         oto
         or mit
@@ -344,10 +346,18 @@ def simulate_column_reference(
                 trades.append(RefTrade(entry_i, i, pos, entry_px, fill[1], fill[0], stop))
                 pos = 0
                 exited = True
+        market_exit = bool(exit_sig[i]) and pos != 0 and exit_next_open
+        if market_exit and (i + 1 == n or bool(starts_day[i + 1])):
+            return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
+        if bool(exit_sig[i]) and not exit_next_open:
+            if pos != 0:
+                trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
+                pos = 0
+                exited = True
+            pending = None
         if next_open:
             # Gate at decision time. An exit can stage a replacement entry at the same open;
             # unrelated entry signals while holding are still ignored (one NETTING position).
-            market_exit = bool(exit_sig[i]) and pos != 0
             enter = (
                 (pos == 0 or (market_exit and reenter))
                 and int(side_sig[i]) != 0
@@ -365,7 +375,7 @@ def simulate_column_reference(
                         float(tgt_pts_sig[i]),
                     )
             continue
-        if bool(exit_sig[i]):
+        if bool(exit_sig[i]) and not exit_next_open:
             if pos != 0:
                 trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
                 pos = 0

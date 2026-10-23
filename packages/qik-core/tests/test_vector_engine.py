@@ -76,7 +76,7 @@ def _nan_free(x: float) -> float | None:
 def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
     limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
-    next_open=False, latency_bars=0, one_tick=False, tick=0.0,
+    next_open=False, latency_bars=0, one_tick=False, tick=0.0, exit_next_open=None,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
@@ -87,7 +87,7 @@ def _run_kernel(
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
         extra[0][None, :], extra[1][None, :], extra[2][None, :],
         day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open,
-        latency_bars, one_tick, tick,
+        latency_bars, one_tick, tick, exit_next_open=exit_next_open,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, t_stop) = out  # fmt: skip
@@ -134,16 +134,19 @@ def _kernel_final(final: tuple) -> tuple:
     return (side, entry, px, stop) if side != 0 else (side, entry, None, None)
 
 
+@pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
 @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(case=_case())
-def test_kernel_equals_reference(case, next_open: bool) -> None:
+def test_kernel_equals_reference(case, next_open: bool, exit_next_open: bool) -> None:
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop = case
     ref = simulate_column_reference(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
-        adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open,
+        adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open, exit_next_open=exit_next_open,
     )  # fmt: skip
-    trades, err, err_bar, final, cnt = _run_kernel(*case, next_open=next_open)
+    trades, err, err_bar, final, cnt = _run_kernel(
+        *case, next_open=next_open, exit_next_open=exit_next_open
+    )
     if err:
         # on error the kernel stops; the table is not built (api raises), so compare the verdict
         assert (err, err_bar) == (ref.err, ref.err_bar)
@@ -207,8 +210,11 @@ def test_next_open_equals_shifted_close_for_unprotected_markets(
     pd.testing.assert_frame_equal(repro.open_positions, close.open_positions)
 
 
+@pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
-def test_kernel_equals_reference_dense_both_stale_modes(next_open: bool) -> None:
+def test_kernel_equals_reference_dense_both_stale_modes(
+    next_open: bool, exit_next_open: bool
+) -> None:
     rng = np.random.default_rng(11)
     stale_hits = 0
     for stale_drop in (False, True):
@@ -228,7 +234,7 @@ def test_kernel_equals_reference_dense_both_stale_modes(next_open: bool) -> None
             ref = simulate_column_reference(
                 arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
                 adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
-                next_open=next_open, new_day=new_day, stop_pts=stop_pts, target_pts=target_pts,
+                next_open=next_open, exit_next_open=exit_next_open, new_day=new_day, stop_pts=stop_pts, target_pts=target_pts,
             )  # fmt: skip
             trades, err, err_bar, final, _ = _run_kernel(
                 arrays,
@@ -240,6 +246,7 @@ def test_kernel_equals_reference_dense_both_stale_modes(next_open: bool) -> None
                 reenter,
                 stale_drop,
                 next_open=next_open,
+                exit_next_open=exit_next_open,
                 new_day=new_day,
                 stop_pts=stop_pts,
                 target_pts=target_pts,

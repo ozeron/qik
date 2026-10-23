@@ -413,6 +413,7 @@ def _column(
     stale_drop,
     protect_flatten,
     next_open,
+    exit_next_open,
     latency_bars,
     one_tick,
     tick,
@@ -611,10 +612,33 @@ def _column(
                         stale_px = px
                 pos = 0
                 exited = True
+        market_exit = exit_sig[i] and pos != 0 and exit_next_open
+        if market_exit and (i + 1 == n or new_day[i + 1]):
+            return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
+        if exit_sig[i] and not exit_next_open and pos != 0:
+            _venue_record(
+                count_only,
+                base + cnt,
+                entry_i,
+                i,
+                pos,
+                entry_px,
+                ci,
+                REASON_SIGNAL,
+                stop,
+                out_entry_i,
+                out_exit_i,
+                out_side,
+                out_entry_px,
+                out_exit_px,
+                out_reason,
+                out_stop,
+            )
+            cnt += 1
+            pos, exited, pend = 0, True, 0
         if next_open:
             # R1 decisions remain at the close; stage only actionable orders. At the following
             # open a market exit executes before a replacement entry and before the price sweep.
-            market_exit = exit_sig[i] and pos != 0
             enter = (
                 (pos == 0 or (market_exit and reenter))
                 and side_sig[i] != 0
@@ -627,7 +651,7 @@ def _column(
                     market_entry = i
             continue
         # --- decisions at bar i's close (on_bar): market orders fill at c[i] ---
-        if exit_sig[i]:
+        if exit_sig[i] and not exit_next_open:
             if pos != 0:
                 if not count_only:
                     k = base + cnt
@@ -709,6 +733,7 @@ def run_columns(
     target_updates: np.ndarray | None = None, be_after: np.ndarray | None = None,
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
+    exit_next_open=None,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -717,6 +742,7 @@ def run_columns(
     without over-allocating ``k * n`` rows.
     """
 
+    exit_next_open = next_open if exit_next_open is None else exit_next_open
     if entry_trigger is not None:
         assert stop_updates is not None and target_updates is not None
         assert be_after is not None and be_offset is not None
@@ -784,7 +810,7 @@ def run_columns(
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, True,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, True,
             e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -858,7 +884,7 @@ def run_columns(
                 _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],

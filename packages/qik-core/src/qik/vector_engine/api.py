@@ -36,6 +36,7 @@ __all__ = [
     "Costs",
     "Instrument",
     "FillModel",
+    "FillTiming",
     "MarketFill",
     "Profile",
     "Result",
@@ -70,9 +71,13 @@ class FillModel(StrEnum):
     ONE_TICK = "one_tick"
 
 
-class MarketFill(StrEnum):
+class FillTiming(StrEnum):
     CLOSE = "close"
     NEXT_OPEN = "next_open"
+
+
+# Backwards-compatible spelling, including enum identity checks.
+MarketFill = FillTiming
 
 
 @dataclass(frozen=True)
@@ -122,6 +127,8 @@ class Rules:
     protect_rejected: Literal["error", "flatten"] = "error"
     profile: Profile = Profile.NAUTILUS
     market_fill: MarketFill = MarketFill.CLOSE
+    entry_fill: FillTiming | None = None
+    exit_fill: FillTiming | None = None
     latency_bars: Literal[0, 1] = 0
     fill_model: FillModel = FillModel.DEFAULT
     protection: Literal["callback", "oto"] = "callback"
@@ -131,6 +138,13 @@ class Rules:
     stop_entry_in_market: Literal["error", "skip"] = "error"
 
     def __post_init__(self) -> None:
+        for name in ("entry_fill", "exit_fill"):
+            value = getattr(self, name)
+            if value is None:
+                object.__setattr__(self, name, self.market_fill)
+            elif not isinstance(value, FillTiming):
+                raise ValueError(f"{name} must be a FillTiming enum")
+        next_open = FillTiming.NEXT_OPEN in (self.entry_fill, self.exit_fill)
         for name, choices in (
             ("protection", ("callback", "oto")),
             ("target_order", ("limit", "mit")),
@@ -144,15 +158,13 @@ class Rules:
             raise ValueError("latency_bars must be the integer 0 or 1")
         if not isinstance(self.fill_model, FillModel):
             raise ValueError("fill_model must be a FillModel enum")
-        if self.market_fill is MarketFill.NEXT_OPEN and (
-            self.latency_bars or self.fill_model is not FillModel.DEFAULT
-        ):
+        if next_open and (self.latency_bars or self.fill_model is not FillModel.DEFAULT):
             raise ValueError("NEXT_OPEN cannot mix with latency_bars or a venue fill_model")
         if not isinstance(self.profile, Profile):
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
             raise ValueError(f"market_fill must be a MarketFill enum, got {self.market_fill!r}")
-        if self.market_fill is MarketFill.NEXT_OPEN and self.profile is not Profile.TRADINGVIEW:
+        if next_open and self.profile is not Profile.TRADINGVIEW:
             raise ValueError("MarketFill.NEXT_OPEN requires Profile.TRADINGVIEW (repro only)")
         if self.stale_book not in ("error", "nautilus"):
             raise ValueError(f"stale_book must be 'error' or 'nautilus', got {self.stale_book!r}")
@@ -361,10 +373,11 @@ def simulate(
     slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
     slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used)
     levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays)
-    next_open = rules.market_fill is MarketFill.NEXT_OPEN
+    next_open = rules.entry_fill is FillTiming.NEXT_OPEN
+    exit_next_open = rules.exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
         raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
-    if next_open and (slots or rules.protection != "callback"):
+    if (next_open or exit_next_open) and (slots or rules.protection != "callback"):
         raise ValueError("NEXT_OPEN does not support A18/A19/A20 order slots")
     if not all(a.shape[1] == k for a in (exit_, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
@@ -424,7 +437,7 @@ def simulate(
             _check_tick(a, rows, instrument.tick, name)
 
     new_day = np.zeros(n, np.bool_)
-    if next_open:
+    if next_open or exit_next_open:
         new_day = _new_york_days(bars, "NEXT_OPEN")
     elif np.isfinite(limit).any():
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
@@ -448,6 +461,7 @@ def simulate(
         mit=rules.target_order == "mit", oto=rules.protection == "oto",
         amend_keep=rules.amend_rejected == "keep", ratchet=rules.stop_update_mode == "ratchet",
         stop_skip=rules.stop_entry_in_market == "skip",
+        exit_next_open=exit_next_open,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip
