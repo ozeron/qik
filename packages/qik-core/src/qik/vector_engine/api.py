@@ -462,6 +462,29 @@ def simulate(
     sizing: Sizing[int] | Sizing[float] | None = None,
     initial_cash: float | None = None,
 ) -> Result:
+    """Run every config under the selected execution profile."""
+    return _simulate(
+        bars,
+        signals,
+        instrument=instrument,
+        rules=rules,
+        costs=costs,
+        sizing=sizing,
+        initial_cash=initial_cash,
+    )
+
+
+def _simulate(
+    bars: Bars,
+    signals: Signals,
+    *,
+    instrument: Instrument | None = None,
+    rules: Rules = Rules(),
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    _run_columns: Any = None,
+) -> Result:
     """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
     if bars.session_labels is not None and rules.profile is Profile.NAUTILUS:
@@ -654,7 +677,8 @@ def simulate(
     if slots:
         absent = t(nan.T)
         slot_data = tuple(absent if a is nan else t(a.T) for a in slot_arrays)
-    out = K.run_columns(
+    run_columns = K.run_columns if _run_columns is None else _run_columns
+    out = run_columns(
         bars.open, bars.high, bars.low, bars.close,
         t(side.T), t(exit_.T), t(stop.T), t(target.T), t(limit.T), t(stop_pts.T), t(target_pts.T),
         new_day, int(rules.limit_chase_bars), rules.adaptive_high_low_ordering,

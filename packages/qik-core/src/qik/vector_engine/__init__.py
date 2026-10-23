@@ -25,8 +25,23 @@ from .api import (
     require_nautilus,
     simulate,
 )
+from .compiled import CompiledBar, Position, run
 from .core import BarView, Core, Decision, check_causal, signals_from_core
 from .grid import grid, stack
+from .kernel import (
+    V_ENTRY_I,
+    V_ENTRY_PX,
+    V_EQUITY,
+    V_LAST_EXIT_I,
+    V_LAST_EXIT_PX,
+    V_LAST_EXIT_REASON,
+    V_QTY,
+    V_SIDE,
+    V_STOP,
+    V_TARGET,
+    V_WORK_LEVEL,
+    V_WORK_SIDE,
+)
 
 __all__ = [
     "BarView",
@@ -55,5 +70,20 @@ __all__ = [
     "require_nautilus",
     "signals_from_core",
     "simulate",
+    "run",
+    "CompiledBar",
+    "Position",
+    "V_SIDE",
+    "V_QTY",
+    "V_ENTRY_I",
+    "V_ENTRY_PX",
+    "V_STOP",
+    "V_TARGET",
+    "V_WORK_SIDE",
+    "V_WORK_LEVEL",
+    "V_LAST_EXIT_I",
+    "V_LAST_EXIT_PX",
+    "V_LAST_EXIT_REASON",
+    "V_EQUITY",
     "stack",
 ]
