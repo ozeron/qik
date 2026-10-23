@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from datetime import date
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -393,7 +393,9 @@ SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
 
 
 @dataclass
-class Result:
+class Result[S = Any]:
+    """Engine output; typed strategy runs additionally expose final state records."""
+
     trades: pd.DataFrame  # closed trades, all configs
     open_positions: pd.DataFrame  # one row per config still in a position after the last bar
     n_bars: int
@@ -402,6 +404,21 @@ class Result:
     initial_cash: float | None = None
     compliance: Compliance | _ReproCompliance = Compliance.NAUTILUS
     research_only: bool = False
+
+    @property
+    def states(self) -> np.recarray:
+        """Final strategy states; present only on results produced by typed run."""
+        if "_states" not in self.__dict__:
+            raise AttributeError("states are available only for typed strategy results")
+        return self.__dict__["_states"]
+
+    @states.setter
+    def states(self, value: np.recarray) -> None:
+        self.__dict__["_states"] = value
+
+    def state(self, i: int = 0) -> S:
+        """Return a mutable typed view of final state i."""
+        return cast(S, self.states[i])
 
     @property
     def deployable(self) -> bool:

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import math
 
-from qik.vector_engine.core import Decision
+from numba.extending import overload, register_jitable
+
+from qik.vector_engine.types import Decision, trail
 
 
+@register_jitable
 def _side(side: int) -> None:
     if side not in (-1, 1):
         raise ValueError("stop/target side must be -1 or +1")
 
 
+@register_jitable
 def atr_stop(anchor: float, side: int, atr: float, multiple: float) -> float:
     """Raw ATR stop; caller selects anchor, ATR seed/freeze and tick conversion.
 
@@ -26,7 +30,8 @@ def atr_stop(anchor: float, side: int, atr: float, multiple: float) -> float:
     return anchor - side * (atr * multiple)
 
 
-def trailing_stop(anchor: float, side: int, distance: float, *, tick: float) -> Decision:
+@register_jitable
+def _trailing_stop(anchor: float, side: int, distance: float, tick: float) -> Decision:
     """Outward tick-rounded candidate from a caller-owned anchor and distance.
 
     Admitted: P059 high-water/frozen-ATR and C001 close/refreshing-ATR trails.
@@ -40,4 +45,17 @@ def trailing_stop(anchor: float, side: int, distance: float, *, tick: float) -> 
         raise ValueError("trail anchor/distance must be finite; distance must be nonnegative")
     raw = anchor - side * distance
     level = (math.floor(raw / tick) if side == 1 else math.ceil(raw / tick)) * tick
-    return Decision(stop_update=level)
+    return trail(level)
+
+
+def trailing_stop(anchor: float, side: int, distance: float, *, tick: float) -> Decision:
+    """Outward-rounded trail Decision; the engine owns amendment and ratchet rules."""
+    return _trailing_stop(anchor, side, distance, tick)
+
+
+@overload(trailing_stop)
+def _overload_trailing_stop(anchor, side, distance, tick):
+    def impl(anchor, side, distance, tick):
+        return _trailing_stop(anchor, side, distance, tick)
+
+    return impl

@@ -12,18 +12,22 @@ import importlib
 import inspect
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import compiled, kernel
 
 
-def write_bound_module(destination: Path, strategy_module: str, strategy_name: str) -> None:
+def write_bound_module(
+    destination: Path, strategy_module: str, strategy_name: str, *, records: bool = False
+) -> None:
     """Write an importable internal runner for ``step(state, params, feats, bar, pos)``.
 
     ``run`` has the prototype _run ABI without its first callback argument. State
     is a structured array with one independent record per parameter row. This is
     a code-generation primitive, not the public strategy decorator or Result API.
     Regenerate when engine or strategy source changes, before importing the module.
+    records=True transports typed features with an int64 clock and appends final
+    copied state rows to the raw output. The prototype ABI stays unchanged otherwise.
     """
     if not all(part.isidentifier() for part in strategy_module.split(".")):
         raise ValueError("strategy_module must be an importable module name")
@@ -67,6 +71,28 @@ def write_bound_module(destination: Path, strategy_module: str, strategy_name: s
                 ast.Name(name, ast.Load()) for name in ("state", "params", "feats", "bar", "pos")
             ]
 
+    if records:
+        # Keep the clock int64 and each named feature's dtype through the ABI.
+        class RecordFeatures(ast.NodeTransformer):
+            def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+                if isinstance(node.value, ast.Name) and node.value.id == "feats":
+                    return ast.parse("feats[0][i]", mode="eval").body
+                return cast(ast.expr, self.generic_visit(node))
+
+            def visit_Name(self, node: ast.Name) -> ast.expr:
+                if node.id == "CompiledBar":
+                    return ast.Name("Bar", ast.Load())
+                return node
+
+        RecordFeatures().visit(adapter)
+        for node in ast.walk(adapter):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_strategy"
+            ):
+                node.args[2] = ast.parse("_features_type(*feats[1:])", mode="eval").body
+
     decision = source(kernel._core_decision)
     for node in ast.walk(decision):
         if (
@@ -104,6 +130,11 @@ def write_bound_module(destination: Path, strategy_module: str, strategy_name: s
         ):
             node.func = ast.Name("_bound_initial_state", ast.Load())
     BindGlobals().visit(runner)
+    if records:
+        for node in runner.body:
+            if isinstance(node, ast.Return):
+                assert isinstance(node.value, ast.Tuple)
+                node.value.elts.append(ast.Name("init_state", ast.Load()))
     functions.append(runner)
     strategy = importlib.import_module(strategy_module)
     fingerprint = hashlib.sha256(
@@ -128,6 +159,12 @@ def write_bound_module(destination: Path, strategy_module: str, strategy_name: s
         "_no_callback = None\n"
         "@nb.njit(cache=True)\ndef _bound_initial_state(states, cores, j):\n    return states[j]\n"
     )
+    if records:
+        header += (
+            "from qik.vector_engine.types import Bar, Position\n"
+            "_features_type = _strategy.__strategy__.features\n"
+            "_strategy = nb.njit(cache=True)(_strategy)\n"
+        )
     text = (
         header
         + ast.unparse(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])))

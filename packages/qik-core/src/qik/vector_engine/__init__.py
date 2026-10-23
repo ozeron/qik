@@ -25,9 +25,11 @@ from .api import (
     require_nautilus,
     simulate,
 )
-from .compiled import CompiledBar, run
-from .core import BarView, Core, Decision, check_causal, signals_from_core
+from .compiled import NAUTILUS, CompiledBar, GridResult, run
+from .core import BarView, Core, check_causal, signals_from_core
+from .core import Decision as LegacyDecision
 from .grid import grid, stack
+from .htf import htf, htf_align
 from .kernel import (
     V_ENTRY_I,
     V_ENTRY_PX,
@@ -42,8 +44,46 @@ from .kernel import (
     V_WORK_LEVEL,
     V_WORK_SIDE,
 )
+from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, StrategySpec, strategy
+from .types import (
+    HOLD,
+    Bar,
+    Decision,
+    ExitReason,
+    Position,
+    Side,
+    enter,
+    exit,
+    flatten,
+    move_target,
+    trail,
+)
+from .types import Decision as TypedDecision
 
 __all__ = [
+    "TypedDecision",
+    "LegacyDecision",
+    "NAUTILUS",
+    "GridResult",
+    "Bar",
+    "HOLD",
+    "State",
+    "Params",
+    "Features",
+    "FloatArray",
+    "IntArray",
+    "BoolArray",
+    "StrategySpec",
+    "strategy",
+    "Side",
+    "ExitReason",
+    "enter",
+    "exit",
+    "trail",
+    "move_target",
+    "flatten",
+    "htf",
+    "htf_align",
     "BarView",
     "Bars",
     "BracketAnchor",
@@ -107,6 +147,7 @@ __all__ += [
     "Bar",
     "Position",
     "TypedDecision",
+    "LegacyDecision",
     "Side",
     "ExitReason",
     "HOLD",

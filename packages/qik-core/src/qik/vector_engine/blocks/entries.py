@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+from numba.extending import register_jitable
 from numpy.typing import ArrayLike, NDArray
 
 
+@register_jitable
 def side_of(value: float, reference: float) -> int:
     """Strict side of an MA/indicator; equality and an unready NaN are neutral.
 
@@ -20,6 +22,7 @@ def side_of_array(value: ArrayLike, reference: ArrayLike) -> NDArray[np.int8]:
     return np.where(v > r, 1, np.where(v < r, -1, 0)).astype(np.int8)
 
 
+@register_jitable
 def range_breakout(close: float, high: float, low: float) -> int:
     """Strict close breakout, long first; pass completed range bounds only.
 

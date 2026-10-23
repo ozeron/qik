@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from datetime import timedelta
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from .api import Bars
 from .core import BarView, Core, Decision
+from .types import Decision as RecordDecision
 
 
 def minute_bars(
@@ -123,12 +125,12 @@ def bar_view(bars: Bars | pd.DataFrame, i: int = 0) -> BarView:
     )
 
 
-def decision_stream(core: Core, bars: Bars | pd.DataFrame) -> list[Decision]:
+def decision_stream(core: Core, bars: Bars | pd.DataFrame) -> list[Decision | RecordDecision]:
     """Advance the supplied core exactly once per bar; callers own fresh-core creation."""
     decisions = []
     for i in range(len(bars)):
         decision = core.step(bar_view(bars, i))
-        if not isinstance(decision, Decision):
+        if not isinstance(decision, (Decision, RecordDecision)):
             raise TypeError(f"bar {i}: step must return a Decision")
         decisions.append(decision)
     return decisions
@@ -172,3 +174,122 @@ def assert_causal_feature(
     if prefix.shape != (n,) or full.shape != (len(bars),):
         raise AssertionError("feature builder must return one value per base bar")
     np.testing.assert_array_equal(prefix, full[:n], err_msg="feature looks ahead")
+
+
+def assert_python_jit_equal(step: Callable[..., Any], bars: Bars, **run_kwargs: Any) -> None:
+    """Compare every trade field and final state against a fresh JIT-disabled process.
+
+    The strategy must be a module-level function. Existing PYTHONPATH and sys.path
+    are retained so test fixtures and importable user modules resolve identically.
+    """
+    import os
+    import pickle
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    import numba as nb
+
+    from .compiled import GridResult, run
+
+    if getattr(nb.config, "DISABLE_JIT"):
+        raise ValueError("assert_python_jit_equal requires a JIT-enabled parent process")
+    kwargs = dict(run_kwargs)
+    kwargs.pop("jit", None)
+    compiled = run(step, bars, jit=True, **kwargs)
+    with tempfile.TemporaryDirectory(prefix="qik-python-jit-") as directory:
+        payload = Path(directory) / "input.pkl"
+        output = Path(directory) / "output.pkl"
+        payload.write_bytes(
+            pickle.dumps((step.__module__, getattr(step, "__name__"), bars, kwargs))
+        )
+        script = """
+import importlib, pickle, sys
+from pathlib import Path
+from qik.vector_engine import run
+name, attr, bars, kwargs = pickle.loads(Path(sys.argv[1]).read_bytes())
+result = run(getattr(importlib.import_module(name), attr), bars, **kwargs)
+Path(sys.argv[2]).write_bytes(pickle.dumps(result))
+"""
+        env = dict(os.environ, NUMBA_DISABLE_JIT="1")
+        env["PYTHONPATH"] = os.pathsep.join(str(p) for p in sys.path if p)
+        process = subprocess.run(
+            [sys.executable, "-c", script, str(payload), str(output)],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode:
+            raise AssertionError(
+                f"JIT-disabled subprocess failed:\n{process.stdout}\n{process.stderr}"
+            )
+        python = pickle.loads(output.read_bytes())
+    left = compiled.results if isinstance(compiled, GridResult) else (compiled,)
+    right = python.results if isinstance(python, GridResult) else (python,)
+    assert len(left) == len(right)
+    for a, b in zip(left, right, strict=True):
+        pd.testing.assert_frame_equal(a.trades, b.trades, check_exact=True)
+        pd.testing.assert_frame_equal(a.open_positions, b.open_positions, check_exact=True)
+        assert a.states.dtype == b.states.dtype
+        assert a.states.tobytes() == b.states.tobytes(), "final state bytes differ"
+
+
+def assert_causal(step: Callable[..., Any], bars: Bars, n: int, **kw: Any) -> None:
+    """Require the prefix run's decisions to equal the full run's first n decisions.
+
+    Pass features as a callable ``features(bars)`` to also check the feature
+    construction, including HTF alignment. Precomputed arrays can only test the
+    strategy's use of those arrays; their construction cannot be inferred.
+    """
+    from collections.abc import Mapping
+
+    from .compiled import _record_run
+    from .core import _prefix, _rows
+
+    if not 0 < n <= len(bars):
+        raise ValueError("n must lie in 1..len(bars)")
+    features = kw.pop("features", None)
+    grid = kw.pop("grid", None)
+    jit = kw.pop("jit", True)
+    axes: list[Any] = [None]
+    if grid is not None:
+        params = getattr(step, "__strategy__").params.from_grid(grid)
+        if not len(params):
+            raise ValueError("grid axes must be nonempty")
+        axes = [{name: [row[name].item()] for name in (params.dtype.names or ())} for row in params]
+    captures = []
+    for tape in (bars, _prefix(bars, n)):
+        if callable(features):
+            values = features(tape)
+        elif isinstance(features, Mapping):
+            values = {name: array[: len(tape)] for name, array in features.items()}
+        elif features is None:
+            values = None
+        else:
+            values = type(features)(*(array[: len(tape)] for array in features))
+        signals = []
+        for config in axes:
+            captured = []
+            try:
+                _record_run(
+                    step,
+                    tape,
+                    grid=config,
+                    features=values,
+                    jit=jit,
+                    _capture_signals=captured,
+                    **kw,
+                )
+            except ValueError as error:
+                # A terminal NEXT_OPEN decision has no prefix settlement bar.
+                # Capture one config at a time so every original decision is
+                # available even when Result validation refuses that settlement.
+                if not (len(tape) < len(bars) and captured and "is at session end" in str(error)):
+                    raise
+            signals.extend(captured)
+        captures.append(signals)
+    for full, prefix in zip(*captures, strict=True):
+        for a, b in zip(_rows(full, n), _rows(prefix, n), strict=True):
+            np.testing.assert_array_equal(a, b, err_msg="strategy is not prefix-causal")

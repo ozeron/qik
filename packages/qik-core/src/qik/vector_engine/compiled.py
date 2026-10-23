@@ -1,4 +1,4 @@
-"""Prototype compiled strategy runner; matching stays in kernel's three advance functions.
+"""Typed strategy runner; matching stays in kernel's three advance functions.
 
 Cores declare signal_fields so dispatch cannot change after observing a future decision.
 The default declaration supports all fields and therefore chooses the slots body.
@@ -6,12 +6,23 @@ The default declaration supports all fields and therefore chooses the slots body
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import hashlib
+import importlib.util
+import os
+import sys
+import warnings
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from itertools import accumulate, product
-from typing import Any, NamedTuple
+from pathlib import Path
+from types import FunctionType
+from typing import Any, NamedTuple, cast, get_type_hints
+from typing import overload as typing_overload
 
 import numba as nb
 import numpy as np
+import pandas as pd
+from numba.core.errors import NumbaError
 from numba.extending import overload
 from numba.typed import List
 
@@ -26,7 +37,6 @@ from .api import (
     FillTiming,
     Flatten,
     Instrument,
-    Result,
     Rules,
     SessionBoundary,
     Signals,
@@ -36,6 +46,12 @@ from .api import (
     _new_york_days,
     _simulate,
 )
+from .api import (
+    Result as EngineResult,
+)
+from .schema import Features, State, StrategySpec
+from .types import Bar, Decision
+from .types import Position as AuthorPosition
 
 
 def _initial_core_state(init_state: Any, cores: Any, j: int | np.integer[Any]) -> Any:
@@ -258,10 +274,10 @@ def _run(
 
 
 def _run_arrays(
-    step: Callable[..., None],
+    step: Callable[..., None] | None,
     init_state: np.ndarray,
     params_grid: np.ndarray,
-    feats: np.ndarray,
+    feats: Any,
     bars: Bars,
     rules: Rules = Rules(),
     instrument: Instrument | None = None,
@@ -273,7 +289,9 @@ def _run_arrays(
     _cores: Any = None,
     cash_accumulation: str = "batch",
     _capture_signals: list[Signals] | None = None,
-) -> list[Result]:
+    _bound_runner: Any = None,
+    _final_states: list[np.recarray] | None = None,
+) -> list[EngineResult]:
     """Run independent compiled cores in parallel, returning one normal Result per config.
 
     signal_fields is a declaration of possible outputs, not a scan of future decisions.
@@ -284,11 +302,18 @@ def _run_arrays(
     fields = set(signal_fields)
     if not fields <= set(SIGNAL_FIELDS):
         raise ValueError("unknown signal_fields")
-    state, params = (np.ascontiguousarray(x, dtype=np.float64) for x in (init_state, params_grid))
-    features = np.ascontiguousarray(feats)
-    if state.ndim != 1 or params.ndim != 2 or features.ndim != 2 or len(params) == 0:
+    if _bound_runner is None:
+        state, params = (
+            np.ascontiguousarray(x, dtype=np.float64) for x in (init_state, params_grid)
+        )
+        features = np.ascontiguousarray(feats)
+    else:
+        state, params, features = init_state, params_grid, feats
+    if _bound_runner is None and (
+        state.ndim != 1 or params.ndim != 2 or features.ndim != 2 or len(params) == 0
+    ):
         raise ValueError("run needs 1D state, nonempty 2D params, 2D features")
-    if len(features) != len(bars):
+    if _bound_runner is None and len(features) != len(bars):
         raise ValueError("features must have one row per bar")
     slots = (
         rules.target_order == "mit"
@@ -378,8 +403,10 @@ def _run_arrays(
             sizing.min_qty if sizing else 1.0,
         ]
     )
-    raw = _run(
-        step,
+    runner: Any = _run if _bound_runner is None else _bound_runner
+    callback_args = (step,) if _bound_runner is None else ()
+    raw = runner(
+        *callback_args,
         state,
         params,
         features,
@@ -398,6 +425,10 @@ def _run_arrays(
         None,
         session_days,
     )
+    if _bound_runner is not None:
+        if _final_states is not None:
+            _final_states.append(raw[-1].view(np.recarray))
+        raw = raw[:-1]
     counts, meta, *tail = raw
     arrays = tail[:7]
     sides, exits, levels, booleans, decisions = tail[7:]
@@ -517,7 +548,7 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     out[14] = decision[14]
 
 
-def run(
+def _run_jitclass(
     CoreClass: Any,
     bars: Bars,
     *,
@@ -530,7 +561,7 @@ def run(
     initial_cash: float | None = None,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
-) -> list[Result]:
+) -> list[EngineResult]:
     """Instantiate one core per Cartesian grid row and call step(bar, pos) in prange.
 
     CoreClass is a jitclass (or a plain class with NUMBA_DISABLE_JIT=1). Constructors
@@ -567,3 +598,286 @@ def run(
         _cores=cores,
         cash_accumulation=cash_accumulation,
     )
+
+
+# Public record/function API. The jitclass prototype remains private.
+
+NAUTILUS = Rules()
+
+
+Result = EngineResult
+
+
+@dataclass(frozen=True)
+class GridResult[S: State]:
+    """Ordered Cartesian results and parameters, without a selection policy."""
+
+    results: tuple[Result[S], ...]
+    params: pd.DataFrame
+    states: np.recarray
+
+    def __len__(self) -> int:
+        """Number of configurations."""
+        return len(self.results)
+
+    def __getitem__(self, i: int) -> Result[S]:
+        """Access one configuration by its stable row index."""
+        return self.results[i]
+
+    def state(self, i: int) -> S:
+        """Return a mutable view of configuration i's final state."""
+        return cast(S, self.states[i])
+
+
+def _bound(step: Any) -> Any:
+    from .bound import write_bound_module
+
+    module_name, name = step.__module__, step.__name__
+    if module_name == "__main__" or "<locals>" in step.__qualname__:
+        raise ValueError("strategy must be defined at module scope in an importable module")
+    directory = Path(os.environ.get("QIK_VECTOR_CACHE", Path.home() / ".cache/qik/vector_engine"))
+    directory.mkdir(parents=True, exist_ok=True)
+    # Generate to a process-owned draft, then publish at a content-addressed path.
+    draft = directory / f"draft_{os.getpid()}_{name}.py"
+    try:
+        write_bound_module(draft, module_name, name, records=True)
+        source = draft.read_bytes()
+    finally:
+        draft.unlink(missing_ok=True)
+    key = hashlib.sha256(source).hexdigest()[:24]
+    bound_name = f"_qik_bound_{key}"
+    path = directory / f"{bound_name}.py"
+    if not path.exists():
+        temp = directory / f"{bound_name}.{os.getpid()}.tmp"
+        temp.write_bytes(source)
+        temp.replace(path)
+    if bound_name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(bound_name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[bound_name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[bound_name]
+
+
+def _python_runner(module: Any) -> Callable[..., Any]:
+    # Rebind every shared helper in a private namespace. No dispatcher or global
+    # config is mutated: jit=False and JIT runs can coexist in one process.
+    from . import sizing as sizing_module
+
+    namespace = dict(vars(sizing_module))
+    namespace.update(vars(K))
+    namespace.update(vars(module))
+    originals = {name: getattr(value, "py_func", value) for name, value in namespace.items()}
+    for name, value in originals.items():
+        if name == "_strategy":
+            namespace[name] = value
+        elif isinstance(value, FunctionType) and value.__module__ in (
+            K.__name__,
+            module.__name__,
+            sizing_module.__name__,
+        ):
+            namespace[name] = FunctionType(
+                value.__code__, namespace, value.__name__, value.__defaults__, value.__closure__
+            )
+    return namespace["run"]
+
+
+def _record_run(
+    step: Any,
+    bars: Bars,
+    *,
+    grid: Mapping[str, Sequence[Any]] | None,
+    features: Features | Mapping[str, np.ndarray] | None,
+    jit: bool,
+    _capture_signals: list[Signals] | None = None,
+    **kwargs: Any,
+) -> Result[Any] | GridResult[Any]:
+    spec: StrategySpec = step.__strategy__
+    params = spec.params.from_grid({} if grid is None else grid)
+    if not len(params):
+        raise ValueError("grid axes must be nonempty")
+    supplied = {} if features is None else features
+    spec.features.validate_values(supplied, len(bars))
+    names = tuple(get_type_hints(spec.features))
+    if isinstance(supplied, Mapping):
+        if unknown := set(supplied).difference(names):
+            raise ValueError(f"unknown features: {sorted(unknown)}")
+        values = spec.features(*(np.ascontiguousarray(supplied[n]) for n in names))
+    else:
+        values = spec.features(*(np.ascontiguousarray(getattr(supplied, n)) for n in names))
+    clock = (
+        np.full(len(bars), -1, np.int64) if bars.index is None else bars.index.as_unit("ns").asi8
+    )
+    states = spec.state.new(len(params))
+    # Numba refuses zero-width Records; an unused internal byte admits stateless
+    # strategies without leaking a synthetic field into the public state schema.
+    internal_states = (
+        states
+        if states.dtype.names
+        else np.zeros(len(params), dtype=[("_empty", "i1")]).view(np.recarray)
+    )
+    internal_params = (
+        params
+        if params.dtype.names
+        else np.zeros(len(params), dtype=[("_empty", "i1")]).view(np.recarray)
+    )
+    module = _bound(step)
+    runner = module.run if jit or getattr(nb.config, "DISABLE_JIT") else _python_runner(module)
+    final: list[np.recarray] = []
+    try:
+        results = _run_arrays(
+            None,
+            internal_states,
+            internal_params,
+            (clock, *(getattr(values, name) for name in names)),
+            bars,
+            _bound_runner=runner,
+            _final_states=final,
+            _capture_signals=_capture_signals,
+            **kwargs,
+        )
+    except NumbaError as error:
+        raise TypeError(
+            f"strategy {step.__module__}.{step.__name__}: compilation failed; "
+            "check declared state/parameter fields, feature dtypes and non-jitable calls. "
+            f"{error}"
+        ) from error
+    if not states.dtype.names:
+        final[0] = states
+    for i, result in enumerate(results):
+        result.states = cast(np.recarray, final[0][i : i + 1])
+    typed = tuple(results)
+    if grid is None:
+        return typed[0]
+    table = (
+        pd.DataFrame.from_records(params)
+        if params.dtype.names
+        else pd.DataFrame(index=range(len(params)))
+    )
+    return GridResult(typed, table, final[0])
+
+
+@typing_overload
+def run[S: State](
+    step: Callable[[S, Any, Any, Bar, AuthorPosition], Decision],
+    bars: Bars,
+    *,
+    grid: None = None,
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> Result[S]: ...
+
+
+@typing_overload
+def run[S: State](
+    step: Callable[[S, Any, Any, Bar, AuthorPosition], Decision],
+    bars: Bars,
+    *,
+    grid: Mapping[str, Sequence[Any]],
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> GridResult[S]: ...
+
+
+@typing_overload
+def run(step: Any, bars: Bars, **kwargs: Any) -> Any: ...
+
+
+def run(
+    step: Any,
+    bars: Bars,
+    *,
+    grid: Mapping[str, Sequence[Any]] | None = None,
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> Any:
+    """Execute a typed strategy through the cacheable, strategy-bound shared engine.
+
+    No grid returns Result[S]; an explicit grid (including {}) returns GridResult[S].
+    Legacy stateless Core classes and Signals remain supported with a warning.
+    """
+    kwargs: dict[str, Any] = dict(
+        rules=rules, instrument=instrument, costs=costs, sizing=sizing, initial_cash=initial_cash
+    )
+    if hasattr(step, "__strategy__"):
+        return _record_run(
+            step,
+            bars,
+            grid=grid,
+            features=features,
+            jit=jit,
+            signal_fields=signal_fields,
+            cash_accumulation=cash_accumulation,
+            **kwargs,
+        )
+    warnings.warn(
+        "Core/Signals API is deprecated; use @strategy and run", DeprecationWarning, stacklevel=2
+    )
+    if hasattr(step, "class_type"):
+        return _run_jitclass(
+            step,
+            bars,
+            grid=None if grid is None else dict(grid),
+            features=cast(dict[str, np.ndarray] | None, features),
+            signal_fields=signal_fields,
+            cash_accumulation=cash_accumulation,
+            **kwargs,
+        )
+    from .core import Decision as LegacyDecision
+    from .core import signals_from_core
+
+    if isinstance(step, Signals):
+        if grid is not None or features is not None:
+            raise ValueError("Signals already contains configurations; grid/features are invalid")
+        # Signals and the bound driver share kernel advance functions. Keep the
+        # array ABI here to preserve per-column optional-field dispatch exactly.
+        from .api import simulate
+
+        return simulate(bars, step, **kwargs)
+    axes = {} if grid is None else grid
+    supplied = {} if features is None else dict(cast(Mapping[str, np.ndarray], features))
+    rows = list(product(*axes.values()))
+    if not rows:
+        raise ValueError("grid axes must be nonempty")
+    results = []
+    from .api import simulate
+
+    for row in rows:
+        config = dict(zip(axes, row, strict=True))
+        config.update(supplied)
+
+        class LegacyView:
+            def __init__(self, instance: Any) -> None:
+                self.instance = instance
+
+            def step(self, bar: Any) -> LegacyDecision:
+                decision = self.instance.step(bar)
+                return LegacyDecision(*decision) if isinstance(decision, Decision) else decision
+
+        def make(config=config):
+            return LegacyView(step(**config))
+
+        results.append(simulate(bars, signals_from_core(make, bars), **kwargs))
+    return results[0] if grid is None else results
