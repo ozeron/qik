@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import timedelta
 
 import numpy as np
@@ -159,3 +159,16 @@ def assert_trades_equal(a: pd.DataFrame, b: pd.DataFrame, fields: Sequence[str])
                 check_dtype=True,
                 check_exact=True,
             )
+
+
+def assert_causal_feature(
+    fn_builder: Callable[[pd.DataFrame], np.ndarray], bars: pd.DataFrame, n: int
+) -> None:
+    """Assert exact prefix stability (including NaN) for a feature builder."""
+    if not 0 < n <= len(bars):
+        raise ValueError("n must select a nonempty prefix")
+    prefix = np.asarray(fn_builder(bars.iloc[:n].copy()))
+    full = np.asarray(fn_builder(bars.copy()))
+    if prefix.shape != (n,) or full.shape != (len(bars),):
+        raise AssertionError("feature builder must return one value per base bar")
+    np.testing.assert_array_equal(prefix, full[:n], err_msg="feature looks ahead")

@@ -87,3 +87,34 @@ __all__ = [
     "V_EQUITY",
     "stack",
 ]
+
+# The existing Core Decision remains public; typed strategies use TypedDecision
+# (also available as qik.vector_engine.types.Decision).
+from .htf import htf, htf_align
+from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, StrategySpec, strategy
+from .types import HOLD, Bar, ExitReason, Position, Side, enter, exit, flatten, move_target, trail
+from .types import Decision as TypedDecision
+
+__all__ += [
+    "State",
+    "Params",
+    "Features",
+    "FloatArray",
+    "IntArray",
+    "BoolArray",
+    "StrategySpec",
+    "strategy",
+    "Bar",
+    "Position",
+    "TypedDecision",
+    "Side",
+    "ExitReason",
+    "HOLD",
+    "enter",
+    "exit",
+    "trail",
+    "move_target",
+    "flatten",
+    "htf",
+    "htf_align",
+]
