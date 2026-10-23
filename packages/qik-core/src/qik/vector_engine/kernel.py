@@ -61,12 +61,31 @@ def _no_reversal(o, e1, e2, c, m, pos):
 
 
 @nb.njit(cache=True, nogil=True)
-def _level(side, anchor, level, pts, sign):
+def _level(side, anchor, level, pts, sign, tick=0.0, rounding=0):
     """A level as given, or ``pts`` points from ``anchor`` (``sign`` +1 target side, -1 stop side)."""
 
-    if np.isnan(pts):
-        return level
-    return anchor + sign * side * pts
+    value = level if np.isnan(pts) else anchor + sign * side * pts
+    return _round_price(value, tick, rounding, sign * side)
+
+
+@nb.njit(cache=True, nogil=True)
+def _round_price(value, tick, rounding, direction):
+    if rounding == 0 or np.isnan(value):
+        return value
+    steps = value / tick
+    if rounding == 1:
+        return np.floor(steps + 0.5) * tick
+    return (np.ceil(steps - 1e-10) if direction > 0 else np.floor(steps + 1e-10)) * tick
+
+
+@nb.njit(cache=True, nogil=True)
+def _force_for(mask, side):
+    return bool(mask & 1) or (side > 0 and bool(mask & 2)) or (side < 0 and bool(mask & 4))
+
+
+@nb.njit(cache=True, nogil=True)
+def _exit_for(global_exit, long_exit, short_exit, side):
+    return global_exit or (side > 0 and long_exit) or (side < 0 and short_exit)
 
 
 @nb.njit(cache=True, nogil=True)
@@ -164,6 +183,14 @@ def _venue_column(
     slip,
     adverse_first,
     bracket_anchor,
+    target_gap,
+    tick_round,
+    round_tick,
+    long_exits,
+    short_exits,
+    force_close,
+    force_open,
+    cross_session,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -193,10 +220,39 @@ def _venue_column(
     cnt = 0
     for i in range(len(c)):
         ci = c[i]
+        exit_now = _exit_for(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (side_sig[pending] if pending >= 0 else 0),
+        )
         exited = False
         busy = pending >= 0
         if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i]:
             return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, stop
+        if force_open[i]:
+            if pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    ei,
+                    i,
+                    pos,
+                    ep,
+                    o[i] - pos * slip,
+                    REASON_SIGNAL,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+            commands.clear()
+            pos, pending, protection, closing, resting, chasing = 0, -1, 0, False, False, False
         if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
             closing = False
         high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
@@ -229,6 +285,8 @@ def _venue_column(
                     entry_stop[d],
                     stop_pts[d],
                     -1.0,
+                    round_tick,
+                    tick_round,
                 )
                 target = _level(
                     s,
@@ -236,6 +294,8 @@ def _venue_column(
                     entry_target[d],
                     target_pts[d],
                     1.0,
+                    round_tick,
+                    tick_round,
                 )
                 pending, resting, chasing = -1, False, False
                 rejected_stop = False
@@ -267,7 +327,7 @@ def _venue_column(
                 candidate = pt - pos * slip
                 if not adverse_hit and _in_market(pos, target, candidate, False):
                     reason = REASON_TARGET
-                    px = candidate if slip else target
+                    px = candidate if slip else (pt if target_gap and m == 0 else target)
                     break
             if reason:
                 _venue_record(
@@ -292,11 +352,48 @@ def _venue_column(
                 pos, exited = 0, True
                 commands.append((i + latency, 5, gen))
                 protection = 3
+        if force_close[i] & 8:
+            if pos or pending >= 0:
+                return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, ei, ep, stop
+            continue
+        if (
+            _force_for(force_close[i], pos if pos else (side_sig[pending] if pending >= 0 else 0))
+            or force_open[i]
+        ):
+            if pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    ei,
+                    i,
+                    pos,
+                    ep,
+                    ci - pos * slip,
+                    REASON_SIGNAL,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+            commands.clear()
+            pos, pending, protection, closing, resting, chasing = 0, -1, 0, False, False, False
+            continue
         if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
             closing = False
         if closing and pos == 0 and protection == 2:
             commands.append((i + latency, 5, gen))
             protection = 3
+        exit_now = _exit_for(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (side_sig[pending] if pending >= 0 else 0),
+        )
         if (
             pending >= 0
             and not closing
@@ -305,7 +402,7 @@ def _venue_column(
         ):
             chasing = True
             commands.append((i + latency, 4, pending))
-        if exit_sig[i]:
+        if exit_now:
             chasing = False
             if pending >= 0:
                 if not closing and not np.isnan(entry_limit[pending]):
@@ -342,8 +439,12 @@ def _venue_column(
                 ):
                     anchor = _anchor(bracket_anchor, c[d], px, px if kind == 1 else entry_limit[d])
                     pos, ei, ep, gen = s, i, px, d
-                    stop = _level(s, anchor, entry_stop[d], stop_pts[d], -1.0)
-                    target = _level(s, anchor, entry_target[d], target_pts[d], 1.0)
+                    stop = _level(
+                        s, anchor, entry_stop[d], stop_pts[d], -1.0, round_tick, tick_round
+                    )
+                    target = _level(
+                        s, anchor, entry_target[d], target_pts[d], 1.0, round_tick, tick_round
+                    )
                     pending, resting, chasing = -1, False, False
                     rejected_stop = False
                     protection = 0 if closing else 1
@@ -446,6 +547,14 @@ def _column(
     tick,
     adverse_first,
     bracket_anchor,
+    target_gap,
+    tick_round,
+    round_tick,
+    long_exits,
+    short_exits,
+    force_close,
+    force_open,
+    cross_session,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -462,6 +571,7 @@ def _column(
     """
 
     if latency_bars or one_tick:
+        venue_slip = tick if one_tick else 0.0
         return _venue_column(
             o,
             h,
@@ -480,9 +590,17 @@ def _column(
             reenter,
             protect_flatten,
             latency_bars,
-            tick if one_tick else 0.0,
+            venue_slip,
             adverse_first,
             bracket_anchor,
+            target_gap,
+            tick_round,
+            round_tick,
+            long_exits,
+            short_exits,
+            force_close,
+            force_open,
+            cross_session,
             count_only,
             out_entry_i,
             out_exit_i,
@@ -516,6 +634,32 @@ def _column(
         stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
         stale_px = 0.0
         ci = c[i]
+        exit_now = _exit_for(exit_sig[i], long_exits[i], short_exits[i], pos if pos else pend)
+        if pend != 0 and new_day[i]:
+            # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
+            return cnt, ERR_PENDING_NEW_DAY, i, pos, entry_i, entry_px, stop
+        if force_open[i]:
+            if pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    entry_i,
+                    i,
+                    pos,
+                    entry_px,
+                    o[i],
+                    REASON_SIGNAL,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+            pos, pend, market_entry, market_exit, exited = 0, 0, -1, False, True
         if market_exit:
             if not count_only:
                 k = base + cnt
@@ -534,10 +678,22 @@ def _column(
             d = market_entry
             s = side_sig[d]
             st = _level(
-                s, _anchor(bracket_anchor, c[d], o[i], o[i]), entry_stop[d], stop_pts[d], -1.0
+                s,
+                _anchor(bracket_anchor, c[d], o[i], o[i]),
+                entry_stop[d],
+                stop_pts[d],
+                -1.0,
+                round_tick,
+                tick_round,
             )
             tg = _level(
-                s, _anchor(bracket_anchor, c[d], o[i], o[i]), entry_target[d], target_pts[d], 1.0
+                s,
+                _anchor(bracket_anchor, c[d], o[i], o[i]),
+                entry_target[d],
+                target_pts[d],
+                1.0,
+                round_tick,
+                tick_round,
             )
             # Newly placed protection is validated at the actual entry open. A4's resting-stop
             # gap rule cannot be applied retroactively across this entry fill (R1).
@@ -551,25 +707,34 @@ def _column(
             stop = st
             target = tg
             market_entry = -1
-        if pend != 0 and new_day[i]:
-            # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
-            return cnt, ERR_PENDING_NEW_DAY, i, pos, entry_i, entry_px, stop
         if pend != 0:
             s = pend
             # A resting limit fills at its own level once any path point reaches it (A5); the
             # protection meets this bar's close, not the rest of the bar (A15).
             filled = (s > 0 and lo[i] <= p_lim) or (s < 0 and h[i] >= p_lim)
             busy = filled or i == p_chase  # the sleeve sees a working entry on this bar
-            if filled or (i == p_chase and not exit_sig[i]):
+            if filled or (i == p_chase and not exit_now):
                 # chase: cancel, market at this close, levels from that fill (an exit on the
                 # same bar flattens instead, and V2's flatten clears the chase)
                 pend = 0
                 px = p_lim if filled else ci
                 st = _level(
-                    s, _anchor(bracket_anchor, c[p_chase - chase], px, px), p_st, p_stp, -1.0
+                    s,
+                    _anchor(bracket_anchor, c[p_chase - chase], px, px),
+                    p_st,
+                    p_stp,
+                    -1.0,
+                    round_tick,
+                    tick_round,
                 )
                 tg = _level(
-                    s, _anchor(bracket_anchor, c[p_chase - chase], px, px), p_tg, p_tgp, 1.0
+                    s,
+                    _anchor(bracket_anchor, c[p_chase - chase], px, px),
+                    p_tg,
+                    p_tgp,
+                    1.0,
+                    round_tick,
+                    tick_round,
                 )
                 err, why = _fill_then_protect(
                     s, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i, out_exit_i,
@@ -607,12 +772,12 @@ def _column(
                 if not np.isnan(stop) and o[i] <= stop:
                     reason, px = REASON_STOP_GAP, o[i]
                 elif not adverse_hit and not np.isnan(target) and o[i] >= target:
-                    reason, px = REASON_TARGET, target
+                    reason, px = REASON_TARGET, (o[i] if target_gap else target)
             else:
                 if not np.isnan(stop) and o[i] >= stop:
                     reason, px = REASON_STOP_GAP, o[i]
                 elif not adverse_hit and not np.isnan(target) and o[i] <= target:
-                    reason, px = REASON_TARGET, target
+                    reason, px = REASON_TARGET, (o[i] if target_gap else target)
             if reason == 0:
                 # Extremes: high then low, or the one nearer the open first when adaptive
                 # (strictly nearer high -> high first; ties -> low first).
@@ -656,10 +821,40 @@ def _column(
                         stale_px = px
                 pos = 0
                 exited = True
-        market_exit = exit_sig[i] and pos != 0 and exit_next_open
-        if market_exit and (i + 1 == n or new_day[i + 1]):
+        if force_close[i] & 8:
+            if pos or pend:
+                return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
+            continue
+        if _force_for(force_close[i], pos if pos else pend):
+            if pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    entry_i,
+                    i,
+                    pos,
+                    entry_px,
+                    ci,
+                    REASON_SIGNAL,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+            pos, pend, market_entry, market_exit = 0, 0, -1, False
+            continue
+        if force_open[i]:
+            continue
+        exit_now = _exit_for(exit_sig[i], long_exits[i], short_exits[i], pos if pos else pend)
+        market_exit = exit_now and pos != 0 and exit_next_open
+        if market_exit and (i + 1 == n or (new_day[i + 1] and not cross_session)):
             return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
-        if exit_sig[i] and not exit_next_open and pos != 0:
+        if exit_now and not exit_next_open and pos != 0:
             _venue_record(
                 count_only,
                 base + cnt,
@@ -689,13 +884,13 @@ def _column(
                 and (reenter or not exited)
             )
             if market_exit or enter:
-                if i + 1 == n or new_day[i + 1]:
+                if i + 1 == n or (new_day[i + 1] and not cross_session):
                     return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
                 if enter:
                     market_entry = i
             continue
         # --- decisions at bar i's close (on_bar): market orders fill at c[i] ---
-        if exit_sig[i] and not exit_next_open:
+        if exit_now and not exit_next_open:
             if pos != 0:
                 if not count_only:
                     k = base + cnt
@@ -719,10 +914,22 @@ def _column(
                 if (s > 0 and lim >= ci) or (s < 0 and lim <= ci):
                     # marketable: fills at the close (A11); V2 anchors point levels to the limit
                     st = _level(
-                        s, _anchor(bracket_anchor, ci, ci, lim), entry_stop[i], stop_pts[i], -1.0
+                        s,
+                        _anchor(bracket_anchor, ci, ci, lim),
+                        entry_stop[i],
+                        stop_pts[i],
+                        -1.0,
+                        round_tick,
+                        tick_round,
                     )
                     tg = _level(
-                        s, _anchor(bracket_anchor, ci, ci, lim), entry_target[i], target_pts[i], 1.0
+                        s,
+                        _anchor(bracket_anchor, ci, ci, lim),
+                        entry_target[i],
+                        target_pts[i],
+                        1.0,
+                        round_tick,
+                        tick_round,
                     )
                     err, why = _fill_then_protect(
                         s, i, ci, st, tg, ci, protect_flatten, count_only, out_entry_i,
@@ -749,8 +956,8 @@ def _column(
                     p_stp = stop_pts[i]
                     p_tgp = target_pts[i]
                 continue
-            st = _level(s, ci, entry_stop[i], stop_pts[i], -1.0)
-            tg = _level(s, ci, entry_target[i], target_pts[i], 1.0)
+            st = _level(s, ci, entry_stop[i], stop_pts[i], -1.0, round_tick, tick_round)
+            tg = _level(s, ci, entry_target[i], target_pts[i], 1.0, round_tick, tick_round)
             if _in_market(s, st, ci, True):
                 return cnt, ERR_STOP_IN_MARKET, i, pos, entry_i, entry_px, stop
             if _in_market(s, tg, ci, False):
@@ -782,6 +989,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -794,6 +1002,28 @@ def run_columns(
     if entry_trigger is not None:
         assert stop_updates is not None and target_updates is not None
         assert be_after is not None and be_offset is not None
+    if exit_long is None:
+        exit_long = np.zeros_like(exit_sig)
+    if exit_short is None:
+        exit_short = np.zeros_like(exit_sig)
+    if force_close is None:
+        force_close = np.zeros(exit_sig.shape, np.int8)
+    if force_open is None:
+        force_open = np.zeros_like(exit_sig)
+    if tick_round:
+        entry_limit = entry_limit.copy()
+        for j in range(side_sig.shape[0]):
+            for i in range(side_sig.shape[1]):
+                entry_limit[j, i] = _round_price(
+                    entry_limit[j, i], tick, tick_round, -side_sig[j, i]
+                )
+        if entry_trigger is not None:
+            entry_trigger = entry_trigger.copy()
+            for j in range(side_sig.shape[0]):
+                for i in range(side_sig.shape[1]):
+                    entry_trigger[j, i] = _round_price(
+                        entry_trigger[j, i], tick, tick_round, side_sig[j, i]
+                    )
     slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
@@ -848,6 +1078,14 @@ def run_columns(
                 stop_skip,
                 adverse_first,
                 bracket_anchor,
+                target_gap,
+                tick_round,
+                tick,
+                exit_long[j],
+                exit_short[j],
+                force_close[j],
+                force_open[j],
+                cross_session,
                 True,
                 e0,
                 e0,
@@ -862,7 +1100,7 @@ def run_columns(
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, True,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, exit_long[j], exit_short[j], force_close[j], force_open[j], cross_session, True,
             e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -926,6 +1164,14 @@ def run_columns(
                     stop_skip,
                     adverse_first,
                     bracket_anchor,
+                    target_gap,
+                    tick_round,
+                    tick,
+                    exit_long[j],
+                    exit_short[j],
+                    force_close[j],
+                    force_open[j],
+                    cross_session,
                     False,
                     entry_i,
                     exit_i,
@@ -940,7 +1186,7 @@ def run_columns(
                 _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, exit_long[j], exit_short[j], force_close[j], force_open[j], cross_session, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
@@ -986,6 +1232,14 @@ def _slots_column(
     stop_skip,
     adverse_first,
     bracket_anchor,
+    target_gap,
+    tick_round,
+    round_tick,
+    long_exits,
+    short_exits,
+    force_close,
+    force_open,
+    cross_session,
     count_only,
     out_ei,
     out_xi,
@@ -1005,6 +1259,12 @@ def _slots_column(
     cnt, error = 0, ERR_NONE
     for i in range(len(c)):
         ci = c[i]
+        exit_now = _exit_for(
+            exits[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (sides[pending] if pending >= 0 else 0),
+        )
         exited, busy = False, pending >= 0
         pinned, pin, prev = 0, np.nan, o[i]
         if (
@@ -1013,6 +1273,29 @@ def _slots_column(
             and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
         ):
             return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, risk_stop
+        if force_open[i]:
+            if pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    ei,
+                    i,
+                    pos,
+                    ep,
+                    o[i] - pos * slip,
+                    REASON_SIGNAL,
+                    risk_stop,
+                    out_ei,
+                    out_xi,
+                    out_sd,
+                    out_ep,
+                    out_xp,
+                    out_why,
+                    out_st,
+                )
+                cnt += 1
+            queue.clear()
+            pos, pending, live, resting, chasing, closing = 0, -1, False, False, False, False
         for phase in range(2):
             if phase == 0 and not (next_open or exit_next_open):
                 continue
@@ -1051,8 +1334,10 @@ def _slots_column(
                                 px,
                                 limits[d] if not np.isnan(limits[d]) else px,
                             )
-                            stop = _level(s, anchor, stops[d], sp[d], -1.0)
-                            target = _level(s, anchor, targets[d], tp[d], 1.0)
+                            stop = _level(s, anchor, stops[d], sp[d], -1.0, round_tick, tick_round)
+                            target = _level(
+                                s, anchor, targets[d], tp[d], 1.0, round_tick, tick_round
+                            )
                             pos, ei, ep, gen, risk_stop = s, i, px, d, stop
                             be_done = False
                             pending, resting, chasing = -1, False, False
@@ -1103,7 +1388,11 @@ def _slots_column(
                             pos, target, pt if mit else pt - pos * slip, False
                         ):
                             reason = REASON_TARGET
-                            px = pt - pos * slip if slip else (pt if mit and m == 0 else target)
+                            px = (
+                                pt - pos * slip
+                                if slip
+                                else (pt if (mit or target_gap) and m == 0 else target)
+                            )
                             if not mit and not slip and (m == 1 or m == 2):
                                 pinned, pin = pos, px
                         if reason:
@@ -1129,6 +1418,52 @@ def _slots_column(
                             pos, exited, live = 0, True, False
                 if error:
                     return cnt, error, i, pos, ei, ep, risk_stop
+                if force_close[i] & 8:
+                    if pos or pending >= 0:
+                        return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, ei, ep, risk_stop
+                    continue
+                if (
+                    _force_for(
+                        force_close[i], pos if pos else (sides[pending] if pending >= 0 else 0)
+                    )
+                    or force_open[i]
+                ):
+                    if pos:
+                        _venue_record(
+                            count_only,
+                            base + cnt,
+                            ei,
+                            i,
+                            pos,
+                            ep,
+                            ci - pos * slip,
+                            REASON_SIGNAL,
+                            risk_stop,
+                            out_ei,
+                            out_xi,
+                            out_sd,
+                            out_ep,
+                            out_xp,
+                            out_why,
+                            out_st,
+                        )
+                        cnt += 1
+                    queue.clear()
+                    pos, pending, live, resting, chasing, closing = (
+                        0,
+                        -1,
+                        False,
+                        False,
+                        False,
+                        False,
+                    )
+                    continue
+                exit_now = _exit_for(
+                    exits[i],
+                    long_exits[i],
+                    short_exits[i],
+                    pos if pos else (sides[pending] if pending >= 0 else 0),
+                )
                 if pos == 0 and pending < 0:
                     closing = False
                 if (
@@ -1140,18 +1475,18 @@ def _slots_column(
                     chasing = True
                     queue.append(
                         (
-                            i + latency + (exit_next_open if exits[i] else next_open),
+                            i + latency + (exit_next_open if exit_now else next_open),
                             _SLOT_CANCEL,
                             pending,
                             0.0,
                         )
                     )
-                if exits[i]:
+                if exit_now:
                     chasing = False
                     if pending >= 0:
                         queue.append(
                             (
-                                i + latency + (exit_next_open if exits[i] else next_open),
+                                i + latency + (exit_next_open if exit_now else next_open),
                                 _SLOT_CANCEL,
                                 pending,
                                 0.0,
@@ -1171,6 +1506,7 @@ def _slots_column(
                             update = ep + pos * (0.0 if np.isnan(bo[gen]) else bo[gen])
                             be_done = True
                     if not np.isnan(update):
+                        update = _round_price(update, round_tick, tick_round, -pos)
                         bound = stop
                         for _, kind, d, value in queue:
                             if kind == _SLOT_AMEND_STOP and d == gen and pos * (value - bound) > 0:
@@ -1183,19 +1519,26 @@ def _slots_column(
                         if np.isnan(target):
                             error = ERR_AMEND_NO_ORDER
                         else:
-                            queue.append((i + latency + next_open, _SLOT_AMEND_TARGET, gen, tu[i]))
+                            queue.append(
+                                (
+                                    i + latency + next_open,
+                                    _SLOT_AMEND_TARGET,
+                                    gen,
+                                    _round_price(tu[i], round_tick, tick_round, pos),
+                                )
+                            )
                 if (
                     pos == 0
                     and pending >= 0
                     and not np.isnan(triggers[pending])
                     and sides[i]
-                    and not exits[i]
+                    and not exit_now
                 ):
                     if latency:
                         return cnt, ERR_STOP_REPLACE_LATENCY, i, pos, ei, ep, risk_stop
                     queue.append(
                         (
-                            i + latency + (exit_next_open if exits[i] else next_open),
+                            i + latency + (exit_next_open if exit_now else next_open),
                             _SLOT_CANCEL,
                             pending,
                             0.0,
@@ -1212,12 +1555,12 @@ def _slots_column(
                 ):
                     pending = i
                     queue.append((i + latency + next_open, _SLOT_SUBMIT, i, 0.0))
-                if next_open and exits[i] and pos and reenter and sides[i] and pending < 0:
+                if next_open and exit_now and pos and reenter and sides[i] and pending < 0:
                     pending = i
                     queue.append((i + 1, _SLOT_SUBMIT, i, 0.0))
             if not error and not latency and (next_open or exit_next_open):
                 for due, _, _, _ in queue:
-                    if due > i and (i + 1 == len(c) or days[i + 1]):
+                    if due > i and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
                         error = ERR_NEXT_OPEN_SESSION_END
             while len(queue) and error == 0:
                 ready = -1
@@ -1259,8 +1602,8 @@ def _slots_column(
                     s, px, anchor = 0, 0.0, 0.0
                 if s:
                     pos, ei, ep, gen = s, i, px, d
-                    stop = _level(s, anchor, stops[d], sp[d], -1.0)
-                    target = _level(s, anchor, targets[d], tp[d], 1.0)
+                    stop = _level(s, anchor, stops[d], sp[d], -1.0, round_tick, tick_round)
+                    target = _level(s, anchor, targets[d], tp[d], 1.0, round_tick, tick_round)
                     risk_stop, be_done = stop, False
                     pending, resting, chasing, live = -1, False, False, False
                     if oto:
@@ -1362,7 +1705,7 @@ def _slots_column(
                         pos, exited, live = 0, True, False
             if not error and not latency and (next_open or exit_next_open):
                 for due, _, _, _ in queue:
-                    if due > i and (i + 1 == len(c) or days[i + 1]):
+                    if due > i and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
                         error = ERR_NEXT_OPEN_SESSION_END
         if error:
             return cnt, error, i, pos, ei, ep, risk_stop

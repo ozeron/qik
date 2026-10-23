@@ -264,6 +264,19 @@ def test_slots_kernel_equals_independent_reference_dense(
         )
         adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
         chase = int(rng.integers(1, 4))
+        rounding = case_i % 3
+        if rounding:
+            st -= side * 0.09
+            tg += side * 0.09
+            trig += side * 0.09
+            limits -= side * 0.09
+            sp += 0.09
+            tp += 0.09
+            su += 0.09
+            tu += 0.09
+            bo += 0.09
+        xl, xs = rng.random(n) < 0.1, rng.random(n) < 0.1
+        fc, fo = (rng.random(n) < 0.03).astype(np.int8), rng.random(n) < 0.03
         ref = simulate_column_reference(
             o,
             h,
@@ -284,6 +297,12 @@ def test_slots_kernel_equals_independent_reference_dense(
             protect_flatten=flatten,
             adverse_first=adverse_first,
             bracket_anchor=bracket_anchor,
+            target_gap=bool(case_i % 2),
+            tick_round=rounding,
+            exit_long=xl,
+            exit_short=xs,
+            force_close=fc,
+            force_open=fo,
             next_open=next_open,
             exit_next_open=exit_next_open,
             latency_bars=latency,
@@ -339,6 +358,12 @@ def test_slots_kernel_equals_independent_reference_dense(
             exit_next_open=exit_next_open,
             adverse_first=adverse_first,
             bracket_anchor=bracket_anchor,
+            target_gap=bool(case_i % 2),
+            tick_round=rounding,
+            exit_long=col(xl),
+            exit_short=col(xs),
+            force_close=col(fc),
+            force_open=col(fo),
         )
         assert (int(out[2][0]), int(out[3][0])) == (ref.err, ref.err_bar), dict(
             o=o,

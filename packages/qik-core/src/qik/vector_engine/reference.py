@@ -114,8 +114,36 @@ class _Book:
         self.pinned_side, self.pinned_px = side, price
 
 
+def _round_level(price: float, tick: float, mode: int, direction: int) -> float:
+    if mode == 0 or math.isnan(price):
+        return price
+    units = price / tick
+    if mode == 1:
+        units = math.floor(units + 0.5)
+    elif direction > 0:
+        units = math.ceil(units - 1e-10)
+    else:
+        units = math.floor(units + 1e-10)
+    return units * tick
+
+
+def _force_for(mask: int, side: int) -> bool:
+    return bool(mask & 1 or (mask & 2 and side > 0) or (mask & 4 and side < 0))
+
+
+def _wants_exit(all_: bool, long_: bool, short_: bool, side: int) -> bool:
+    return bool(all_ or (long_ if side > 0 else short_ if side < 0 else False))
+
+
 def _levels(
-    side: int, anchor: float, stop: float, target: float, stop_pts: float, target_pts: float
+    side: int,
+    anchor: float,
+    stop: float,
+    target: float,
+    stop_pts: float,
+    target_pts: float,
+    tick: float = 0.0,
+    rounding: int = 0,
 ) -> tuple[float, float]:
     """Absolute stop and target: given levels as they are, point offsets from ``anchor``."""
 
@@ -123,7 +151,7 @@ def _levels(
         stop = anchor - side * stop_pts
     if not math.isnan(target_pts):
         target = anchor + side * target_pts
-    return stop, target
+    return _round_level(stop, tick, rounding, -side), _round_level(target, tick, rounding, side)
 
 
 OPEN = 0
@@ -191,6 +219,13 @@ def simulate_column_reference(
     exit_next_open: bool | None = None,
     adverse_first: bool = False,
     bracket_anchor: int = 0,
+    target_gap: bool = False,
+    tick_round: int = 0,
+    exit_long: np.ndarray | None = None,
+    exit_short: np.ndarray | None = None,
+    force_close: np.ndarray | None = None,
+    force_open: np.ndarray | None = None,
+    cross_session: bool = False,
     latency_bars: int = 0,
     one_tick: bool = False,
     tick: float = 0.0,
@@ -206,6 +241,26 @@ def simulate_column_reference(
     stop_skip: bool = False,
 ) -> RefColumn:
     exit_next_open = next_open if exit_next_open is None else exit_next_open
+    long_exits = np.zeros(len(c), bool) if exit_long is None else exit_long
+    short_exits = np.zeros(len(c), bool) if exit_short is None else exit_short
+    round_tick = tick
+    force_close = np.zeros(len(c), bool) if force_close is None else force_close
+    force_open = np.zeros(len(c), bool) if force_open is None else force_open
+    if tick_round:
+        if entry_limit is not None:
+            entry_limit = np.array(
+                [
+                    _round_level(float(v), tick, tick_round, -int(side_sig[i]))
+                    for i, v in enumerate(entry_limit)
+                ]
+            )
+        if stop_entry is not None:
+            stop_entry = np.array(
+                [
+                    _round_level(float(v), tick, tick_round, int(side_sig[i]))
+                    for i, v in enumerate(stop_entry)
+                ]
+            )
     if (
         oto
         or mit
@@ -222,6 +277,14 @@ def simulate_column_reference(
             entry_target,
             adverse_first=adverse_first,
             bracket_anchor=bracket_anchor,
+            target_gap=target_gap,
+            tick_round=tick_round,
+            round_tick=round_tick,
+            long_exits=long_exits,
+            short_exits=short_exits,
+            force_close=force_close,
+            force_open=force_open,
+            cross_session=cross_session,
             entry_limit=entry_limit,
             next_open=next_open,
             exit_next_open=exit_next_open,
@@ -266,6 +329,14 @@ def simulate_column_reference(
             new_day=new_day,
             adverse_first=adverse_first,
             bracket_anchor=bracket_anchor,
+            target_gap=target_gap,
+            tick_round=tick_round,
+            round_tick=round_tick,
+            long_exits=long_exits,
+            short_exits=short_exits,
+            force_close=force_close,
+            force_open=force_open,
+            cross_session=cross_session,
             latency_bars=latency_bars,
             tick=tick if one_tick else 0.0,
         )
@@ -289,6 +360,20 @@ def simulate_column_reference(
         busy = False
         book = _Book()
         close = float(c[i])
+        exit_now = _wants_exit(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (pending.side if pending is not None else 0),
+        )
+        if pending is not None and bool(starts_day[i]):
+            # V2 drops a staged chase on a new calendar day and the DAY limit keeps resting; the
+            # engine does not model that, so the input is refused (A15).
+            return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
+        if force_open[i]:
+            if pos:
+                trades.append(RefTrade(entry_i, i, pos, entry_px, float(o[i]), REASON_SIGNAL, stop))
+            pos, pending, market_entry, market_exit, exited = 0, None, None, False, True
         if market_exit:
             trades.append(RefTrade(entry_i, i, pos, entry_px, float(o[i]), REASON_SIGNAL, stop))
             pos = 0
@@ -304,6 +389,8 @@ def simulate_column_reference(
                 m.target,
                 m.stop_pts,
                 m.target_pts,
+                tick=round_tick,
+                rounding=tick_round,
             )
             # R1's newly placed protection cannot retroactively gap-fill across the entry open.
             if not math.isnan(st) and (st >= px if m.side > 0 else st <= px):
@@ -312,10 +399,6 @@ def simulate_column_reference(
                 return RefColumn(trades, ERR_TARGET_IN_MARKET, i, pos, entry_i)
             pos, entry_i, entry_px, stop, target = m.side, i, px, st, tg
             market_entry = None
-        if pending is not None and bool(starts_day[i]):
-            # V2 drops a staged chase on a new calendar day and the DAY limit keeps resting; the
-            # engine does not model that, so the input is refused (A15).
-            return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
         if pending is not None:
             # A resting limit entry fills at its own level once reached, also on a gap (A5). V2
             # places the protection when the fill event arrives, which in a backtest is after the
@@ -329,7 +412,7 @@ def simulate_column_reference(
                     filled = True
                     break
             busy = filled or i == p.chase_bar  # the sleeve still sees a working entry this bar
-            if filled or (i == p.chase_bar and not bool(exit_sig[i])):
+            if filled or (i == p.chase_bar and not exit_now):
                 # Not filled by the chase bar: cancel, market at this close (V2's coordinator runs
                 # before the sleeve's own decisions on the bar); levels from that fill.
                 pending = None
@@ -341,6 +424,8 @@ def simulate_column_reference(
                     p.target,
                     p.stop_pts,
                     p.target_pts,
+                    tick=round_tick,
+                    rounding=tick_round,
                 )
                 verdict = _protect_at_close(p.side, st, tg, close, protect_flatten)
                 if verdict == REFUSE:
@@ -373,17 +458,34 @@ def simulate_column_reference(
                 if not adverse_hit and not math.isnan(target):
                     px = _limit_fill(pos, target, price)
                     if px is not None:
-                        fill = (REASON_TARGET, px)
+                        fill = (REASON_TARGET, price if target_gap and label == "O" else px)
                         if label != "O":  # a limit already through at the open pins nothing (A13)
                             book.pin(pos, px)
             if fill is not None:
                 trades.append(RefTrade(entry_i, i, pos, entry_px, fill[1], fill[0], stop))
                 pos = 0
                 exited = True
-        market_exit = bool(exit_sig[i]) and pos != 0 and exit_next_open
-        if market_exit and (i + 1 == n or bool(starts_day[i + 1])):
+        if int(force_close[i]) & 8:
+            if pos or pending is not None:
+                return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
+            continue
+        if _force_for(int(force_close[i]), pos if pos else (pending.side if pending else 0)):
+            if pos:
+                trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
+            pos, pending, market_entry, market_exit = 0, None, None, False
+            continue
+        if force_open[i]:
+            continue
+        exit_now = _wants_exit(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (pending.side if pending is not None else 0),
+        )
+        market_exit = exit_now and pos != 0 and exit_next_open
+        if market_exit and (i + 1 == n or (bool(starts_day[i + 1]) and not cross_session)):
             return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
-        if bool(exit_sig[i]) and not exit_next_open:
+        if exit_now and not exit_next_open:
             if pos != 0:
                 trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
                 pos = 0
@@ -398,7 +500,7 @@ def simulate_column_reference(
                 and (reenter or not exited)
             )
             if market_exit or enter:
-                if i + 1 == n or bool(starts_day[i + 1]):
+                if i + 1 == n or (bool(starts_day[i + 1]) and not cross_session):
                     return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
                 if enter:
                     market_entry = _MarketEntry(
@@ -410,7 +512,7 @@ def simulate_column_reference(
                         float(tgt_pts_sig[i]),
                     )
             continue
-        if bool(exit_sig[i]) and not exit_next_open:
+        if exit_now and not exit_next_open:
             if pos != 0:
                 trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
                 pos = 0
@@ -433,7 +535,13 @@ def simulate_column_reference(
                 if (lim >= close) if s > 0 else (lim <= close):
                     # Marketable: fills at the close (A11). V2 still anchors point levels to the
                     # limit price, not the fill.
-                    st, tg = _levels(s, _anchor(bracket_anchor, close, close, lim), *spec)
+                    st, tg = _levels(
+                        s,
+                        _anchor(bracket_anchor, close, close, lim),
+                        *spec,
+                        tick=round_tick,
+                        rounding=tick_round,
+                    )
                     verdict = _protect_at_close(s, st, tg, close, protect_flatten)
                     if verdict == REFUSE:
                         return RefColumn(trades, ERR_PROTECT_REJECTED, i, pos, entry_i)
@@ -445,7 +553,7 @@ def simulate_column_reference(
                 else:
                     pending = _Pending(s, lim, i + chase_after, *spec)
                 continue
-            st, tg = _levels(s, close, *spec)
+            st, tg = _levels(s, close, *spec, tick=round_tick, rounding=tick_round)
             if not math.isnan(st) and (st >= close if s > 0 else st <= close):
                 return RefColumn(trades, ERR_STOP_IN_MARKET, i, pos, entry_i)
             if not math.isnan(tg) and (tg <= close if s > 0 else tg >= close):
@@ -484,6 +592,14 @@ def _simulate_venue_reference(
     *,
     adverse_first: bool,
     bracket_anchor: int,
+    target_gap: bool,
+    tick_round: int,
+    round_tick: float,
+    long_exits: np.ndarray,
+    short_exits: np.ndarray,
+    force_close: np.ndarray,
+    force_open: np.ndarray,
+    cross_session: bool,
     adaptive: bool,
     reenter: bool,
     entry_limit: np.ndarray | None,
@@ -541,6 +657,8 @@ def _simulate_venue_reference(
             float(entry_target[d]),
             float(spts[d]),
             float(tpts[d]),
+            tick=round_tick,
+            rounding=tick_round,
         )
         pending, resting, chasing = -1, False, False
         rejected_stop = False
@@ -554,11 +672,21 @@ def _simulate_venue_reference(
             send("protect", d)
 
     for i in range(n):
+        exit_now = _wants_exit(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (int(side_sig[pending]) if pending >= 0 else 0),
+        )
         exited = False
         busy = pending >= 0
         ci = float(c[i])
         if pending >= 0 and not math.isnan(limits[pending]) and days[i]:
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
+        if force_open[i]:
+            close(float(o[i]) - pos * tick, REASON_SIGNAL)
+            commands.clear()
+            pending, resting, chasing, protection, closing = -1, False, False, 0, False
         if closing and pending < 0 and pos == 0 and protection in (0, 3):
             closing = False
         adverse_hit = (
@@ -596,9 +724,26 @@ def _simulate_venue_reference(
                 elif not adverse_hit and not math.isnan(target):
                     px = price - pos * tick
                     if px >= target if pos > 0 else px <= target:
-                        close(px if tick else target, REASON_TARGET)
+                        close(
+                            px if tick else (price if target_gap and label == "O" else target),
+                            REASON_TARGET,
+                        )
                         send("cancel_protect", generation)
                         protection = 3
+        if int(force_close[i]) & 8:
+            if pos or pending >= 0:
+                return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
+            continue
+        if (
+            _force_for(
+                int(force_close[i]), pos if pos else (int(side_sig[pending]) if pending >= 0 else 0)
+            )
+            or force_open[i]
+        ):
+            close(ci - pos * tick, REASON_SIGNAL)
+            commands.clear()
+            pending, resting, chasing, protection, closing = -1, False, False, 0, False
+            continue
         # V2 sync sees protective fills/cancellations from this sweep before deciding.
         if closing and pending < 0 and pos == 0 and protection in (0, 3):
             closing = False
@@ -614,7 +759,13 @@ def _simulate_venue_reference(
         ):
             chasing = True
             send("cancel_entry", pending)
-        if bool(exit_sig[i]):
+        exit_now = _wants_exit(
+            exit_sig[i],
+            long_exits[i],
+            short_exits[i],
+            pos if pos else (int(side_sig[pending]) if pending >= 0 else 0),
+        )
+        if exit_now:
             chasing = False
             if pending >= 0:
                 if not closing and not math.isnan(limits[pending]):
@@ -711,6 +862,14 @@ def _simulate_slots_reference(
     *,
     adverse_first: bool,
     bracket_anchor: int,
+    target_gap: bool,
+    tick_round: int,
+    round_tick: float,
+    long_exits: np.ndarray,
+    short_exits: np.ndarray,
+    force_close: np.ndarray,
+    force_open: np.ndarray,
+    cross_session: bool,
     next_open: bool,
     exit_next_open: bool,
     entry_limit: np.ndarray | None,
@@ -768,10 +927,10 @@ def _simulate_slots_reference(
             if kind == "close":
                 delay += int(exit_next_open)
             elif kind == "cancel":
-                delay += int(exit_next_open if exits[i] else next_open)
+                delay += int(exit_next_open if exit_now else next_open)
             elif kind in ("submit", "replace", "stop", "target"):
                 delay += int(next_open)
-        if delay and not latency and (i + 1 == len(c) or days[i + 1]):
+        if delay and not latency and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
             fail(ERR_NEXT_OPEN_SESSION_END)
         queue.append((i + delay, kind, d, value))
 
@@ -829,7 +988,16 @@ def _simulate_slots_reference(
         s = int(sides[d])
         anchor = float(limits[d]) if not math.isnan(limits[d]) and not chased else price
         anchor = _anchor(bracket_anchor, float(c[d]), price, anchor)
-        st, tg = _levels(s, anchor, float(stops[d]), float(targets[d]), float(sp[d]), float(tp[d]))
+        st, tg = _levels(
+            s,
+            anchor,
+            float(stops[d]),
+            float(targets[d]),
+            float(sp[d]),
+            float(tp[d]),
+            tick=round_tick,
+            rounding=tick_round,
+        )
         position = _SlotPosition(d, s, i, price, st, tg, st)
         last_entry, last_price, last_stop = i, price, st
         pending, resting, chasing = -1, False, False
@@ -841,6 +1009,12 @@ def _simulate_slots_reference(
             send("protect", d)
 
     for i in range(len(c)):
+        exit_now = _wants_exit(
+            exits[i],
+            long_exits[i],
+            short_exits[i],
+            position.side if position else (int(sides[pending]) if pending >= 0 else 0),
+        )
         exited = False
         busy = pending >= 0
         book = _Book()
@@ -850,6 +1024,11 @@ def _simulate_slots_reference(
             and (not math.isnan(triggers[pending]) or not math.isnan(limits[pending]))
         ):
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, 0, last_entry, last_price, last_stop)
+        if force_open[i]:
+            if position is not None:
+                close(float(o[i]) - position.side * slip, REASON_SIGNAL)
+            queue.clear()
+            pending, resting, chasing, closing = -1, False, False, False
         for phase in range(2):
             if phase == 0 and not (next_open or exit_next_open):
                 continue
@@ -894,11 +1073,33 @@ def _simulate_slots_reference(
                             px = (
                                 price + out * slip
                                 if slip
-                                else (price if mit and label == "O" else p.target)
+                                else (price if (mit or target_gap) and label == "O" else p.target)
                             )
                             if not mit and not slip and label in ("H", "L"):
                                 book.pin(p.side, px)
                             close(px, REASON_TARGET)
+                if int(force_close[i]) & 8:
+                    if position is not None or pending >= 0:
+                        return RefColumn(
+                            trades,
+                            ERR_NEXT_OPEN_SESSION_END,
+                            i,
+                            0 if position is None else position.side,
+                            last_entry,
+                        )
+                    continue
+                if (
+                    _force_for(
+                        int(force_close[i]),
+                        position.side if position else (int(sides[pending]) if pending >= 0 else 0),
+                    )
+                    or force_open[i]
+                ):
+                    if position is not None:
+                        close(float(c[i]) - position.side * slip, REASON_SIGNAL)
+                    queue.clear()
+                    pending, resting, chasing, closing = -1, False, False, False
+                    continue
                 if position is None and pending < 0:
                     closing = False
                 if (
@@ -909,7 +1110,13 @@ def _simulate_slots_reference(
                 ):
                     chasing = True
                     send("cancel", pending)
-                if exits[i]:
+                exit_now = _wants_exit(
+                    exits[i],
+                    long_exits[i],
+                    short_exits[i],
+                    position.side if position else (int(sides[pending]) if pending >= 0 else 0),
+                )
+                if exit_now:
                     chasing = False
                     if pending >= 0:
                         send("cancel", pending)
@@ -936,6 +1143,7 @@ def _simulate_slots_reference(
                             update = p.price + p.side * offset
                             p.be_done = True
                     if not math.isnan(update):
+                        update = _round_level(update, round_tick, tick_round, -p.side)
                         bound = p.stop
                         for _, kind, d, value in queue:
                             if kind == "stop" and d == p.decision and p.side * (value - bound) > 0:
@@ -948,13 +1156,17 @@ def _simulate_slots_reference(
                         if math.isnan(p.target):
                             fail(ERR_AMEND_NO_ORDER)
                         else:
-                            send("target", p.decision, float(tu[i]))
+                            send(
+                                "target",
+                                p.decision,
+                                _round_level(float(tu[i]), round_tick, tick_round, p.side),
+                            )
                 if (
                     position is None
                     and pending >= 0
                     and not math.isnan(triggers[pending])
                     and sides[i]
-                    and not exits[i]
+                    and not exit_now
                 ):
                     if latency:
                         return RefColumn(
@@ -980,7 +1192,7 @@ def _simulate_slots_reference(
                     send("submit", i)
                 if (
                     next_open
-                    and exits[i]
+                    and exit_now
                     and position is not None
                     and reenter
                     and sides[i]

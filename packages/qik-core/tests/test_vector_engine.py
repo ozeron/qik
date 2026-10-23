@@ -77,6 +77,7 @@ def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
     limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
     next_open=False, latency_bars=0, one_tick=False, tick=0.0, exit_next_open=None, slots=False, adverse_first=False, bracket_anchor=0,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
@@ -89,6 +90,11 @@ def _run_kernel(
         day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open,
         latency_bars, one_tick, tick, exit_next_open=exit_next_open,
         adverse_first=adverse_first, bracket_anchor=bracket_anchor,
+        target_gap=target_gap, tick_round=tick_round, cross_session=cross_session,
+        exit_long=None if exit_long is None else exit_long[None, :],
+        exit_short=None if exit_short is None else exit_short[None, :],
+        force_close=None if force_close is None else force_close.astype(np.int8)[None, :],
+        force_open=None if force_open is None else force_open[None, :],
         entry_trigger=nan[None, :] if slots else None,
         stop_updates=nan[None, :] if slots else None, target_updates=nan[None, :] if slots else None,
         be_after=nan[None, :] if slots else None, be_offset=nan[None, :] if slots else None,
@@ -147,6 +153,11 @@ def _kernel_final(final: tuple) -> tuple:
     adverse_first=st.booleans(),
     bracket_anchor=st.integers(0, 2),
     point_brackets=st.booleans(),
+    target_gap=st.booleans(),
+    tick_round=st.integers(0, 2),
+    cross_session=st.booleans(),
+    side_exits=st.booleans(),
+    flatten_at=st.integers(0, 29),
 )
 def test_kernel_equals_reference(
     case,
@@ -156,6 +167,11 @@ def test_kernel_equals_reference(
     adverse_first: bool,
     bracket_anchor: int,
     point_brackets: bool,
+    target_gap: bool,
+    tick_round: int,
+    side_exits: bool,
+    cross_session: bool,
+    flatten_at: int,
 ) -> None:
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop = case
     # Anchor changes have no effect on absolute levels. Include distances so
@@ -166,12 +182,36 @@ def test_kernel_equals_reference(
         target_pts = np.full(len(side), 1.5)
         stop = np.full(len(side), np.nan)
         target = np.full(len(side), np.nan)
+    n = len(side)
+    # Off-grid values make NEAREST / UP observably different, also with points.
+    if tick_round:
+        stop = stop - side * 0.09
+        target = target + side * 0.09
+        if stop_pts is not None:
+            stop_pts = stop_pts + 0.09
+            target_pts = target_pts + 0.09
+    long_exit = exit_ & (np.arange(n) % 2 == 0) if side_exits else np.zeros(n, bool)
+    short_exit = exit_ & (np.arange(n) % 2 == 1) if side_exits else np.zeros(n, bool)
+    exit_ = np.zeros(n, bool) if side_exits else exit_
+    close_force = np.arange(n) == flatten_at
+    open_force = np.arange(n) == flatten_at + 1
+    phase1b = dict(
+        target_gap=target_gap,
+        cross_session=cross_session,
+        new_day=np.arange(n) % 7 == 0,
+        tick_round=tick_round,
+        tick=TICK,
+        exit_long=long_exit,
+        exit_short=short_exit,
+        force_close=close_force,
+        force_open=open_force,
+    )
     ref = simulate_column_reference(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
         adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open, exit_next_open=exit_next_open,
         stop_update=np.full(len(side), np.nan) if slots else None,
         stop_pts=stop_pts, target_pts=target_pts,
-        adverse_first=adverse_first, bracket_anchor=bracket_anchor,
+        adverse_first=adverse_first, bracket_anchor=bracket_anchor, **phase1b,
     )  # fmt: skip
     trades, err, err_bar, final, cnt = _run_kernel(
         arrays,
@@ -189,6 +229,7 @@ def test_kernel_equals_reference(
         slots=slots,
         adverse_first=adverse_first,
         bracket_anchor=bracket_anchor,
+        **phase1b,
     )
     if err:
         # on error the kernel stops; the table is not built (api raises), so compare the verdict
@@ -615,3 +656,64 @@ def test_explicit_inputs_are_required() -> None:
             Costs(**bad)
     with pytest.raises(ValueError, match="limit_chase_bars"):
         Rules(limit_chase_bars=2.0)  # ty: ignore[invalid-argument-type]
+
+
+@pytest.mark.parametrize(
+    "slots,latency,one_tick",
+    [(False, 0, False), (True, 0, False), (False, 1, False), (False, 0, True), (True, 1, True)],
+)
+def test_phase1b_dense_active_axes(slots: bool, latency: int, one_tick: bool) -> None:
+    """All execution bodies with gaps, off-grid distances, directional exits and flatten events."""
+    rng = np.random.default_rng(713)
+    changed = set()
+    for j in range(1000):
+        a, side, exits, stop, target = _dense_case(rng)
+        n = len(side)
+        rounding = j % 3
+        points = j % 2 == 0
+        if points:
+            stop[:] = target[:] = np.nan
+        else:
+            stop -= side * 0.09
+            target += side * 0.09
+        sp = np.full(n, 0.84) if points else None
+        tp = np.full(n, 0.59) if points else None
+        fl = (rng.random(n) < 0.05).astype(np.int8)
+        fo = rng.random(n) < 0.05
+        xl, xs = rng.random(n) < 0.12, rng.random(n) < 0.12
+        opts = dict(
+            target_gap=bool(j % 2),
+            tick_round=rounding,
+            tick=TICK,
+            exit_long=xl,
+            exit_short=xs,
+            force_close=fl,
+            force_open=fo,
+            latency_bars=latency,
+            one_tick=one_tick,
+            stop_pts=sp,
+            target_pts=tp,
+            adverse_first=bool(j % 3),
+            bracket_anchor=j % 3,
+        )
+        ref = simulate_column_reference(
+            a["o"],
+            a["h"],
+            a["lo"],
+            a["c"],
+            side,
+            exits,
+            stop,
+            target,
+            stop_update=np.full(n, np.nan) if slots else None,
+            **opts,
+        )
+        trades, err, eb, final, _ = _run_kernel(
+            a, side, exits, stop, target, False, True, False, slots=slots, **opts
+        )
+        assert (err, eb if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
+        if not err:
+            assert trades == _ref_trades(ref)
+            assert _kernel_final(final) == _ref_final(ref)
+            changed.update(t[5] for t in trades)
+    assert {K.REASON_SIGNAL, K.REASON_STOP, K.REASON_TARGET}.issubset(changed)

@@ -62,6 +62,10 @@ class Decision:
     breakeven_after_points: float = math.nan
     breakeven_offset_points: float = math.nan
 
+    flatten: bool = False
+    exit_long: bool = False
+    exit_short: bool = False
+
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):
             raise ValueError(f"side must be -1, 0 or +1, got {self.side!r}")
@@ -71,7 +75,11 @@ class Core(Protocol):
     def step(self, bar: BarView) -> Decision: ...
 
 
-_LEVELS = tuple(name for name in SIGNAL_FIELDS if name not in ("entry_side", "exit"))
+_LEVELS = tuple(
+    name
+    for name in SIGNAL_FIELDS
+    if name not in ("entry_side", "exit", "exit_long", "exit_short", "flatten")
+)
 
 
 def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
@@ -84,6 +92,7 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
     n = len(bars)
     side = np.zeros(n, np.int8)
     exit_ = np.zeros(n, np.bool_)
+    exits = {name: np.zeros(n, np.bool_) for name in ("exit_long", "exit_short", "flatten")}
     levels = {name: np.full(n, np.nan) for name in _LEVELS}
     vol = bars.volume if bars.volume is not None else np.full(n, np.nan)
     for i in range(n):
@@ -95,10 +104,12 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
             raise TypeError(f"bar {i}: step must return a Decision, got {type(d).__name__}")
         side[i] = d.side
         exit_[i] = d.exit
+        for name, arr in exits.items():
+            arr[i] = getattr(d, name)
         for name, arr in levels.items():
             arr[i] = getattr(d, name)
     used = {name: (arr if not np.isnan(arr).all() else None) for name, arr in levels.items()}
-    return Signals(side, exit_, **used)
+    return Signals(side, exit_, **exits, **used)
 
 
 def _prefix(bars: Bars, m: int) -> Bars:
@@ -109,6 +120,7 @@ def _prefix(bars: Bars, m: int) -> Bars:
         bars.close[:m],
         index=None if bars.index is None else bars.index[:m],
         volume=None if bars.volume is None else bars.volume[:m],
+        session_labels=None if bars.session_labels is None else bars.session_labels[:m],
     )
 
 
@@ -128,6 +140,10 @@ def _decision_rows(sig: Signals) -> np.ndarray:
     side = np.asarray(sig.entry_side)
     exit_ = np.asarray(sig.exit)
     any_ = (side != 0) | exit_
+    for name in ("exit_long", "exit_short", "flatten"):
+        a = getattr(sig, name)
+        if a is not None:
+            any_ = any_ | np.asarray(a, dtype=bool)
     for name in ("stop_update", "target_update"):
         a = getattr(sig, name)
         if a is not None:

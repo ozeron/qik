@@ -8,7 +8,7 @@
     res.trades        # one row per closed trade, all k configs, column ``config``
     res.summary()     # one row per config: qik.metrics headline stats
 
-Everything is explicit: nothing is rounded, clipped or defaulted for you. Inputs the engine cannot
+Defaults never round or clip inputs; explicit repro rounding is opt-in. Inputs the engine cannot
 execute the way Nautilus would (levels off the tick grid, a stop at or through the entry close,
 non-finite prices, inconsistent OHLC) raise ``ValueError`` naming the config and the bar.
 """
@@ -40,6 +40,10 @@ __all__ = [
     "Instrument",
     "FillModel",
     "FillTiming",
+    "Flatten",
+    "SessionBoundary",
+    "TargetGap",
+    "TickRound",
     "MarketFill",
     "Profile",
     "Result",
@@ -100,25 +104,60 @@ class BracketAnchor(StrEnum):
     FILL = "fill"
 
 
+class Flatten(StrEnum):
+    NEXT_OPEN = "next_open"
+    LAST_BAR_CLOSE = "last_bar_close"
+    SESSION_END = "session_end"
+
+
+class SessionBoundary(StrEnum):
+    REFUSE = "refuse"
+    NEXT_OBSERVED = "next_observed"
+    LAST_BAR_CLOSE = "last_bar_close"
+
+
+class TargetGap(StrEnum):
+    AT_LIMIT = "at_limit"
+    GAP_IMPROVED = "gap_improved"
+
+
+class TickRound(StrEnum):
+    NONE = "none"
+    NEAREST = "nearest"
+    UP = "up"
+
+
 @dataclass(frozen=True)
 class Instrument:
     tick: float
     point_value: float
+    lot_step: float = field(default=1.0, kw_only=True)
+    min_qty: float = field(default=1.0, kw_only=True)
 
     def __post_init__(self) -> None:
-        if not (self.tick > 0 and self.point_value > 0):
+        if not (
+            np.isfinite(self.tick)
+            and np.isfinite(self.point_value)
+            and self.tick > 0
+            and self.point_value > 0
+        ):
             raise ValueError("tick and point_value must be positive")
+        for name in ("lot_step", "min_qty"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value <= 0:
+                raise ValueError(f"Instrument.{name} must be finite and positive")
 
 
 @dataclass(frozen=True)
 class Costs:
-    """Applied after execution: every fill moves ``slippage_ticks`` against us, then commission."""
+    """Post-fill valuation: adverse ticks, commission and per-side notional basis points."""
 
     commission_per_side: float = 0.0
     slippage_ticks: float = 0.0
+    proportional_bps: float = 0.0
 
     def __post_init__(self) -> None:
-        for name in ("commission_per_side", "slippage_ticks"):
+        for name in ("commission_per_side", "slippage_ticks", "proportional_bps"):
             v = getattr(self, name)
             if not (np.isfinite(v) and v >= 0):
                 raise ValueError(f"{name} must be finite and non-negative, got {v!r}")
@@ -152,6 +191,10 @@ class Rules:
     exit_fill: FillTiming | None = field(default=None, kw_only=True)
     bracket_policy: BracketPolicy = field(default=BracketPolicy.STOP_FIRST, kw_only=True)
     bracket_anchor: BracketAnchor | None = field(default=None, kw_only=True)
+    flatten: Flatten = field(default=Flatten.NEXT_OPEN, kw_only=True)
+    session_boundary: SessionBoundary = field(default=SessionBoundary.REFUSE, kw_only=True)
+    target_gap: TargetGap = field(default=TargetGap.AT_LIMIT, kw_only=True)
+    tick_round: TickRound = field(default=TickRound.NONE, kw_only=True)
     latency_bars: Literal[0, 1] = 0
     fill_model: FillModel = FillModel.DEFAULT
     protection: Literal["callback", "oto"] = "callback"
@@ -182,6 +225,21 @@ class Rules:
             self.bracket_policy is not BracketPolicy.STOP_FIRST or self.bracket_anchor is not None
         ):
             raise ValueError("non-default bracket rules require a repro profile")
+        for name, enum in (
+            ("target_gap", TargetGap),
+            ("tick_round", TickRound),
+            ("flatten", Flatten),
+            ("session_boundary", SessionBoundary),
+        ):
+            if not isinstance(getattr(self, name), enum):
+                raise ValueError(f"{name} must be a {enum.__name__} enum")
+        if self.profile is Profile.NAUTILUS and (
+            self.target_gap is not TargetGap.AT_LIMIT
+            or self.tick_round is not TickRound.NONE
+            or self.flatten is not Flatten.NEXT_OPEN
+            or self.session_boundary is not SessionBoundary.REFUSE
+        ):
+            raise ValueError("non-default target_gap/tick_round require a repro profile")
         next_open = FillTiming.NEXT_OPEN in (self.effective_entry_fill, self.effective_exit_fill)
         for name, choices in (
             ("protection", ("callback", "oto")),
@@ -243,7 +301,14 @@ class Bars:
     index: pd.DatetimeIndex | None = None
     volume: np.ndarray | None = None
 
+    session_labels: np.ndarray | None = field(default=None, kw_only=True)
+
     def __post_init__(self) -> None:
+        if self.session_labels is not None:
+            labels = np.asarray(self.session_labels)
+            if labels.shape != (len(self.open),) or pd.isna(labels).any():
+                raise ValueError("session_labels must have one nonmissing label per bar")
+            object.__setattr__(self, "session_labels", labels)
         arrays = [
             np.asarray(a, dtype=np.float64) for a in (self.open, self.high, self.low, self.close)
         ]
@@ -319,6 +384,9 @@ class Signals:
     target_update: np.ndarray | None = None
     breakeven_after_points: np.ndarray | None = None
     breakeven_offset_points: np.ndarray | None = None
+    flatten: np.ndarray | None = None
+    exit_long: np.ndarray | None = None
+    exit_short: np.ndarray | None = None
 
 
 SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
@@ -391,16 +459,31 @@ def simulate(
     instrument: Instrument | None = None,
     rules: Rules = Rules(),
     costs: Costs | None = None,
-    sizing: Sizing | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
     initial_cash: float | None = None,
 ) -> Result:
     """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
+    if bars.session_labels is not None and rules.profile is Profile.NAUTILUS:
+        raise ValueError("custom session labels require a repro profile")
+    if (
+        signals.flatten is not None
+        and np.asarray(signals.flatten).any()
+        and rules.profile is Profile.NAUTILUS
+    ):
+        raise ValueError("flatten intents require a repro profile")
     if rules.fill_model is FillModel.ONE_TICK and instrument is None:
         raise ValueError("FillModel.ONE_TICK needs Instrument(tick=..., point_value=...)")
     n = len(bars)
     side = _as_2d(signals.entry_side, n, np.int8, "entry_side")
     k = side.shape[1]
+
+    def exit_mask(a: np.ndarray | None, name: str) -> np.ndarray:
+        return np.zeros((n, k), np.bool_) if a is None else _as_2d(a, n, np.bool_, name)
+
+    exit_long = exit_mask(signals.exit_long, "exit_long")
+    exit_short = exit_mask(signals.exit_short, "exit_short")
+    flatten = exit_mask(signals.flatten, "flatten")
     exit_ = _as_2d(signals.exit, n, np.bool_, "exit")
     nan = np.full((n, k), np.nan)
 
@@ -428,7 +511,7 @@ def simulate(
     exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
         raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
-    if not all(a.shape[1] == k for a in (exit_, *levels)):
+    if not all(a.shape[1] == k for a in (exit_, exit_long, exit_short, flatten, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():
         raise ValueError("entry_side must be -1, 0 or +1")
@@ -472,11 +555,32 @@ def simulate(
         raise ValueError("USD P&L needs costs: pass costs=Costs(...) (Costs() for none)")
     if sizing is not None and instrument is None:
         raise ValueError("sizing needs an instrument (point_value)")
+    if (
+        sizing is None
+        and instrument is not None
+        and (
+            instrument.min_qty > 1
+            or abs(1 / instrument.lot_step - round(1 / instrument.lot_step)) > 1e-7
+        )
+    ):
+        raise ValueError("default one-unit sizing is outside the instrument quantity grid")
+    if sizing is not None and instrument is not None:
+        if (
+            sizing.min_qty < instrument.min_qty
+            or abs(
+                sizing.lot_step / instrument.lot_step - round(sizing.lot_step / instrument.lot_step)
+            )
+            > 1e-7
+            or sizing.lot_step < instrument.lot_step
+        ):
+            raise ValueError("Sizing lot_step/min_qty must respect the instrument quantity grid")
     if initial_cash is not None and not (np.isfinite(initial_cash) and initial_cash > 0):
         raise ValueError(f"initial_cash must be positive, got {initial_cash!r}")
     if sizing is not None and sizing.risk_fraction is not None and initial_cash is None:
         raise ValueError("Sizing(risk_fraction=...) needs initial_cash")
-    if instrument is not None:
+    if rules.tick_round is not TickRound.NONE and instrument is None:
+        raise ValueError("tick_round needs Instrument.tick")
+    if instrument is not None and rules.tick_round is TickRound.NONE:
         for a, name in zip(
             levels,
             ("stop", "target", "entry_limit", "stop_points", "target_points", *slot_names),
@@ -494,6 +598,44 @@ def simulate(
         new_day = _new_york_days(bars, "NEXT_OPEN")
     elif slot_used[0]:
         new_day = _new_york_days(bars, "stop entries")
+    session_days = new_day.copy()
+    needs_sessions = rules.flatten is Flatten.SESSION_END or (
+        rules.flatten is Flatten.NEXT_OPEN and bool(flatten.any())
+    )
+    if bars.session_labels is not None:
+        session_days = (
+            np.r_[False, bars.session_labels[1:] != bars.session_labels[:-1]] if n else session_days
+        )
+    elif needs_sessions:
+        session_days = _new_york_days(bars, "flatten")
+    if bars.session_labels is not None and (next_open or exit_next_open):
+        new_day = session_days.copy()
+    ends = np.r_[session_days[1:], True] if n else np.zeros(0, bool)
+    force_close = np.zeros((n, k), np.int8)
+    force_open = np.zeros((n, k), bool)
+    if rules.session_boundary is SessionBoundary.LAST_BAR_CLOSE and exit_next_open:
+        force_close |= (ends[:, None] & exit_).astype(np.int8)
+        force_close |= 2 * (ends[:, None] & exit_long).astype(np.int8)
+        force_close |= 4 * (ends[:, None] & exit_short).astype(np.int8)
+        exit_ = exit_ & ~ends[:, None]
+        exit_long = exit_long & ~ends[:, None]
+        exit_short = exit_short & ~ends[:, None]
+    if rules.flatten is Flatten.SESSION_END:
+        force_close |= np.broadcast_to(ends[:, None], (n, k))
+    elif rules.flatten is Flatten.LAST_BAR_CLOSE:
+        force_close |= flatten
+    elif flatten.any():
+        for i in np.flatnonzero(flatten.any(axis=1)):
+            boundary = i + 1 == n or (
+                session_days[i + 1] and rules.session_boundary is not SessionBoundary.NEXT_OBSERVED
+            )
+            if boundary:
+                if rules.session_boundary is not SessionBoundary.LAST_BAR_CLOSE:
+                    force_close[i] |= 8 * flatten[i].astype(np.int8)
+                    continue
+                force_close[i] |= flatten[i]
+            else:
+                force_open[i + 1] |= flatten[i]
     t = np.ascontiguousarray
     slot_data: tuple[np.ndarray | None, ...] = (None,) * 5
     if slots:
@@ -513,6 +655,11 @@ def simulate(
         amend_keep=rules.amend_rejected == "keep", ratchet=rules.stop_update_mode == "ratchet",
         stop_skip=rules.stop_entry_in_market == "skip",
         exit_next_open=exit_next_open,
+        target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,
+        tick_round=tuple(TickRound).index(rules.tick_round),
+        exit_long=t(exit_long.T), exit_short=t(exit_short.T),
+        force_close=t(force_close.T), force_open=t(force_open.T),
+        cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         bracket_anchor=0 if rules.bracket_anchor is None else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
     )  # fmt: skip
@@ -558,7 +705,14 @@ def simulate(
         per_contract_cost = 2.0 * (
             c.commission_per_side + c.slippage_ticks * instrument.tick * instrument.point_value
         )
-        net_1 = trades["gross_points"].to_numpy() * instrument.point_value - per_contract_cost
+        proportional = (
+            (np.abs(e_px) + np.abs(x_px)) * instrument.point_value * c.proportional_bps / 10_000
+        )
+        net_1 = (
+            trades["gross_points"].to_numpy() * instrument.point_value
+            - per_contract_cost
+            - proportional
+        )
         contracts = np.ones(len(trades), np.int64)
         open_contracts = np.ones(len(open_positions), np.int64)
         if sizing is not None:
@@ -569,23 +723,43 @@ def simulate(
             o_risk = np.abs(open_positions["entry_px"].to_numpy() - final_stop[held]) * pv
             cash = float(initial_cash) if initial_cash is not None else np.nan  # risk_usd: unused
             contracts, final_equity, err, row = S.size_trades(
-                cfg, net_1, risk, sizing.mode, sizing.amount, sizing.cap, cash, k
+                cfg,
+                net_1,
+                risk,
+                sizing.mode,
+                sizing.amount,
+                sizing.cap,
+                cash,
+                k,
+                sizing.lot_step,
+                sizing.min_qty,
             )
             if err:
                 _sizing_error(err, int(cfg[row]), int(e_i[row]))
             open_contracts = S.size_open(
-                o_cfg, final_equity, o_risk, sizing.mode, sizing.amount, sizing.cap
+                o_cfg,
+                final_equity,
+                o_risk,
+                sizing.mode,
+                sizing.amount,
+                sizing.cap,
+                sizing.lot_step,
+                sizing.min_qty,
             )
             if (open_contracts < 0).any():
                 r = int(np.flatnonzero(open_contracts < 0)[0])
                 _sizing_error(int(-open_contracts[r]), int(o_cfg[r]), int(o_entry[r]))
-        _check_liquidity(bars, e_i, x_i, cfg, contracts)
+        if sizing is not None and sizing.lot_step == 1.0 and sizing.min_qty == 1.0:
+            contracts = contracts.astype(np.int64)
+            open_contracts = open_contracts.astype(np.int64)
+        _check_liquidity(bars, e_i, x_i, cfg, contracts, instrument)
         _check_liquidity(
             bars,
             open_positions["entry_i"].to_numpy(),
             None,
             open_positions["config"].to_numpy(),
             open_contracts,
+            instrument,
         )
         trades["contracts"] = contracts
         trades["gross_usd"] = trades["gross_points"] * instrument.point_value * contracts
@@ -641,6 +815,9 @@ def _limit_entry_checks(
 def _new_york_days(bars: Bars, rule: str) -> np.ndarray:
     """Shared session boundary calculation for pending limits and next-open market orders."""
 
+    if bars.session_labels is not None:
+        labels = bars.session_labels
+        return np.r_[False, labels[1:] != labels[:-1]] if len(bars) else np.zeros(0, bool)
     if bars.index is None:
         raise ValueError(f"{rule} need timezone-aware Bars(index=...) to detect New York dates")
     stamps = pd.DatetimeIndex(bars.index)
@@ -723,6 +900,7 @@ def _check_liquidity(
     exit_i: np.ndarray | None,
     cfg: np.ndarray,
     contracts: np.ndarray,
+    instrument: Instrument,
 ) -> None:
     """Refuse sizes above what Nautilus fills at one price on the entry / exit bar (A14)."""
 
@@ -732,7 +910,7 @@ def _check_liquidity(
         raise ValueError(
             "sizing above 1 contract needs Bars(volume=...): Nautilus fills against it"
         )
-    liq = S.point_liquidity(bars.volume)
+    liq = S.point_liquidity(bars.volume, instrument.lot_step, instrument.min_qty)
     for where, idx in (("entry", entry_i), ("exit", exit_i)):
         if idx is None:
             continue
@@ -740,7 +918,7 @@ def _check_liquidity(
         if over.size:
             r = int(over[0])
             raise ValueError(
-                f"{int(contracts[r])} contracts at the {where} bar {int(idx[r])}, config {int(cfg[r])} "
+                f"{contracts[r]:g} contracts at the {where} bar {int(idx[r])}, config {int(cfg[r])} "
                 f"exceed the bar's liquidity ({int(liq[idx[r]])} = max(floor(volume/4), 1)): "
                 f"Nautilus would fill the rest one tick worse (docs/vector-engine.md A14)"
             )

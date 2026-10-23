@@ -31,7 +31,7 @@ ERR_NO_STOP = 2
 
 
 @dataclass(frozen=True)
-class Sizing:
+class Sizing[Quantity: int | float = int]:
     """Contracts per entry; set exactly one of ``contracts``, ``risk_usd`` or ``risk_fraction``.
 
     * ``contracts``: the same number for every trade.
@@ -40,30 +40,43 @@ class Sizing:
       (compounding); needs ``initial_cash``.
 
     The stop distance is in points from the entry fill; costs are not part of the risk.
-    ``max_contracts`` caps the risk modes.
+    ``max_contracts`` caps the risk modes. Risk quantities floor to ``lot_step`` multiples
+    and refuse below ``min_qty``; fixed quantities must already be on that grid.
+    Defaults retain integer-only construction; explicit fractional steps admit float quantities.
     """
 
-    contracts: int | None = None
+    contracts: Quantity | None = None
     risk_usd: float | None = None
     risk_fraction: float | None = None
-    max_contracts: int | None = None
+    max_contracts: Quantity | None = None
+
+    lot_step: float = 1.0
+    min_qty: float = 1.0
 
     def __post_init__(self) -> None:
         set_ = [x is not None for x in (self.contracts, self.risk_usd, self.risk_fraction)]
         if sum(set_) != 1:
             raise ValueError("Sizing needs exactly one of contracts, risk_usd, risk_fraction")
-        if self.contracts is not None and (not is_int(self.contracts) or self.contracts < 1):
-            raise ValueError(f"contracts must be a positive integer, got {self.contracts!r}")
-        if self.risk_usd is not None and not self.risk_usd > 0:
+        for name in ("lot_step", "min_qty"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not (np.isfinite(v) and v > 0):
+                raise ValueError(f"{name} must be finite and positive")
+        for name in ("contracts", "max_contracts"):
+            v = getattr(self, name)
+            if v is not None and (
+                isinstance(v, bool)
+                or (self.lot_step == 1 and self.min_qty == 1 and not is_int(v))
+                or not np.isfinite(v)
+                or v < self.min_qty
+                or abs(v / self.lot_step - round(v / self.lot_step)) > 1e-7
+            ):
+                raise ValueError(
+                    f"{name} must be a positive integer multiple of lot_step and >= min_qty"
+                )
+        if self.risk_usd is not None and not (np.isfinite(self.risk_usd) and self.risk_usd > 0):
             raise ValueError(f"risk_usd must be positive, got {self.risk_usd!r}")
         if self.risk_fraction is not None and not 0 < self.risk_fraction <= 1:
             raise ValueError(f"risk_fraction must be in (0, 1], got {self.risk_fraction!r}")
-        if self.max_contracts is not None and (
-            not is_int(self.max_contracts) or self.max_contracts < 1
-        ):
-            raise ValueError(
-                f"max_contracts must be a positive integer, got {self.max_contracts!r}"
-            )
 
     @property
     def mode(self) -> int:
@@ -79,28 +92,34 @@ class Sizing:
         raise AssertionError("unreachable: validated in __post_init__")
 
     @property
-    def cap(self) -> int:
-        return int(self.max_contracts) if self.max_contracts is not None else 0
+    def cap(self) -> float:
+        return float(self.max_contracts) if self.max_contracts is not None else 0
 
 
 @nb.njit(cache=True)
 def _contracts_for(
-    mode: int, amount: float, cap: int, equity: float, risk_per_contract: float
-) -> np.int64:
+    mode: int,
+    amount: float,
+    cap: float,
+    equity: float,
+    risk_per_contract: float,
+    lot_step: float = 1.0,
+    min_qty: float = 1.0,
+) -> float:
     """Contracts for one entry, or a negative error code."""
 
     if mode == MODE_CONTRACTS:
-        return np.int64(amount)
+        return amount
     if not (risk_per_contract > 0.0):  # NaN stop
-        return np.int64(-ERR_NO_STOP)
+        return float(-ERR_NO_STOP)
     budget = amount if mode == MODE_RISK_USD else amount * equity
     if not (budget > 0.0):
-        return np.int64(-ERR_ZERO)
-    n = np.int64(np.floor(budget / risk_per_contract + 1e-9))
+        return float(-ERR_ZERO)
+    n = np.floor(budget / risk_per_contract / lot_step + 1e-9) * lot_step
     if cap > 0 and n > cap:
-        n = np.int64(cap)
-    if n < 1:
-        return np.int64(-ERR_ZERO)
+        n = cap
+    if n < min_qty - 1e-10:
+        return float(-ERR_ZERO)
     return n
 
 
@@ -111,9 +130,11 @@ def size_trades(
     risk_per_contract: np.ndarray,
     mode: int,
     amount: float,
-    cap: int,
+    cap: float,
     initial_cash: float,
     k: int,
+    lot_step: float = 1.0,
+    min_qty: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Sequential sizing of closed trades grouped by config, in time order within each config.
 
@@ -121,11 +142,13 @@ def size_trades(
     """
 
     m = cfg.shape[0]
-    contracts = np.zeros(m, np.int64)
+    contracts = np.zeros(m, np.float64)
     final_equity = np.full(k, initial_cash)
     for r in range(m):
         j = cfg[r]
-        n = _contracts_for(mode, amount, cap, final_equity[j], risk_per_contract[r])
+        n = _contracts_for(
+            mode, amount, cap, final_equity[j], risk_per_contract[r], lot_step, min_qty
+        )
         if n < 0:
             return contracts, final_equity, int(-n), r
         contracts[r] = n
@@ -140,20 +163,22 @@ def size_open(
     risk_per_contract: np.ndarray,
     mode: int,
     amount: float,
-    cap: int,
+    cap: float,
+    lot_step: float = 1.0,
+    min_qty: float = 1.0,
 ) -> np.ndarray:
     """Contracts of the positions still open after the last bar (equity = after the last close)."""
 
     m = cfg.shape[0]
-    out = np.zeros(m, np.int64)
+    out = np.zeros(m, np.float64)
     for r in range(m):
         out[r] = _contracts_for(
-            mode, amount, cap, equity[cfg[r]], risk_per_contract[r]
+            mode, amount, cap, equity[cfg[r]], risk_per_contract[r], lot_step, min_qty
         )  # < 0: error code
     return out
 
 
-def point_liquidity(volume: np.ndarray) -> np.ndarray:
+def point_liquidity(volume: np.ndarray, lot_step: float = 1.0, min_qty: float = 1.0) -> np.ndarray:
     """Contracts Nautilus fills at one price at each open/high/low point of a bar (A14)."""
 
-    return np.maximum(np.floor(volume / 4.0), 1.0)
+    return np.maximum(np.floor(volume / 4.0 / lot_step + 1e-10) * lot_step, max(1.0, min_qty))

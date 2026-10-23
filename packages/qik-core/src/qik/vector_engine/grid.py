@@ -73,7 +73,21 @@ def stack(params: pd.DataFrame, build: Callable[..., Signals]) -> Signals:
             return None
         return np.column_stack(columns(name, np.float64))
 
-    lv = {name: levels(name) for name in SIGNAL_FIELDS[2:]}
+    lv = {
+        name: levels(name)
+        for name in SIGNAL_FIELDS[2:]
+        if name not in ("exit_long", "exit_short", "flatten")
+    }
+    for name in ("exit_long", "exit_short", "flatten"):
+        if any(getattr(sig, name) is not None for sig in built):
+            lv[name] = np.column_stack(
+                [
+                    np.zeros(n, bool)
+                    if getattr(sig, name) is None
+                    else _column(getattr(sig, name), n, name, j, bool)
+                    for j, sig in enumerate(built)
+                ]
+            )
     return Signals(
         np.column_stack(columns("entry_side", np.int8)),
         np.column_stack(columns("exit", np.bool_)),
