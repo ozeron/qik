@@ -107,9 +107,9 @@ def _run(
     a2s, a5s = np.empty((k, width), np.int8), np.empty((k, width), np.int8)
     a3s, a4s, a6s = np.empty((k, width)), np.empty((k, width)), np.empty((k, width))
     sides_all, exits_all = np.zeros((k, n), np.int8), np.zeros((k, n), np.bool_)
-    levels_all = np.full((k, 10, n), np.nan)
+    levels_all = np.full((k, 11, n), np.nan)
     bools_all = np.zeros((k, 3, n), np.bool_)
-    decisions_all = np.full((k, 15, n), np.nan)
+    decisions_all = np.full((k, 16, n), np.nan)
     for column in nb.prange(k):  # ty: ignore[not-iterable]  (Numba ships prange as a class)
         j = np.int64(column)
         sides, exits, levels = sides_all[j], exits_all[j], levels_all[j]
@@ -120,7 +120,7 @@ def _run(
             force_open[:] = masks[j, 1]
         view = np.full(12, np.nan)
         view[K.V_LAST_EXIT_I] = -1
-        decision = np.empty(15)
+        decision = np.empty(16)
         account = np.array([0.0, initial_cash])
         core = K.CoreContext(
             step,
@@ -203,6 +203,7 @@ def _run(
                 a6,
                 0,
                 core,
+                levels[10],
             )
         else:
             result = K._compiled_column(
@@ -248,6 +249,7 @@ def _run(
                 a6,
                 0,
                 core,
+                levels[10],
             )
         counts[j] = result[0]
         meta[j, 0] = result[1]
@@ -333,7 +335,7 @@ def _run_arrays(
         )
     )
     dates_needed = (
-        bool(fields & {"entry_limit", "entry_stop"})
+        bool(fields & {"entry_limit", "entry_stop", "entry_limit_ioc"})
         or ("flatten" in fields and rules.flatten is Flatten.NEXT_OPEN)
         or (
             rules.effective_entry_fill is FillTiming.NEXT_OPEN
@@ -458,7 +460,9 @@ def _run_arrays(
         for q, name in enumerate(SIGNAL_FIELDS):
             if name in fields or q < 2:
                 continue
-            active = decisions[j, q].any() if q >= 12 else np.isfinite(decisions[j, q]).any()
+            active = (
+                decisions[j, q].any() if q in (12, 13, 14) else np.isfinite(decisions[j, q]).any()
+            )
             if active:
                 raise ValueError(f"core emitted undeclared field {name}")
         if _capture_signals is not None:
@@ -555,6 +559,7 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     out[12] = decision[12]
     out[13] = decision[13]
     out[14] = decision[14]
+    out[15] = decision[15] if len(decision) > 15 else np.nan
 
 
 def _run_jitclass(
@@ -575,7 +580,7 @@ def _run_jitclass(
 
     CoreClass is a jitclass (or a plain class with NUMBA_DISABLE_JIT=1). Constructors
     receive grid parameters and immutable feature arrays as named arguments. step
-    returns a 15-field numeric NamedTuple in Decision/SIGNAL_FIELDS order.
+    returns a 16-field numeric NamedTuple in Decision/SIGNAL_FIELDS order.
     """
     axes = {} if grid is None else grid
     supplied = {} if features is None else features

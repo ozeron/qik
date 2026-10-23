@@ -56,6 +56,7 @@ class Decision(NamedTuple):
     flatten: bool = False
     exit_long: bool = False
     exit_short: bool = False
+    entry_limit_ioc: float = math.nan
 
 
 HOLD = Decision()
@@ -89,6 +90,7 @@ def _enter(
         False,
         False,
         False,
+        math.nan,
     )
 
 
@@ -133,6 +135,36 @@ def _overload_enter(
 
 
 @register_jitable
+def enter_limit_ioc(
+    side: int,
+    limit: float,
+    stop: float = math.nan,
+    target: float = math.nan,
+    stop_points: float = math.nan,
+    target_points: float = math.nan,
+) -> Decision:
+    """Attempt once at the next open, filling at that open within the inclusive cap."""
+    return Decision(
+        int(side + 0),
+        False,
+        float(stop),
+        float(target),
+        math.nan,
+        float(stop_points),
+        float(target_points),
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        False,
+        False,
+        False,
+        float(limit),
+    )
+
+
+@register_jitable
 def exit() -> Decision:
     """Exit a position and cancel working entry using ordinary exit timing."""
     return Decision(
@@ -151,6 +183,7 @@ def exit() -> Decision:
         False,
         False,
         False,
+        math.nan,
     )
 
 
@@ -173,6 +206,7 @@ def trail(level: float) -> Decision:
         False,
         False,
         False,
+        math.nan,
     )
 
 
@@ -195,6 +229,7 @@ def move_target(level: float) -> Decision:
         False,
         False,
         False,
+        math.nan,
     )
 
 
@@ -217,6 +252,7 @@ def flatten() -> Decision:
         True,
         False,
         False,
+        math.nan,
     )
 
 

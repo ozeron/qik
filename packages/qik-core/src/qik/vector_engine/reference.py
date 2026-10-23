@@ -213,6 +213,7 @@ def simulate_column_reference(
     reenter: bool = True,
     stale_drop: bool = False,
     entry_limit: np.ndarray | None = None,
+    entry_limit_ioc: np.ndarray | None = None,
     stop_pts: np.ndarray | None = None,
     target_pts: np.ndarray | None = None,
     chase_after: int = 1,
@@ -289,6 +290,7 @@ def simulate_column_reference(
             force_open=force_open,
             cross_session=cross_session,
             entry_limit=entry_limit,
+            entry_limit_ioc=entry_limit_ioc,
             next_open=next_open,
             exit_next_open=exit_next_open,
             stop_pts=stop_pts,
@@ -325,6 +327,7 @@ def simulate_column_reference(
             adaptive=adaptive,
             reenter=reenter,
             entry_limit=entry_limit,
+            entry_limit_ioc=entry_limit_ioc,
             stop_pts=stop_pts,
             target_pts=target_pts,
             chase_after=chase_after,
@@ -347,6 +350,7 @@ def simulate_column_reference(
     starts_day = np.zeros(n, bool) if new_day is None else new_day
     nan = np.full(n, np.nan)
     lim_sig = nan if entry_limit is None else entry_limit
+    ioc_sig = nan if entry_limit_ioc is None else entry_limit_ioc
     stop_pts_sig = nan if stop_pts is None else stop_pts
     tgt_pts_sig = nan if target_pts is None else target_pts
     trades: list[RefTrade] = []
@@ -358,6 +362,7 @@ def simulate_column_reference(
     pending: _Pending | None = None
     market_entry: _MarketEntry | None = None
     market_exit = False
+    ioc_cap = math.nan
     for i in range(n):
         exited = False
         busy = False
@@ -382,6 +387,9 @@ def simulate_column_reference(
             pos = 0
             exited = True
             market_exit = False
+        if market_entry is not None and not math.isnan(ioc_cap):
+            if market_entry.side * (float(o[i]) - ioc_cap) > 0:
+                market_entry = None
         if market_entry is not None:
             m = market_entry
             px = float(o[i])
@@ -494,11 +502,12 @@ def simulate_column_reference(
                 pos = 0
                 exited = True
             pending = None
-        if next_open:
+        if next_open or not math.isnan(float(ioc_sig[i])):
             # Gate at decision time. An exit can stage a replacement entry at the same open;
             # unrelated entry signals while holding are still ignored (one NETTING position).
             enter = (
                 (pos == 0 or (market_exit and reenter))
+                and (next_open or (pending is None and not busy))
                 and int(side_sig[i]) != 0
                 and (reenter or not exited)
             )
@@ -506,6 +515,7 @@ def simulate_column_reference(
                 if i + 1 == n or (bool(starts_day[i + 1]) and not cross_session):
                     return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
                 if enter:
+                    ioc_cap = float(ioc_sig[i])
                     market_entry = _MarketEntry(
                         close,
                         int(side_sig[i]),
@@ -606,6 +616,7 @@ def _simulate_venue_reference(
     adaptive: bool,
     reenter: bool,
     entry_limit: np.ndarray | None,
+    entry_limit_ioc: np.ndarray | None,
     stop_pts: np.ndarray | None,
     target_pts: np.ndarray | None,
     chase_after: int,
@@ -625,6 +636,8 @@ def _simulate_venue_reference(
     tpts = nan if target_pts is None else target_pts
     days = np.zeros(n, bool) if new_day is None else new_day
     commands: list[_VenueCommand] = []
+    ioc_arrivals: list[tuple[int, int]] = []
+    caps = nan if entry_limit_ioc is None else entry_limit_ioc
     trades: list[RefTrade] = []
     pos, entry_i, generation = 0, -1, -1
     entry_px, stop, target = math.nan, math.nan, math.nan
@@ -689,7 +702,18 @@ def _simulate_venue_reference(
         if force_open[i]:
             close(float(o[i]) - pos * tick, REASON_SIGNAL)
             commands.clear()
+            ioc_arrivals.clear()
             pending, resting, chasing, protection, closing = -1, False, False, 0, False
+        for due, d in list(ioc_arrivals):
+            if due > i:
+                continue
+            ioc_arrivals.remove((due, d))
+            if pending != d:
+                continue
+            if int(side_sig[d]) * (float(o[i]) - float(caps[d])) <= 0:
+                fill_entry(d, float(o[i]), False)
+            else:
+                pending, resting, chasing, closing = -1, False, False, False
         if closing and pending < 0 and pos == 0 and protection in (0, 3):
             closing = False
         adverse_hit = (
@@ -745,6 +769,7 @@ def _simulate_venue_reference(
         ):
             close(ci - pos * tick, REASON_SIGNAL)
             commands.clear()
+            ioc_arrivals.clear()
             pending, resting, chasing, protection, closing = -1, False, False, 0, False
             continue
         # V2 sync sees protective fills/cancellations from this sweep before deciding.
@@ -790,7 +815,13 @@ def _simulate_venue_reference(
             and (reenter or not exited)
         ):
             pending = i
-            send("market" if math.isnan(limits[i]) else "limit", i)
+            if not math.isnan(float(caps[i])):
+                due = i + latency_bars + 1
+                if due >= n or (not cross_session and any(days[i + 1 : due + 1])):
+                    return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
+                ioc_arrivals.append((due, i))
+            else:
+                send("market" if math.isnan(limits[i]) else "limit", i)
         # FIFO settlement; a fill callback may append another command due now (zero latency).
         while commands and commands[0].due <= i:
             cmd = commands.pop(0)
@@ -876,6 +907,7 @@ def _simulate_slots_reference(
     next_open: bool,
     exit_next_open: bool,
     entry_limit: np.ndarray | None,
+    entry_limit_ioc: np.ndarray | None,
     stop_pts: np.ndarray | None,
     target_pts: np.ndarray | None,
     stop_entry: np.ndarray | None,
@@ -911,6 +943,7 @@ def _simulate_slots_reference(
             be_offset,
         )
     ]
+    caps = nan if entry_limit_ioc is None else entry_limit_ioc
     days = np.zeros(len(c), bool) if new_day is None else new_day
     trades: list[RefTrade] = []
     queue: list[tuple[int, str, int, float]] = []
@@ -932,7 +965,13 @@ def _simulate_slots_reference(
             elif kind == "cancel":
                 delay += int(exit_next_open if exit_now else next_open)
             elif kind in ("submit", "replace", "stop", "target"):
-                delay += int(next_open)
+                delay += (
+                    1 if kind == "submit" and not math.isnan(float(caps[d])) else int(next_open)
+                )
+        if kind == "submit" and not math.isnan(float(caps[d])):
+            due = i + delay
+            if due >= len(c) or (not cross_session and any(days[i + 1 : due + 1])):
+                fail(ERR_NEXT_OPEN_SESSION_END)
         if delay and not latency and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
             fail(ERR_NEXT_OPEN_SESSION_END)
         queue.append((i + delay, kind, d, value))
@@ -1033,7 +1072,7 @@ def _simulate_slots_reference(
             queue.clear()
             pending, resting, chasing, closing = -1, False, False, False
         for phase in range(2):
-            if phase == 0 and not (next_open or exit_next_open):
+            if phase == 0 and not (next_open or exit_next_open or entry_limit_ioc is not None):
                 continue
             settlement = float(o[i] if phase == 0 else c[i])
             if phase == 1:
@@ -1204,7 +1243,21 @@ def _simulate_slots_reference(
                     pending = i
                     send("submit", i)
             while not error:
-                ready = next((q for q, cmd in enumerate(queue) if cmd[0] <= i), None)
+                ready = next(
+                    (
+                        q
+                        for q, cmd in enumerate(queue)
+                        if cmd[0] <= i
+                        and (
+                            phase == 1
+                            or next_open
+                            or exit_next_open
+                            or (cmd[1] == "submit" and not math.isnan(float(caps[cmd[2]])))
+                            or (cmd[1] == "protect" and position is not None and position.bar == i)
+                        )
+                    ),
+                    None,
+                )
                 if ready is None:
                     break
                 _, kind, d, value = queue.pop(ready)
@@ -1215,7 +1268,12 @@ def _simulate_slots_reference(
                     kind = "submit"
                 if kind == "submit" and pending == d:
                     s = int(sides[d])
-                    if not math.isnan(triggers[d]):
+                    if not math.isnan(float(caps[d])):
+                        if s * (settlement - float(caps[d])) <= 0:
+                            fill(d, settlement, quote(-s))
+                        else:
+                            pending, resting, chasing, closing = -1, False, False, False
+                    elif not math.isnan(triggers[d]):
                         if not (phase == 0 and next_open) and through(
                             s, float(triggers[d]), True, quote(s)
                         ):

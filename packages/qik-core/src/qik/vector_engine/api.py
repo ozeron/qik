@@ -388,6 +388,7 @@ class Signals:
     flatten: np.ndarray | None = None
     exit_long: np.ndarray | None = None
     exit_short: np.ndarray | None = None
+    entry_limit_ioc: np.ndarray | None = None
 
 
 SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
@@ -539,6 +540,8 @@ def _simulate(
     stop = opt(signals.stop, "stop")
     target = opt(signals.target, "target")
     limit = opt(signals.entry_limit, "entry_limit")
+    ioc = opt(signals.entry_limit_ioc, "entry_limit_ioc")
+    ioc_used = bool(np.isfinite(ioc).any())
     stop_pts = opt(signals.stop_points, "stop_points")
     target_pts = opt(signals.target_points, "target_points")
     slot_names = (
@@ -552,7 +555,7 @@ def _simulate(
     trigger, sup, tup, after, offset = slot_arrays
     slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
     slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used)
-    levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays)
+    levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc)
     next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
     exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
@@ -570,6 +573,16 @@ def _simulate(
         and np.any(entries & np.isfinite(trigger) & np.isfinite(limit))
     ):
         raise ValueError("an entry cannot specify both entry_stop and entry_limit")
+    if np.any(entries & np.isfinite(ioc) & (np.isfinite(limit) | np.isfinite(trigger))):
+        raise ValueError("entry_limit_ioc, entry_limit and entry_stop are mutually exclusive")
+    if np.any(ioc <= 0):
+        raise ValueError("entry_limit_ioc must be positive or NaN")
+    if ioc_used and rules.protection == "oto":
+        raise ValueError("entry_limit_ioc does not support OTO protection; use callback")
+    if ioc_used and rules.fill_model is FillModel.ONE_TICK:
+        raise ValueError("entry_limit_ioc ONE_TICK execution is unproved")
+    if instrument is not None:
+        _check_tick(ioc, entries, instrument.tick, "entry_limit_ioc")
     for a, name in zip(slot_arrays[:4], slot_names[:4], strict=True):
         if a is not nan and np.any(a <= 0):
             raise ValueError(f"{name} must be positive or NaN")
@@ -629,7 +642,15 @@ def _simulate(
     if instrument is not None and rules.tick_round is TickRound.NONE:
         for a, name in zip(
             levels,
-            ("stop", "target", "entry_limit", "stop_points", "target_points", *slot_names),
+            (
+                "stop",
+                "target",
+                "entry_limit",
+                "stop_points",
+                "target_points",
+                *slot_names,
+                "entry_limit_ioc",
+            ),
             strict=True,
         ):
             if a is nan:
@@ -640,10 +661,12 @@ def _simulate(
     new_day = np.zeros(n, np.bool_)
     if np.isfinite(limit).any():
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
-    elif next_open or exit_next_open:
+    elif next_open or exit_next_open or ioc_used:
         new_day = _new_york_days(bars, "NEXT_OPEN")
     elif slot_used[0]:
         new_day = _new_york_days(bars, "stop entries")
+    if ioc_used:
+        new_day = _new_york_days(bars, "entry_limit_ioc")
     session_days = new_day.copy()
     needs_sessions = rules.flatten is Flatten.SESSION_END or (
         rules.flatten is Flatten.NEXT_OPEN and flatten_used
@@ -654,7 +677,7 @@ def _simulate(
         )
     elif needs_sessions:
         session_days = _new_york_days(bars, "flatten")
-    if bars.session_labels is not None and (next_open or exit_next_open):
+    if bars.session_labels is not None and (next_open or exit_next_open or ioc_used):
         new_day = session_days.copy()
     ends = np.r_[session_days[1:], True] if n else np.zeros(0, bool)
     force_close: np.ndarray | None = None
@@ -716,6 +739,7 @@ def _simulate(
         exit_short=t(exit_short.T) if signals.exit_short is not None and exit_short.any() else None,
         force_close=t(force_close.T) if force_close is not None and force_close.any() else None,
         force_open=t(force_open.T) if force_open is not None and force_open.any() else None,
+        entry_limit_ioc=t(ioc.T) if signals.entry_limit_ioc is not None else None,
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         bracket_anchor=0 if rules.bracket_anchor is None else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
@@ -846,12 +870,15 @@ def _simulate(
         compliance = Compliance.REPRO_TRADINGVIEW
     else:
         compliance = _ReproCompliance(f"repro:{rules.author_platform}")
-    research_only = slots and (
-        rules.protection == "oto"
-        or rules.adaptive_high_low_ordering
-        or not rules.reenter_on_exit_bar
-        or bool(np.any(entries & np.isnan(stop) & np.isnan(stop_pts)))
-        or (sizing is not None and sizing.contracts is None)
+    research_only = ioc_used or (
+        slots
+        and (
+            rules.protection == "oto"
+            or rules.adaptive_high_low_ordering
+            or not rules.reenter_on_exit_bar
+            or bool(np.any(entries & np.isnan(stop) & np.isnan(stop_pts)))
+            or (sizing is not None and sizing.contracts is None)
+        )
     )
     return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, research_only)
 

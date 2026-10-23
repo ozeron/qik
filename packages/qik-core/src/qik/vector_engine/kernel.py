@@ -148,6 +148,7 @@ def _venue_column(
     out_stop,
     base,
     core=None,
+    ioc_limits=None,
 ):
     """A16/A17 venue settlement, with a bounded-by-flight-time FIFO command list.
 
@@ -198,6 +199,7 @@ def _venue_column(
         out_reason,
         out_stop,
         base,
+        ioc_limits,
     )
     for i in range(len(c)):
         state, err, eb = _venue_column_advance(state, i, inputs, core)
@@ -252,6 +254,7 @@ def _venue_column_advance(state, i, inputs, core=None):
         out_reason,
         out_stop,
         base,
+        ioc_limits,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -329,6 +332,31 @@ def _venue_column_advance(state, i, inputs, core=None):
             cnt += 1
         commands.clear()
         pos, pending, protection, closing, resting, chasing = 0, -1, 0, False, False, False
+    for q in range(len(commands) - 1, -1, -1):
+        due, kind, d = commands[q]
+        if kind == 7 and due <= i:
+            commands.pop(q)
+            if pending != d:
+                continue
+            s = side_sig[d]
+            cap = _optional_at(ioc_limits, d, np.nan)
+            if s * (o[i] - cap) > 0:
+                pending, resting, chasing, closing = -1, False, False, False
+                continue
+            pos, ei, ep, gen = s, i, o[i], d
+            stop, target = levels(
+                s,
+                _anchor(bracket_anchor, c[d], ep, ep),
+                entry_stop[d],
+                entry_target[d],
+                stop_pts[d],
+                target_pts[d],
+                round_tick,
+                tick_round,
+            )
+            pending, resting, chasing, rejected_stop = -1, False, False, False
+            protection = 0 if closing else 1
+            commands.append((i + latency, 6 if closing else 3, d))
     if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
         closing = False
     high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
@@ -574,9 +602,22 @@ def _venue_column_advance(state, i, inputs, core=None):
         and (reenter or not exited)
     ):
         pending = i
-        commands.append((i + latency, 1 if np.isnan(entry_limit[i]) else 2, i))
-    while len(commands) and commands[0][0] <= i:
-        _, kind, d = commands.pop(0)
+        if not np.isnan(_optional_at(ioc_limits, i, np.nan)):
+            due = i + latency + 1
+            if due >= len(c) or (not cross_session and np.any(new_day[i + 1 : due + 1])):
+                return state, ERR_NEXT_OPEN_SESSION_END, i
+            commands.append((due, 7, i))
+        else:
+            commands.append((i + latency, 1 if np.isnan(entry_limit[i]) else 2, i))
+    while len(commands):
+        ready = -1
+        for q in range(len(commands)):
+            if commands[q][0] <= i and commands[q][1] != 7:
+                ready = q
+                break
+        if ready < 0:
+            break
+        _, kind, d = commands.pop(ready)
         if kind == 1 or kind == 2:
             if pending != d:
                 continue
@@ -755,6 +796,7 @@ def _column(
     out_stop,
     base,
     core=None,
+    ioc_limits=None,
 ):
     """Simulate one column.
 
@@ -803,6 +845,7 @@ def _column(
             out_stop,
             base,
             core,
+            ioc_limits,
         )
     n = o.shape[0]
     # Flat position, no working limit or next-open market commands.
@@ -852,6 +895,7 @@ def _column(
         out_reason,
         out_stop,
         base,
+        ioc_limits,
     )
     for i in range(n):
         state, err, eb = _column_advance(state, i, inputs, core)
@@ -910,6 +954,7 @@ def _column_advance(state, i, inputs, core=None):
         out_reason,
         out_stop,
         base,
+        ioc_limits,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -999,6 +1044,10 @@ def _column_advance(state, i, inputs, core=None):
         pos = 0
         exited = True
         market_exit = False
+    if market_entry >= 0:
+        cap = _optional_at(ioc_limits, market_entry, np.nan)
+        if not np.isnan(cap) and side_sig[market_entry] * (o[i] - cap) > 0:
+            market_entry = -1
     if market_entry >= 0:
         d = market_entry
         s = side_sig[d]
@@ -1428,11 +1477,14 @@ def _column_advance(state, i, inputs, core=None):
         )
         cnt += 1
         pos, exited, pend = 0, True, 0
-    if next_open:
+    if next_open or not np.isnan(_optional_at(ioc_limits, i, np.nan)):
         # R1 decisions remain at the close; stage only actionable orders. At the following
         # open a market exit executes before a replacement entry and before the price sweep.
         enter = (
-            (pos == 0 or (market_exit and reenter)) and side_sig[i] != 0 and (reenter or not exited)
+            (pos == 0 or (market_exit and reenter))
+            and (next_open or (pend == 0 and not busy))
+            and side_sig[i] != 0
+            and (reenter or not exited)
         )
         if market_exit or enter:
             if i + 1 == n or (new_day[i + 1] and not cross_session):
@@ -1496,7 +1548,12 @@ def _column_advance(state, i, inputs, core=None):
             pos = 0
             exited = True
         pend = 0  # an exit also cancels a working entry
-    if pos == 0 and pend == 0 and not busy and side_sig[i] != 0 and (reenter or not exited):
+    if (
+        pos == 0
+        and (next_open or (pend == 0 and not busy))
+        and side_sig[i] != 0
+        and (reenter or not exited)
+    ):
         s = side_sig[i]
         lim = entry_limit[i]
         if not np.isnan(lim):
@@ -1700,7 +1757,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1741,6 +1798,7 @@ def run_columns(
     s0 = np.empty(0, np.int8)
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
+        ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
         close_column = None if force_close is None else force_close[j]
@@ -1803,13 +1861,14 @@ def run_columns(
                 s0,
                 f0,
                 0,
+                ioc_limits=ioc_column,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
             adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, True,
-            e0, e0, s0, f0, f0, s0, f0, 0,
+            e0, e0, s0, f0, f0, s0, f0, 0, ioc_limits=ioc_column,
         )  # fmt: skip
         counts[j] = cnt
         errs[j] = err
@@ -1830,6 +1889,7 @@ def run_columns(
     reason = np.empty(total, np.int8)
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
+        ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
         close_column = None if force_close is None else force_close[j]
@@ -1893,6 +1953,7 @@ def run_columns(
                     reason,
                     stop,
                     offsets[j],
+                    ioc_limits=ioc_column,
                 )
             else:
                 _column(
@@ -1901,7 +1962,7 @@ def run_columns(
                 adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
-                stop, offsets[j],
+                stop, offsets[j], ioc_limits=ioc_column,
             )  # fmt: skip
     return (
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
@@ -1962,6 +2023,7 @@ def _slots_column(
     out_st,
     base,
     core=None,
+    ioc_limits=None,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
@@ -2021,6 +2083,7 @@ def _slots_column(
         out_why,
         out_st,
         base,
+        ioc_limits,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2088,6 +2151,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         out_why,
         out_st,
         base,
+        ioc_limits,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2172,7 +2236,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         queue.clear()
         pos, pending, live, resting, chasing, closing = 0, -1, False, False, False, False
     for phase in range(2):
-        if phase == 0 and not (next_open or exit_next_open):
+        if phase == 0 and not (next_open or exit_next_open or ioc_limits is not None):
             continue
         ci = o[i] if phase == 0 else c[i]
         if phase == 1:
@@ -2516,7 +2580,20 @@ def _slots_column_advance(state, i, inputs, core=None):
                 and (reenter or not exited)
             ):
                 pending = i
-                queue.append((i + latency + next_open, _SLOT_SUBMIT, i, 0.0))
+                if not np.isnan(_optional_at(ioc_limits, i, np.nan)):
+                    due = i + latency + 1
+                    if due >= len(c) or (not cross_session and np.any(days[i + 1 : due + 1])):
+                        error = ERR_NEXT_OPEN_SESSION_END
+                queue.append(
+                    (
+                        i
+                        + latency
+                        + (1 if not np.isnan(_optional_at(ioc_limits, i, np.nan)) else next_open),
+                        _SLOT_SUBMIT,
+                        i,
+                        0.0,
+                    )
+                )
             if next_open and exit_now and pos and reenter and sides[i] and pending < 0:
                 pending = i
                 queue.append((i + 1, _SLOT_SUBMIT, i, 0.0))
@@ -2527,7 +2604,17 @@ def _slots_column_advance(state, i, inputs, core=None):
         while len(queue) and error == 0:
             ready = -1
             for q in range(len(queue)):
-                if queue[q][0] <= i:
+                due, cmd_kind, cmd_d, _ = queue[q]
+                ioc_command = cmd_kind == _SLOT_SUBMIT and not np.isnan(
+                    _optional_at(ioc_limits, cmd_d, np.nan)
+                )
+                if due <= i and (
+                    phase == 1
+                    or next_open
+                    or exit_next_open
+                    or ioc_command
+                    or (cmd_kind == _SLOT_PROTECT and gen == cmd_d and ei == i)
+                ):
                     ready = q
                     break
             if ready < 0:
@@ -2539,6 +2626,10 @@ def _slots_column_advance(state, i, inputs, core=None):
                 pending, kind = d, _SLOT_SUBMIT
             if kind == _SLOT_SUBMIT and pending == d:
                 s = sides[d]
+                cap = _optional_at(ioc_limits, d, np.nan)
+                if not np.isnan(cap) and s * (ci - cap) > 0:
+                    pending, resting, chasing, closing = -1, False, False, False
+                    continue
                 q = pin if pinned == -s else ci
                 if not np.isnan(triggers[d]):
                     if not (phase == 0 and next_open) and _in_market(-s, triggers[d], q, True):
@@ -2796,6 +2887,7 @@ def _core_decision(
     core.sides[i], core.exits[i] = int(d[0]), bool(d[1])
     for col in range(10):
         core.levels[col, i] = d[col + 2]
+    core.levels[10, i] = d[15]
     core.levels[2, i] = _round_price(d[4], core.tick, core.rounding, -d[0])
     core.levels[5, i] = _round_price(d[7], core.tick, core.rounding, d[0])
     core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])

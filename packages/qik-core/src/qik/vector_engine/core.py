@@ -66,6 +66,7 @@ class Decision:
     flatten: bool = False
     exit_long: bool = False
     exit_short: bool = False
+    entry_limit_ioc: float = math.nan
 
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):

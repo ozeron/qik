@@ -24,7 +24,8 @@ _BATCH = K.run_columns
 
 @nb.njit(cache=True)
 def replay(state, params, i, feats, o, h, lo, c, v, view, out):
-    out[:] = feats[int(params[0]), i]
+    # The saved pre-IOC fixture retains its original fifteen numeric fields.
+    out[:15] = feats[int(params[0]), i]
 
 
 def compare(*args, **kwargs):
@@ -242,6 +243,7 @@ class ReplayCore:
             r[12],
             r[13],
             r[14],
+            np.nan,  # IOC is absent in the saved pre-IOC corpus.
         )
 
 
@@ -385,6 +387,7 @@ class CaptureCore:
             r[12],
             r[13],
             r[14],
+            np.nan,  # IOC is absent in the saved pre-IOC corpus.
         )
 
 
