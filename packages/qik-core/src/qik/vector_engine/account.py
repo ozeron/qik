@@ -46,9 +46,15 @@ def quantity(
 
 
 @nb.njit(cache=True)
-def fixed_cost(commission: float, slippage: float, tick: float, point_value: float) -> float:
+def fixed_cost(
+    commission: float,
+    slippage: float,
+    tick: float,
+    point_value: float,
+    round_trip: float = 2.0,
+) -> float:
     """Fixed round-trip friction per unit; retain multiplication order."""
-    return 2.0 * (commission + slippage * tick * point_value)
+    return round_trip * (commission + slippage * tick * point_value)
 
 
 @nb.njit(cache=True)

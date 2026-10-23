@@ -395,8 +395,10 @@ def _run_arrays(
     pv = instrument.point_value if instrument else 1.0
     from .account import fixed_cost
 
+    fixed_cost = getattr(fixed_cost, "py_func", fixed_cost)
+    # Preserve the original integer factor (batch accounting used 2.0).
     friction = (
-        fixed_cost(costs.commission_per_side, costs.slippage_ticks, tick, pv) if costs else 0.0
+        fixed_cost(costs.commission_per_side, costs.slippage_ticks, tick, pv, 2) if costs else 0.0
     )
     economic = np.array(
         [

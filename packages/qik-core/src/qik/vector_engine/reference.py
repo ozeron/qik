@@ -1300,12 +1300,16 @@ def quantity_reference(
 
 
 def fixed_cost_reference(
-    commission: float, slippage: float, tick: float, point_value: float
+    commission: float,
+    slippage: float,
+    tick: float,
+    point_value: float,
+    round_trip: float = 2.0,
 ) -> float:
     """Reference fixed round-trip friction, in the historical arithmetic order."""
     slipped = slippage * tick
     slipped *= point_value
-    return (commission + slipped) * 2.0
+    return (commission + slipped) * round_trip
 
 
 def fill_cost_reference(entry: float, exit: float, point_value: float, bps: float) -> float:

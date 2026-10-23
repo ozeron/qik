@@ -759,13 +759,18 @@ def _simulate(
     )
     if instrument is not None and costs is not None:
         c = costs
-        per_contract_cost = A.fixed_cost(
+        fixed_cost = getattr(A.fixed_cost, "py_func", A.fixed_cost)
+        per_contract_cost = fixed_cost(
             c.commission_per_side, c.slippage_ticks, instrument.tick, instrument.point_value
         )
-        proportional = A.fill_cost(e_px, x_px, instrument.point_value, c.proportional_bps)
+        # Keep NumPy warning/errstate behavior for host arrays; compiled cores use
+        # the dispatchers for the same policy bodies.
+        fill_cost = getattr(A.fill_cost, "py_func", A.fill_cost)
+        settle = getattr(A.settle, "py_func", A.settle)
+        proportional = fill_cost(e_px, x_px, instrument.point_value, c.proportional_bps)
         net_1 = cast(
             np.ndarray,
-            A.settle(
+            settle(
                 trades["gross_points"].to_numpy(),
                 instrument.point_value,
                 per_contract_cost,
