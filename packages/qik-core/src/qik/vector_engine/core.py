@@ -56,6 +56,11 @@ class Decision:
     entry_limit: float = math.nan  # LimitThenMarket price for this bar's entry (A15)
     stop_points: float = math.nan  # stop as points from the entry anchor instead of a level
     target_points: float = math.nan
+    entry_stop: float = math.nan
+    stop_update: float = math.nan
+    target_update: float = math.nan
+    breakeven_after_points: float = math.nan
+    breakeven_offset_points: float = math.nan
 
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):
@@ -66,7 +71,7 @@ class Core(Protocol):
     def step(self, bar: BarView) -> Decision: ...
 
 
-_LEVELS = ("stop", "target", "entry_limit", "stop_points", "target_points")
+_LEVELS = tuple(name for name in SIGNAL_FIELDS if name not in ("entry_side", "exit"))
 
 
 def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
@@ -92,7 +97,7 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
         exit_[i] = d.exit
         for name, arr in levels.items():
             arr[i] = getattr(d, name)
-    used = {name: (arr if np.isfinite(arr).any() else None) for name, arr in levels.items()}
+    used = {name: (arr if not np.isnan(arr).all() else None) for name, arr in levels.items()}
     return Signals(side, exit_, **used)
 
 
@@ -123,6 +128,10 @@ def _decision_rows(sig: Signals) -> np.ndarray:
     side = np.asarray(sig.entry_side)
     exit_ = np.asarray(sig.exit)
     any_ = (side != 0) | exit_
+    for name in ("stop_update", "target_update"):
+        a = getattr(sig, name)
+        if a is not None:
+            any_ = any_ | np.isfinite(a)
     return np.flatnonzero(any_.reshape(any_.shape[0], -1).any(axis=1))
 
 

@@ -1,6 +1,6 @@
 """Numba kernel: closed-form per-bar execution rules, one column (config) at a time.
 
-The rules are written down in ``docs/vector-engine.md`` (A1-A17 and repro-only R1). ``reference.py`` is an
+The rules are written down in ``docs/vector-engine.md`` (A1-A20 and repro-only R1). ``reference.py`` is an
 independent, slow implementation of the same spec that matches orders price point by price point;
 ``tests`` check the two agree exactly and that both reproduce Nautilus golden data.
 
@@ -25,6 +25,21 @@ ERR_STALE_BOOK = 3  # new stop falls inside the stale quote a same-bar limit fil
 ERR_PROTECT_REJECTED = 4  # limit-then-market entry's stop at or through its fill bar's close (A15)
 ERR_PENDING_NEW_DAY = 5  # a limit entry still working when the New York date changes (A15)
 ERR_NEXT_OPEN_SESSION_END = 6  # R1 decision has no following bar on the same New York date
+ERR_STOP_ENTRY_IN_MARKET = 7
+ERR_MIT_IN_MARKET = 8
+ERR_AMEND_REJECTED = 9
+ERR_AMEND_NO_ORDER = 10
+ERR_STOP_REPLACE_LATENCY = 11
+
+_SLOT_SUBMIT = 1
+_SLOT_PROTECT = 2
+_SLOT_CANCEL = 3
+_SLOT_CHASE = 4
+_SLOT_REPLACE = 5
+_SLOT_CLOSE = 6
+_SLOT_PROTECT_FAIL = 7
+_SLOT_AMEND_STOP = 8
+_SLOT_AMEND_TARGET = 9
 
 
 @nb.njit(cache=True, nogil=True)
@@ -690,6 +705,10 @@ def run_columns(
     o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts,
     new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False,
     latency_bars=0, one_tick=False, tick=0.0,
+    entry_trigger: np.ndarray | None = None, stop_updates: np.ndarray | None = None,
+    target_updates: np.ndarray | None = None, be_after: np.ndarray | None = None,
+    be_offset: np.ndarray | None = None,
+    mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -698,6 +717,10 @@ def run_columns(
     without over-allocating ``k * n`` rows.
     """
 
+    if entry_trigger is not None:
+        assert stop_updates is not None and target_updates is not None
+        assert be_after is not None and be_offset is not None
+    slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
     errs = np.zeros(k, np.int64)
@@ -710,7 +733,55 @@ def run_columns(
     s0 = np.empty(0, np.int8)
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
-        cnt, err, eb, fs, fe, fpx, fst = _column(
+        if (
+            entry_trigger is not None
+            and stop_updates is not None
+            and target_updates is not None
+            and be_after is not None
+            and be_offset is not None
+        ):
+            cnt, err, eb, fs, fe, fpx, fst = _slots_column(
+                o,
+                h,
+                lo,
+                c,
+                side_sig[j],
+                exit_sig[j],
+                entry_stop[j],
+                entry_target[j],
+                entry_limit[j],
+                stop_pts[j],
+                target_pts[j],
+                new_day,
+                chase,
+                adaptive,
+                reenter,
+                stale_drop,
+                protect_flatten,
+                latency_bars,
+                slot_slip,
+                entry_trigger[j],
+                stop_updates[j],
+                target_updates[j],
+                be_after[j],
+                be_offset[j],
+                mit,
+                oto,
+                amend_keep,
+                ratchet,
+                stop_skip,
+                True,
+                e0,
+                e0,
+                s0,
+                f0,
+                f0,
+                s0,
+                f0,
+                0,
+            )
+        else:
+            cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
             adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, True,
@@ -736,7 +807,55 @@ def run_columns(
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
         if errs[j] == 0:
-            _column(
+            if (
+                entry_trigger is not None
+                and stop_updates is not None
+                and target_updates is not None
+                and be_after is not None
+                and be_offset is not None
+            ):
+                _slots_column(
+                    o,
+                    h,
+                    lo,
+                    c,
+                    side_sig[j],
+                    exit_sig[j],
+                    entry_stop[j],
+                    entry_target[j],
+                    entry_limit[j],
+                    stop_pts[j],
+                    target_pts[j],
+                    new_day,
+                    chase,
+                    adaptive,
+                    reenter,
+                    stale_drop,
+                    protect_flatten,
+                    latency_bars,
+                    slot_slip,
+                    entry_trigger[j],
+                    stop_updates[j],
+                    target_updates[j],
+                    be_after[j],
+                    be_offset[j],
+                    mit,
+                    oto,
+                    amend_keep,
+                    ratchet,
+                    stop_skip,
+                    False,
+                    entry_i,
+                    exit_i,
+                    side,
+                    entry_px,
+                    exit_px,
+                    reason,
+                    stop,
+                    offsets[j],
+                )
+            else:
+                _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
                 adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, False,
@@ -748,3 +867,336 @@ def run_columns(
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
         entry_i, exit_i, side, entry_px, exit_px, reason, stop,
     )  # fmt: skip
+
+
+@nb.njit(cache=True, nogil=True)
+def _slots_column(
+    o,
+    h,
+    lo,
+    c,
+    sides,
+    exits,
+    stops,
+    targets,
+    limits,
+    sp,
+    tp,
+    days,
+    chase,
+    adaptive,
+    reenter,
+    stale_drop,
+    protect_flatten,
+    latency,
+    slip,
+    triggers,
+    su,
+    tu,
+    ba,
+    bo,
+    mit,
+    oto,
+    amend_keep,
+    ratchet,
+    stop_skip,
+    count_only,
+    out_ei,
+    out_xi,
+    out_sd,
+    out_ep,
+    out_xp,
+    out_why,
+    out_st,
+    base,
+):
+    """A18-A20: queued commands retain their entry generation and requested amendment price."""
+    queue = [(0, 0, 0, 0.0)]
+    queue.pop()
+    pos, ei, gen, pending = 0, -1, -1, -1
+    ep, stop, target, risk_stop = np.nan, np.nan, np.nan, np.nan
+    live, resting, chasing, closing, be_done = False, False, False, False, False
+    cnt, error = 0, ERR_NONE
+    for i in range(len(c)):
+        ci = c[i]
+        exited, busy = False, pending >= 0
+        pinned, pin, prev = 0, np.nan, o[i]
+        if (
+            pending >= 0
+            and days[i]
+            and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
+        ):
+            return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, risk_stop
+        high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
+        for m in range(4):
+            pt = o[i] if m == 0 else (ci if m == 3 else (h[i] if (m == 1) == high_first else lo[i]))
+            if (pinned > 0 and pt < prev) or (pinned < 0 and pt > prev):
+                pinned = 0
+            prev = pt
+            entered = False
+            if pending >= 0 and resting:
+                d, s = pending, sides[pending]
+                stop_order = not np.isnan(triggers[d])
+                level = triggers[d] if stop_order else limits[d]
+                match = _in_market(-s, level, pt if stop_order else pt + s * slip, stop_order)
+                if match:
+                    px = pt + s * slip if slip else (pt if stop_order and m == 0 else level)
+                    anchor = limits[d] if not np.isnan(limits[d]) else px
+                    stop = _level(s, anchor, stops[d], sp[d], -1.0)
+                    target = _level(s, anchor, targets[d], tp[d], 1.0)
+                    pos, ei, ep, gen, risk_stop = s, i, px, d, stop
+                    be_done = False
+                    pending, resting, chasing = -1, False, False
+                    live, entered = False, True
+                    if oto:
+                        if mit and _in_market(pos, target, pt, False):
+                            error = ERR_MIT_IN_MARKET
+                        elif _in_market(pos, stop, pt, True):
+                            error = ERR_PROTECT_REJECTED
+                        else:
+                            live = True
+                            if _in_market(pos, target, pt, False):
+                                _venue_record(
+                                    count_only,
+                                    base + cnt,
+                                    ei,
+                                    i,
+                                    pos,
+                                    ep,
+                                    pt - pos * slip,
+                                    REASON_TARGET,
+                                    risk_stop,
+                                    out_ei,
+                                    out_xi,
+                                    out_sd,
+                                    out_ep,
+                                    out_xp,
+                                    out_why,
+                                    out_st,
+                                )
+                                cnt += 1
+                                pos, exited = 0, True
+                    else:
+                        queue.append(
+                            (i + latency, _SLOT_CLOSE if closing else _SLOT_PROTECT, d, 0.0)
+                        )
+            if pos and live and not entered:
+                reason, px = 0, 0.0
+                if _in_market(pos, stop, pt, True):
+                    reason = REASON_STOP_GAP if m == 0 else REASON_STOP
+                    px = pt - pos * slip if slip else (pt if m == 0 else stop)
+                elif _in_market(pos, target, pt if mit else pt - pos * slip, False):
+                    reason = REASON_TARGET
+                    px = pt - pos * slip if slip else (pt if mit and m == 0 else target)
+                    if not mit and not slip and (m == 1 or m == 2):
+                        pinned, pin = pos, px
+                if reason:
+                    _venue_record(
+                        count_only,
+                        base + cnt,
+                        ei,
+                        i,
+                        pos,
+                        ep,
+                        px,
+                        reason,
+                        risk_stop,
+                        out_ei,
+                        out_xi,
+                        out_sd,
+                        out_ep,
+                        out_xp,
+                        out_why,
+                        out_st,
+                    )
+                    cnt += 1
+                    pos, exited, live = 0, True, False
+        if error:
+            return cnt, error, i, pos, ei, ep, risk_stop
+        if pos == 0 and pending < 0:
+            closing = False
+        if pending >= 0 and not np.isnan(limits[pending]) and not closing and i == pending + chase:
+            chasing = True
+            queue.append((i + latency, _SLOT_CANCEL, pending, 0.0))
+        if exits[i]:
+            chasing = False
+            if pending >= 0:
+                queue.append((i + latency, _SLOT_CANCEL, pending, 0.0))
+                closing = not oto
+            if pos and not closing:
+                queue.append((i + latency, _SLOT_CLOSE, gen, 0.0))
+                closing = True
+        elif pos:
+            update = su[i]
+            if not be_done and not np.isnan(ba[gen]):
+                reached = h[i] >= ep + ba[gen] if pos > 0 else lo[i] <= ep - ba[gen]
+                if reached:
+                    if not np.isnan(update):
+                        error = ERR_AMEND_REJECTED
+                    update = ep + pos * (0.0 if np.isnan(bo[gen]) else bo[gen])
+                    be_done = True
+            if not np.isnan(update):
+                bound = stop
+                for _, kind, d, value in queue:
+                    if kind == _SLOT_AMEND_STOP and d == gen and pos * (value - bound) > 0:
+                        bound = value
+                if np.isnan(stop):
+                    error = ERR_AMEND_NO_ORDER
+                elif not ratchet or pos * (update - bound) > 0:
+                    queue.append((i + latency, _SLOT_AMEND_STOP, gen, update))
+            if not np.isnan(tu[i]):
+                if np.isnan(target):
+                    error = ERR_AMEND_NO_ORDER
+                else:
+                    queue.append((i + latency, _SLOT_AMEND_TARGET, gen, tu[i]))
+        if (
+            pos == 0
+            and pending >= 0
+            and not np.isnan(triggers[pending])
+            and sides[i]
+            and not exits[i]
+        ):
+            if latency:
+                return cnt, ERR_STOP_REPLACE_LATENCY, i, pos, ei, ep, risk_stop
+            queue.append((i + latency, _SLOT_CANCEL, pending, 0.0))
+            queue.append((i + latency, _SLOT_REPLACE, i, 0.0))
+        elif (
+            pos == 0
+            and pending < 0
+            and not busy
+            and not closing
+            and sides[i]
+            and (reenter or not exited)
+        ):
+            pending = i
+            queue.append((i + latency, _SLOT_SUBMIT, i, 0.0))
+        while len(queue) and queue[0][0] <= i and error == 0:
+            _, kind, d, value = queue.pop(0)
+            if kind == _SLOT_REPLACE:
+                if pos or pending >= 0:
+                    continue
+                pending, kind = d, _SLOT_SUBMIT
+            if kind == _SLOT_SUBMIT and pending == d:
+                s = sides[d]
+                q = pin if pinned == -s else ci
+                if not np.isnan(triggers[d]):
+                    if _in_market(-s, triggers[d], q, True):
+                        if stop_skip:
+                            pending, resting = -1, False
+                        else:
+                            error = ERR_STOP_ENTRY_IN_MARKET
+                    else:
+                        resting = True
+                    continue
+                if not np.isnan(limits[d]) and s * (ci + s * slip - limits[d]) > 0:
+                    resting = True
+                    continue
+                px = ci + s * slip
+                anchor = limits[d] if not np.isnan(limits[d]) else px
+            elif kind == _SLOT_CHASE and pending == d:
+                s = sides[d]
+                px, anchor = ci + s * slip, ci + s * slip
+            else:
+                s, px, anchor = 0, 0.0, 0.0
+            if s:
+                pos, ei, ep, gen = s, i, px, d
+                stop = _level(s, anchor, stops[d], sp[d], -1.0)
+                target = _level(s, anchor, targets[d], tp[d], 1.0)
+                risk_stop, be_done = stop, False
+                pending, resting, chasing, live = -1, False, False, False
+                if oto:
+                    # Native child processing is synchronous within the entry fill.
+                    q = pin if pinned == pos else ci
+                    if mit and _in_market(pos, target, q, False):
+                        error = ERR_MIT_IN_MARKET
+                    elif _in_market(pos, stop, q, True):
+                        if pinned == pos and not _in_market(pos, stop, ci, True):
+                            if not stale_drop:
+                                error = ERR_STALE_BOOK
+                            else:
+                                stop, target = np.nan, np.nan
+                        else:
+                            error = ERR_PROTECT_REJECTED
+                    else:
+                        live = True
+                        if _in_market(pos, target, q, False):
+                            _venue_record(
+                                count_only,
+                                base + cnt,
+                                ei,
+                                i,
+                                pos,
+                                ep,
+                                q - pos * slip,
+                                REASON_TARGET,
+                                risk_stop,
+                                out_ei,
+                                out_xi,
+                                out_sd,
+                                out_ep,
+                                out_xp,
+                                out_why,
+                                out_st,
+                            )
+                            cnt += 1
+                            pos, exited, live = 0, True, False
+                else:
+                    queue.append((i + latency, _SLOT_CLOSE if closing else _SLOT_PROTECT, d, 0.0))
+            elif kind == _SLOT_CANCEL and pending == d:
+                pending, resting = -1, False
+                if chasing:
+                    pending = d
+                    queue.append((i + latency, _SLOT_CHASE, d, 0.0))
+            elif pos and gen == d:
+                q = pin if pinned == pos else ci
+                reason = 0
+                if kind == _SLOT_PROTECT:
+                    if mit and _in_market(pos, target, q, False):
+                        error = ERR_MIT_IN_MARKET
+                    elif _in_market(pos, stop, q, True):
+                        if not protect_flatten:
+                            error = ERR_PROTECT_REJECTED
+                        else:
+                            queue.append((i + latency, _SLOT_PROTECT_FAIL, gen, 0.0))
+                    else:
+                        live = True
+                        if _in_market(pos, target, q, False):
+                            reason = REASON_TARGET
+                elif kind == _SLOT_CLOSE or kind == _SLOT_PROTECT_FAIL:
+                    reason = REASON_SIGNAL if kind == _SLOT_CLOSE else REASON_PROTECT_FAIL
+                elif kind == _SLOT_AMEND_STOP or kind == _SLOT_AMEND_TARGET:
+                    is_stop = kind == _SLOT_AMEND_STOP
+                    invalid = _in_market(pos, value, q, is_stop)
+                    if invalid and (is_stop or mit):
+                        if not amend_keep:
+                            error = ERR_AMEND_REJECTED
+                    elif is_stop:
+                        stop = value
+                    else:
+                        target = value
+                        if invalid:
+                            reason = REASON_TARGET
+                if reason:
+                    _venue_record(
+                        count_only,
+                        base + cnt,
+                        ei,
+                        i,
+                        pos,
+                        ep,
+                        q - pos * slip,
+                        reason,
+                        risk_stop,
+                        out_ei,
+                        out_xi,
+                        out_sd,
+                        out_ep,
+                        out_xp,
+                        out_why,
+                        out_st,
+                    )
+                    cnt += 1
+                    pos, exited, live = 0, True, False
+        if error:
+            return cnt, error, i, pos, ei, ep, risk_stop
+    return cnt, ERR_NONE, -1, pos, ei, ep, risk_stop

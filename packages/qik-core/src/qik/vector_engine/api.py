@@ -101,7 +101,7 @@ class Costs:
 
 @dataclass(frozen=True)
 class Rules:
-    """Execution switches (docs/vector-engine.md, A6, A9, A13, A16/A17 and repro-only R1).
+    """Execution switches (docs/vector-engine.md, A6, A9, A13, A16-A20 and repro-only R1).
 
     ``stale_book`` decides what happens when a new entry's stop lands inside the quote a same-bar
     limit fill left stale in Nautilus' L1 book: ``"error"`` (default) refuses the input,
@@ -124,8 +124,22 @@ class Rules:
     market_fill: MarketFill = MarketFill.CLOSE
     latency_bars: Literal[0, 1] = 0
     fill_model: FillModel = FillModel.DEFAULT
+    protection: Literal["callback", "oto"] = "callback"
+    target_order: Literal["limit", "mit"] = "limit"
+    amend_rejected: Literal["error", "keep"] = "error"
+    stop_update_mode: Literal["any", "ratchet"] = "any"
+    stop_entry_in_market: Literal["error", "skip"] = "error"
 
     def __post_init__(self) -> None:
+        for name, choices in (
+            ("protection", ("callback", "oto")),
+            ("target_order", ("limit", "mit")),
+            ("amend_rejected", ("error", "keep")),
+            ("stop_update_mode", ("any", "ratchet")),
+            ("stop_entry_in_market", ("error", "skip")),
+        ):
+            if getattr(self, name) not in choices:
+                raise ValueError(f"{name} must be one of {choices}")
         if not is_int(self.latency_bars) or self.latency_bars not in (0, 1):
             raise ValueError("latency_bars must be the integer 0 or 1")
         if not isinstance(self.fill_model, FillModel):
@@ -224,6 +238,10 @@ class Signals:
     Each leg is either a level or points, never both. A limit entry needs a stop (V2 sends no
     protection without one) and ``Bars.index`` (a limit still working when the New York date
     changes is refused).
+
+    ``entry_stop`` is a DAY stop-market entry (A18). ``stop_update`` / ``target_update`` amend
+    existing legs at this close (A19); NaN keeps the level. ``breakeven_after_points`` and
+    ``breakeven_offset_points`` are fixed at entry and request a one-shot stop amendment (A19b).
     """
 
     entry_side: np.ndarray
@@ -233,6 +251,11 @@ class Signals:
     entry_limit: np.ndarray | None = None
     stop_points: np.ndarray | None = None
     target_points: np.ndarray | None = None
+    entry_stop: np.ndarray | None = None
+    stop_update: np.ndarray | None = None
+    target_update: np.ndarray | None = None
+    breakeven_after_points: np.ndarray | None = None
+    breakeven_offset_points: np.ndarray | None = None
 
 
 SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
@@ -247,12 +270,13 @@ class Result:
     index: pd.DatetimeIndex | None = None  # the bars' timestamps
     initial_cash: float | None = None
     compliance: Compliance = Compliance.NAUTILUS
+    research_only: bool = False
 
     @property
     def deployable(self) -> bool:
-        """Phase 1 has no research-only Nautilus rules: compliance is the whole gate."""
+        """V2 has no stop-entry/amend/MIT API; compliant research can still be undeployable."""
 
-        return self.compliance is Compliance.NAUTILUS
+        return self.compliance is Compliance.NAUTILUS and not self.research_only
 
     def summary(
         self,
@@ -272,6 +296,7 @@ class Result:
             periods_per_year=periods_per_year,
         )
         out["compliance"] = self.compliance.value
+        out["deployable"] = self.deployable
         return out
 
 
@@ -324,17 +349,50 @@ def simulate(
     limit = opt(signals.entry_limit, "entry_limit")
     stop_pts = opt(signals.stop_points, "stop_points")
     target_pts = opt(signals.target_points, "target_points")
-    levels = (stop, target, limit, stop_pts, target_pts)
+    slot_names = (
+        "entry_stop",
+        "stop_update",
+        "target_update",
+        "breakeven_after_points",
+        "breakeven_offset_points",
+    )
+    slot_arrays = tuple(opt(getattr(signals, name), name) for name in slot_names)
+    trigger, sup, tup, after, offset = slot_arrays
+    slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
+    slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used)
+    levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays)
     next_open = rules.market_fill is MarketFill.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
         raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
+    if next_open and (slots or rules.protection != "callback"):
+        raise ValueError("NEXT_OPEN does not support A18/A19/A20 order slots")
     if not all(a.shape[1] == k for a in (exit_, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():
         raise ValueError("entry_side must be -1, 0 or +1")
-    if any(np.isinf(a).any() for a in levels):
+    if any(np.isinf(a).any() for a in levels if a is not nan):
         raise ValueError("levels must be finite or NaN")
     entries = side != 0
+    if (
+        slot_used[0]
+        and limit is not nan
+        and np.any(entries & np.isfinite(trigger) & np.isfinite(limit))
+    ):
+        raise ValueError("an entry cannot specify both entry_stop and entry_limit")
+    for a, name in zip(slot_arrays[:4], slot_names[:4], strict=True):
+        if a is not nan and np.any(a <= 0):
+            raise ValueError(f"{name} must be positive or NaN")
+    if slot_used[4] and np.any(entries & np.isfinite(offset) & np.isnan(after)):
+        raise ValueError("breakeven_offset_points needs breakeven_after_points at the entry")
+    if slot_used[3] and np.any(entries & np.isfinite(after) & np.isnan(stop) & np.isnan(stop_pts)):
+        raise ValueError("breakeven_after_points needs an entry stop")
+    if slots and rules.protection == "oto":
+        if np.isfinite(limit).any():
+            raise ValueError("OTO order slots do not support entry_limit / chase; use callback")
+        if np.any(entries & (np.isfinite(stop_pts) | np.isfinite(target_pts))):
+            raise ValueError(
+                "OTO order slots need absolute protection; use callback for point offsets"
+            )
     for lvl, pts, leg in ((stop, stop_pts, "stop"), (target, target_pts, "target")):
         both = np.argwhere(entries & np.isfinite(lvl) & np.isfinite(pts))
         if both.size:
@@ -355,16 +413,28 @@ def simulate(
     if sizing is not None and sizing.risk_fraction is not None and initial_cash is None:
         raise ValueError("Sizing(risk_fraction=...) needs initial_cash")
     if instrument is not None:
-        for a, name in zip(levels, ("stop", "target", "entry_limit", "stop_points",
-                                     "target_points"), strict=True):  # fmt: skip
-            _check_tick(a, entries, instrument.tick, name)
+        for a, name in zip(
+            levels,
+            ("stop", "target", "entry_limit", "stop_points", "target_points", *slot_names),
+            strict=True,
+        ):
+            if a is nan:
+                continue
+            rows = np.ones_like(entries) if name in ("stop_update", "target_update") else entries
+            _check_tick(a, rows, instrument.tick, name)
 
     new_day = np.zeros(n, np.bool_)
     if next_open:
         new_day = _new_york_days(bars, "NEXT_OPEN")
     elif np.isfinite(limit).any():
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
+    elif slot_used[0]:
+        new_day = _new_york_days(bars, "stop entries")
     t = np.ascontiguousarray
+    slot_data: tuple[np.ndarray | None, ...] = (None,) * 5
+    if slots:
+        absent = t(nan.T)
+        slot_data = tuple(absent if a is nan else t(a.T) for a in slot_arrays)
     out = K.run_columns(
         bars.open, bars.high, bars.low, bars.close,
         t(side.T), t(exit_.T), t(stop.T), t(target.T), t(limit.T), t(stop_pts.T), t(target_pts.T),
@@ -373,6 +443,11 @@ def simulate(
         rules.protect_rejected == "flatten", next_open,
         rules.latency_bars, rules.fill_model is FillModel.ONE_TICK,
         0.0 if instrument is None else instrument.tick,
+        entry_trigger=slot_data[0], stop_updates=slot_data[1], target_updates=slot_data[2],
+        be_after=slot_data[3], be_offset=slot_data[4],
+        mit=rules.target_order == "mit", oto=rules.protection == "oto",
+        amend_keep=rules.amend_rejected == "keep", ratchet=rules.stop_update_mode == "ratchet",
+        stop_skip=rules.stop_entry_in_market == "skip",
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip
@@ -462,7 +537,7 @@ def simulate(
     compliance = (
         Compliance.NAUTILUS if rules.profile is Profile.NAUTILUS else Compliance.REPRO_TRADINGVIEW
     )
-    return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance)
+    return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, slots)
 
 
 def _limit_entry_checks(
@@ -500,6 +575,11 @@ def _new_york_days(bars: Bars, rule: str) -> np.ndarray:
 
 
 _KERNEL_ERRORS = {
+    K.ERR_STOP_REPLACE_LATENCY: "stop entry replacement at bar {bar}, config {j} with latency is not pinned: cancel the old entry and wait before replacing it",
+    K.ERR_STOP_ENTRY_IN_MARKET: "stop entry at bar {bar}, config {j} is in the market at submission",
+    K.ERR_MIT_IN_MARKET: "MIT target at bar {bar}, config {j} is touched at submission",
+    K.ERR_AMEND_REJECTED: "amendment at bar {bar}, config {j} rejected: trigger is in the market or conflicts with breakeven",
+    K.ERR_AMEND_NO_ORDER: "amendment at bar {bar}, config {j} has no working order in that slot",
     K.ERR_NEXT_OPEN_SESSION_END: (
         "NEXT_OPEN decision at bar {bar}, config {j} is at session end: the next bar is absent "
         "or starts a new New York date; no cross-session market fills (docs/vector-engine.md R1)"
@@ -511,9 +591,9 @@ _KERNEL_ERRORS = {
         "away, or take V2's answer with Rules(protect_rejected='flatten') (exit at that close)"
     ),
     K.ERR_PENDING_NEW_DAY: (
-        "the limit entry of config {j} is still working at bar {bar}, the first bar of a new New "
-        "York date: V2 drops its chase there and leaves the DAY limit resting, which the engine "
-        "does not model (docs/vector-engine.md A15). Exit (cancel) it before the session ends"
+        "the DAY limit/stop entry of config {j} is still working at bar {bar}, the first bar of a new New "
+        "York date: pending DAY entries across this boundary are not modelled "
+        "(docs/vector-engine.md A15/A18). Exit (cancel) it before the session ends"
     ),
     K.ERR_STALE_BOOK: (
         "stop at bar {bar}, config {j} sits inside the quote left stale by a limit fill earlier in "
