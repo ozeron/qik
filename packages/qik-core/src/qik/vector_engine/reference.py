@@ -790,10 +790,12 @@ def _simulate_slots_reference(
         )
 
     def close(price: float, why: int) -> None:
-        nonlocal position, exited
+        nonlocal position, exited, closing
         if position is not None:
             p = position
             trades.append(RefTrade(p.bar, i, p.side, p.price, price, why, p.risk_stop))
+            if next_open and pending >= 0 and pending != p.decision:
+                closing = False
             position, exited = None, True
 
     def activate(price: float, native: bool) -> None:
@@ -973,6 +975,16 @@ def _simulate_slots_reference(
                     and not closing
                     and sides[i]
                     and (reenter or not exited)
+                ):
+                    pending = i
+                    send("submit", i)
+                if (
+                    next_open
+                    and exits[i]
+                    and position is not None
+                    and reenter
+                    and sides[i]
+                    and pending < 0
                 ):
                     pending = i
                     send("submit", i)

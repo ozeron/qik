@@ -1212,6 +1212,9 @@ def _slots_column(
                 ):
                     pending = i
                     queue.append((i + latency + next_open, _SLOT_SUBMIT, i, 0.0))
+                if next_open and exits[i] and pos and reenter and sides[i] and pending < 0:
+                    pending = i
+                    queue.append((i + 1, _SLOT_SUBMIT, i, 0.0))
             if not error and not latency and (next_open or exit_next_open):
                 for due, _, _, _ in queue:
                     if due > i and (i + 1 == len(c) or days[i + 1]):
@@ -1354,6 +1357,8 @@ def _slots_column(
                             out_st,
                         )
                         cnt += 1
+                        if next_open and pending >= 0 and pending != gen:
+                            closing = False
                         pos, exited, live = 0, True, False
             if not error and not latency and (next_open or exit_next_open):
                 for due, _, _, _ in queue:
