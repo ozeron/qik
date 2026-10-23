@@ -109,8 +109,23 @@ def levels(
     target_points: float,
     tick: float = 0.0,
     rounding: int = 0,
+    combine: int = 0,
+    fill: float = np.nan,
 ) -> tuple[float, float]:
-    """Resolve a bracket from its selected anchor, preserving stop-before-target order."""
+    """Resolve protection; combined legs use the actual fill, then round once.
+
+    Bits 1/2 opt stops/targets into the nearer directional threshold. A level beyond
+    the fill remains marketable and is handled by the scheduler's existing checks.
+    Missing legs retain their original anchor semantics.
+    """
+    if combine & 1 and not np.isnan(stop) and not np.isnan(stop_points):
+        relative = fill - side * stop_points
+        stop = max(stop, relative) if side > 0 else min(stop, relative)
+        stop_points = np.nan
+    if combine & 2 and not np.isnan(target) and not np.isnan(target_points):
+        relative = fill + side * target_points
+        target = min(target, relative) if side > 0 else max(target, relative)
+        target_points = np.nan
     return (
         _level(side, anchor, stop, stop_points, -1.0, tick, rounding),
         _level(side, anchor, target, target_points, 1.0, tick, rounding),

@@ -205,6 +205,7 @@ def _run(
                 0,
                 core,
                 levels[10],
+                combine=int(rules[22]),
             )
         else:
             result = K._compiled_column(
@@ -251,6 +252,7 @@ def _run(
                 0,
                 core,
                 levels[10],
+                combine=int(rules[22]),
             )
         counts[j] = result[0]
         meta[j, 0] = result[1]
@@ -398,6 +400,7 @@ def _run_arrays(
                 SessionBoundary.LAST_BAR_CLOSE: 1,
                 SessionBoundary.NEXT_OBSERVED: 2,
             }[rules.session_boundary],
+            (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
         ],
         float,
     )

@@ -147,12 +147,22 @@ def _levels(
     target_pts: float,
     tick: float = 0.0,
     rounding: int = 0,
+    combine: int = 0,
+    fill: float = math.nan,
 ) -> tuple[float, float]:
     """Absolute stop and target: given levels as they are, point offsets from ``anchor``."""
 
-    if not math.isnan(stop_pts):
+    if combine & 1 and not math.isnan(stop) and not math.isnan(stop_pts):
+        candidate = fill - side * stop_pts
+        if side * candidate > side * stop:
+            stop = candidate
+    elif not math.isnan(stop_pts):
         stop = anchor - side * stop_pts
-    if not math.isnan(target_pts):
+    if combine & 2 and not math.isnan(target) and not math.isnan(target_pts):
+        candidate = fill + side * target_pts
+        if side * candidate < side * target:
+            target = candidate
+    elif not math.isnan(target_pts):
         target = anchor + side * target_pts
     return _round_level(stop, tick, rounding, -side), _round_level(target, tick, rounding, side)
 
@@ -243,6 +253,7 @@ def simulate_column_reference(
     amend_keep: bool = False,
     ratchet: bool = False,
     stop_skip: bool = False,
+    combine: int = 0,
 ) -> RefColumn:
     exit_next_open = next_open if exit_next_open is None else exit_next_open
     long_exits = np.zeros(len(c), bool) if exit_long is None else exit_long
@@ -313,6 +324,7 @@ def simulate_column_reference(
             stop_skip=stop_skip,
             protect_flatten=protect_flatten,
             stale_drop=stale_drop,
+            combine=combine,
         )
     if latency_bars or one_tick:
         return _simulate_venue_reference(
@@ -345,6 +357,7 @@ def simulate_column_reference(
             cross_session=cross_session,
             latency_bars=latency_bars,
             tick=tick if one_tick else 0.0,
+            combine=combine,
         )
     n = len(o)
     starts_day = np.zeros(n, bool) if new_day is None else new_day
@@ -402,6 +415,8 @@ def simulate_column_reference(
                 m.target_pts,
                 tick=round_tick,
                 rounding=tick_round,
+                combine=combine,
+                fill=px,
             )
             # R1's newly placed protection cannot retroactively gap-fill across the entry open.
             if not math.isnan(st) and (st >= px if m.side > 0 else st <= px):
@@ -437,6 +452,8 @@ def simulate_column_reference(
                     p.target_pts,
                     tick=round_tick,
                     rounding=tick_round,
+                    combine=combine,
+                    fill=px,
                 )
                 verdict = _protect_at_close(p.side, st, tg, close, protect_flatten)
                 if verdict == REFUSE:
@@ -554,6 +571,8 @@ def simulate_column_reference(
                         *spec,
                         tick=round_tick,
                         rounding=tick_round,
+                        combine=combine,
+                        fill=close,
                     )
                     verdict = _protect_at_close(s, st, tg, close, protect_flatten)
                     if verdict == REFUSE:
@@ -566,7 +585,9 @@ def simulate_column_reference(
                 else:
                     pending = _Pending(s, lim, i + chase_after, *spec)
                 continue
-            st, tg = _levels(s, close, *spec, tick=round_tick, rounding=tick_round)
+            st, tg = _levels(
+                s, close, *spec, tick=round_tick, rounding=tick_round, combine=combine, fill=close
+            )
             if not math.isnan(st) and (st >= close if s > 0 else st <= close):
                 return RefColumn(trades, ERR_STOP_IN_MARKET, i, pos, entry_i)
             if not math.isnan(tg) and (tg <= close if s > 0 else tg >= close):
@@ -624,6 +645,7 @@ def _simulate_venue_reference(
     new_day: np.ndarray | None,
     latency_bars: int,
     tick: float,
+    combine: int = 0,
 ) -> RefColumn:
     """A16/A17: literal venue replay. Commands keep send order and incur a hop each time.
 
@@ -675,6 +697,8 @@ def _simulate_venue_reference(
             float(tpts[d]),
             tick=round_tick,
             rounding=tick_round,
+            combine=combine,
+            fill=price,
         )
         pending, resting, chasing = -1, False, False
         rejected_stop = False
@@ -928,6 +952,7 @@ def _simulate_slots_reference(
     stop_skip: bool,
     protect_flatten: bool,
     stale_drop: bool,
+    combine: int = 0,
 ) -> RefColumn:
     nan = np.full(len(c), np.nan)
     limits, sp, tp, triggers, su, tu, ba, bo = [
@@ -1039,6 +1064,8 @@ def _simulate_slots_reference(
             float(tp[d]),
             tick=round_tick,
             rounding=tick_round,
+            combine=combine,
+            fill=price,
         )
         position = _SlotPosition(d, s, i, price, st, tg, st)
         last_entry, last_price, last_stop = i, price, st

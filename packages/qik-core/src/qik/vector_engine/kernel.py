@@ -149,6 +149,7 @@ def _venue_column(
     base,
     core=None,
     ioc_limits=None,
+    combine=0,
 ):
     """A16/A17 venue settlement, with a bounded-by-flight-time FIFO command list.
 
@@ -200,6 +201,7 @@ def _venue_column(
         out_stop,
         base,
         ioc_limits,
+        combine,
     )
     for i in range(len(c)):
         state, err, eb = _venue_column_advance(state, i, inputs, core)
@@ -255,6 +257,7 @@ def _venue_column_advance(state, i, inputs, core=None):
         out_stop,
         base,
         ioc_limits,
+        combine,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -392,6 +395,8 @@ def _venue_column_advance(state, i, inputs, core=None):
                 target_pts[d],
                 round_tick,
                 tick_round,
+                combine=combine,
+                fill=px,
             )
             pending, resting, chasing = -1, False, False
             rejected_stop = False
@@ -635,6 +640,8 @@ def _venue_column_advance(state, i, inputs, core=None):
                     target_pts[d],
                     round_tick,
                     tick_round,
+                    combine=combine,
+                    fill=px,
                 )
                 pending, resting, chasing = -1, False, False
                 rejected_stop = False
@@ -797,6 +804,7 @@ def _column(
     base,
     core=None,
     ioc_limits=None,
+    combine=0,
 ):
     """Simulate one column.
 
@@ -846,6 +854,7 @@ def _column(
             base,
             core,
             ioc_limits,
+            combine=combine,
         )
     n = o.shape[0]
     # Flat position, no working limit or next-open market commands.
@@ -896,6 +905,7 @@ def _column(
         out_stop,
         base,
         ioc_limits,
+        combine,
     )
     for i in range(n):
         state, err, eb = _column_advance(state, i, inputs, core)
@@ -955,6 +965,7 @@ def _column_advance(state, i, inputs, core=None):
         out_stop,
         base,
         ioc_limits,
+        combine,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -1060,6 +1071,8 @@ def _column_advance(state, i, inputs, core=None):
             target_pts[d],
             round_tick,
             tick_round,
+            combine=combine,
+            fill=o[i],
         )
         # Newly placed protection is validated at the actual entry open. A4's resting-stop
         # gap rule cannot be applied retroactively across this entry fill (R1).
@@ -1164,6 +1177,8 @@ def _column_advance(state, i, inputs, core=None):
                 p_tgp,
                 round_tick,
                 tick_round,
+                combine=combine,
+                fill=px,
             )
             if core is not None and filled:
                 # The resting entry has printed, but its callback protection is a close
@@ -1570,6 +1585,8 @@ def _column_advance(state, i, inputs, core=None):
                     target_pts[i],
                     round_tick,
                     tick_round,
+                    combine=combine,
+                    fill=ci,
                 )
                 err, why = _fill_then_protect(
                     s, i, ci, st, tg, ci, protect_flatten, count_only, out_entry_i,
@@ -1645,6 +1662,8 @@ def _column_advance(state, i, inputs, core=None):
             target_pts[i],
             round_tick,
             tick_round,
+            combine=combine,
+            fill=ci,
         )
         if _in_market(s, st, ci, True):
             return (
@@ -1757,7 +1776,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1862,6 +1881,7 @@ def run_columns(
                 f0,
                 0,
                 ioc_limits=ioc_column,
+                combine=combine,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
@@ -1869,6 +1889,7 @@ def run_columns(
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
             adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, True,
             e0, e0, s0, f0, f0, s0, f0, 0, ioc_limits=ioc_column,
+            combine=combine,
         )  # fmt: skip
         counts[j] = cnt
         errs[j] = err
@@ -1954,6 +1975,7 @@ def run_columns(
                     stop,
                     offsets[j],
                     ioc_limits=ioc_column,
+                    combine=combine,
                 )
             else:
                 _column(
@@ -1963,6 +1985,7 @@ def run_columns(
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j], ioc_limits=ioc_column,
+                combine=combine,
             )  # fmt: skip
     return (
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
@@ -2024,6 +2047,7 @@ def _slots_column(
     base,
     core=None,
     ioc_limits=None,
+    combine=0,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
@@ -2084,6 +2108,7 @@ def _slots_column(
         out_st,
         base,
         ioc_limits,
+        combine,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2152,6 +2177,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         out_st,
         base,
         ioc_limits,
+        combine,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2272,7 +2298,16 @@ def _slots_column_advance(state, i, inputs, core=None):
                             limits[d] if not np.isnan(limits[d]) else px,
                         )
                         stop, target = levels(
-                            s, anchor, stops[d], targets[d], sp[d], tp[d], round_tick, tick_round
+                            s,
+                            anchor,
+                            stops[d],
+                            targets[d],
+                            sp[d],
+                            tp[d],
+                            round_tick,
+                            tick_round,
+                            combine=combine,
+                            fill=px,
                         )
                         pos, ei, ep, gen, risk_stop = s, i, px, d, stop
                         be_done = False
@@ -2656,7 +2691,16 @@ def _slots_column_advance(state, i, inputs, core=None):
             if s:
                 pos, ei, ep, gen = s, i, px, d
                 stop, target = levels(
-                    s, anchor, stops[d], targets[d], sp[d], tp[d], round_tick, tick_round
+                    s,
+                    anchor,
+                    stops[d],
+                    targets[d],
+                    sp[d],
+                    tp[d],
+                    round_tick,
+                    tick_round,
+                    combine=combine,
+                    fill=px,
                 )
                 risk_stop, be_done = stop, False
                 pending, resting, chasing, live = -1, False, False, False

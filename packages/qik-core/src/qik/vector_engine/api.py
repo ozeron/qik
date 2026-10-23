@@ -177,6 +177,13 @@ class Rules:
     it requires timezone-aware Bars.index and excludes limit-then-market entries.
     ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
     changes venue liquidity and needs Instrument.tick. Neither combines with NEXT_OPEN.
+
+    ``stop_combine="tighter"`` permits a level plus points on the same entry: long
+    max(level, fill - points), short min(level, fill + points). ``target_combine``
+    independently selects the nearer target (long min, short max). Combined offsets
+    always use the actual fill, regardless of bracket_anchor; selection precedes
+    tick rounding. Missing legs retain their existing anchor semantics. Marketable
+    levels retain the existing rejection/fill policy. Both default to ``"refuse"``.
     """
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
@@ -202,6 +209,8 @@ class Rules:
     target_order: Literal["limit", "mit"] = "limit"
     amend_rejected: Literal["error", "keep"] = "error"
     stop_update_mode: Literal["any", "ratchet"] = "any"
+    stop_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
+    target_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
     stop_entry_in_market: Literal["error", "skip"] = "error"
 
     def __post_init__(self) -> None:
@@ -243,6 +252,8 @@ class Rules:
             raise ValueError("non-default target_gap/tick_round require a repro profile")
         next_open = FillTiming.NEXT_OPEN in (self.effective_entry_fill, self.effective_exit_fill)
         for name, choices in (
+            ("stop_combine", ("refuse", "tighter")),
+            ("target_combine", ("refuse", "tighter")),
             ("protection", ("callback", "oto")),
             ("target_order", ("limit", "mit")),
             ("amend_rejected", ("error", "keep")),
@@ -594,14 +605,21 @@ def _simulate(
         if np.isfinite(limit).any():
             raise ValueError("OTO order slots do not support entry_limit / chase; use callback")
         if rules.bracket_anchor is not BracketAnchor.FILL and np.any(
-            entries & (np.isfinite(stop_pts) | np.isfinite(target_pts))
+            entries
+            & (
+                (np.isfinite(stop_pts) & ~(np.isfinite(stop) & (rules.stop_combine == "tighter")))
+                | (
+                    np.isfinite(target_pts)
+                    & ~(np.isfinite(target) & (rules.target_combine == "tighter"))
+                )
+            )
         ):
             raise ValueError(
                 "OTO order slots need absolute protection; use callback for point offsets"
             )
     for lvl, pts, leg in ((stop, stop_pts, "stop"), (target, target_pts, "target")):
         both = np.argwhere(entries & np.isfinite(lvl) & np.isfinite(pts))
-        if both.size:
+        if both.size and getattr(rules, f"{leg}_combine") == "refuse":
             i, j = (int(x) for x in both[0])
             raise ValueError(f"bar {i}, config {j}: {leg} is given as a level and as points")
         neg = np.argwhere(entries & (pts <= 0))
@@ -742,6 +760,7 @@ def _simulate(
         entry_limit_ioc=t(ioc.T) if signals.entry_limit_ioc is not None else None,
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
+        combine=(rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
         bracket_anchor=0 if rules.bracket_anchor is None else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
