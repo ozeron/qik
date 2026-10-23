@@ -48,8 +48,10 @@ def test_core_sees_each_bar_once_in_order_with_time_and_volume() -> None:
 
 
 def test_decision_and_driver_validation() -> None:
+    from qik.vector_engine import LegacyDecision
+
     with pytest.raises(ValueError, match="side"):
-        Decision(side=2)
+        LegacyDecision(side=2)
 
     class Bad:
         def step(self, bar: BarView) -> object:

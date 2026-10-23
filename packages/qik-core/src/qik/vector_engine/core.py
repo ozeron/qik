@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from .api import SIGNAL_FIELDS, Bars, Signals
+from .types import Decision as NumericDecision
 
 __all__ = ["BarView", "Core", "Decision", "check_causal", "signals_from_core"]
 
@@ -72,7 +73,7 @@ class Decision:
 
 
 class Core(Protocol):
-    def step(self, bar: BarView) -> Decision: ...
+    def step(self, bar: BarView) -> Decision | NumericDecision: ...
 
 
 _LEVELS = tuple(
@@ -100,6 +101,8 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
         d = core.step(
             BarView(i, ts, bars.open[i], bars.high[i], bars.low[i], bars.close[i], vol[i])
         )
+        if isinstance(d, NumericDecision):
+            d = Decision(*d)
         if not isinstance(d, Decision):
             raise TypeError(f"bar {i}: step must return a Decision, got {type(d).__name__}")
         side[i] = d.side
