@@ -488,10 +488,10 @@ def simulate(
             _check_tick(a, rows, instrument.tick, name)
 
     new_day = np.zeros(n, np.bool_)
-    if next_open or exit_next_open:
-        new_day = _new_york_days(bars, "NEXT_OPEN")
-    elif np.isfinite(limit).any():
+    if np.isfinite(limit).any():
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
+    elif next_open or exit_next_open:
+        new_day = _new_york_days(bars, "NEXT_OPEN")
     elif slot_used[0]:
         new_day = _new_york_days(bars, "stop entries")
     t = np.ascontiguousarray

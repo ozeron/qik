@@ -81,6 +81,21 @@ def test_next_open_refuses_limit_entries() -> None:
         )
 
 
+@pytest.mark.parametrize("profile", [Profile.TRADINGVIEW, Profile.REPRO])
+@pytest.mark.parametrize("exit_fill", list(MarketFill))
+def test_exit_clock_preserves_limit_entry_stop_requirement(
+    profile: Profile, exit_fill: MarketFill
+) -> None:
+    bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
+    signals = Signals(
+        np.array([1, 0, 0]),
+        np.array([False, True, False]),
+        entry_limit=np.array([101.0, np.nan, np.nan]),
+    )
+    with pytest.raises(ValueError, match="limit entry needs a stop"):
+        simulate(bars, signals, rules=Rules(profile=profile, exit_fill=exit_fill))
+
+
 def test_next_open_tags_are_repro() -> None:
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
     result = simulate(
