@@ -76,7 +76,7 @@ def _nan_free(x: float) -> float | None:
 def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
     limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
-    next_open=False,
+    next_open=False, latency_bars=0, one_tick=False, tick=0.0,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
@@ -87,6 +87,7 @@ def _run_kernel(
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
         extra[0][None, :], extra[1][None, :], extra[2][None, :],
         day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open,
+        latency_bars, one_tick, tick,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, t_stop) = out  # fmt: skip

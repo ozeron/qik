@@ -35,6 +35,7 @@ __all__ = [
     "Compliance",
     "Costs",
     "Instrument",
+    "FillModel",
     "MarketFill",
     "Profile",
     "Result",
@@ -62,6 +63,11 @@ class Profile(StrEnum):
 class Compliance(StrEnum):
     NAUTILUS = "nautilus"
     REPRO_TRADINGVIEW = "repro:tradingview"
+
+
+class FillModel(StrEnum):
+    DEFAULT = "default"
+    ONE_TICK = "one_tick"
 
 
 class MarketFill(StrEnum):
@@ -95,7 +101,7 @@ class Costs:
 
 @dataclass(frozen=True)
 class Rules:
-    """Execution switches (docs/vector-engine.md, A6, A9, A13 and repro-only R1).
+    """Execution switches (docs/vector-engine.md, A6, A9, A13, A16/A17 and repro-only R1).
 
     ``stale_book`` decides what happens when a new entry's stop lands inside the quote a same-bar
     limit fill left stale in Nautilus' L1 book: ``"error"`` (default) refuses the input,
@@ -104,6 +110,8 @@ class Rules:
 
     NEXT_OPEN is available only under Profile.TRADINGVIEW, for external-author reproduction;
     it requires timezone-aware Bars.index and excludes limit-then-market entries.
+    ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
+    changes venue liquidity and needs Instrument.tick. Neither combines with NEXT_OPEN.
     """
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
@@ -114,8 +122,18 @@ class Rules:
     protect_rejected: Literal["error", "flatten"] = "error"
     profile: Profile = Profile.NAUTILUS
     market_fill: MarketFill = MarketFill.CLOSE
+    latency_bars: Literal[0, 1] = 0
+    fill_model: FillModel = FillModel.DEFAULT
 
     def __post_init__(self) -> None:
+        if not is_int(self.latency_bars) or self.latency_bars not in (0, 1):
+            raise ValueError("latency_bars must be the integer 0 or 1")
+        if not isinstance(self.fill_model, FillModel):
+            raise ValueError("fill_model must be a FillModel enum")
+        if self.market_fill is MarketFill.NEXT_OPEN and (
+            self.latency_bars or self.fill_model is not FillModel.DEFAULT
+        ):
+            raise ValueError("NEXT_OPEN cannot mix with latency_bars or a venue fill_model")
         if not isinstance(self.profile, Profile):
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
@@ -290,6 +308,8 @@ def simulate(
 ) -> Result:
     """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
+    if rules.fill_model is FillModel.ONE_TICK and instrument is None:
+        raise ValueError("FillModel.ONE_TICK needs Instrument(tick=..., point_value=...)")
     n = len(bars)
     side = _as_2d(signals.entry_side, n, np.int8, "entry_side")
     k = side.shape[1]
@@ -351,6 +371,8 @@ def simulate(
         new_day, int(rules.limit_chase_bars), rules.adaptive_high_low_ordering,
         rules.reenter_on_exit_bar, rules.stale_book == "nautilus",
         rules.protect_rejected == "flatten", next_open,
+        rules.latency_bars, rules.fill_model is FillModel.ONE_TICK,
+        0.0 if instrument is None else instrument.tick,
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip

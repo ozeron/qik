@@ -176,7 +176,31 @@ def simulate_column_reference(
     protect_flatten: bool = False,
     new_day: np.ndarray | None = None,
     next_open: bool = False,
+    latency_bars: int = 0,
+    one_tick: bool = False,
+    tick: float = 0.0,
 ) -> RefColumn:
+    if latency_bars or one_tick:
+        return _simulate_venue_reference(
+            o,
+            h,
+            lo,
+            c,
+            side_sig,
+            exit_sig,
+            entry_stop,
+            entry_target,
+            adaptive=adaptive,
+            reenter=reenter,
+            entry_limit=entry_limit,
+            stop_pts=stop_pts,
+            target_pts=target_pts,
+            chase_after=chase_after,
+            protect_flatten=protect_flatten,
+            new_day=new_day,
+            latency_bars=latency_bars,
+            tick=tick if one_tick else 0.0,
+        )
     n = len(o)
     starts_day = np.zeros(n, bool) if new_day is None else new_day
     nan = np.full(n, np.nan)
@@ -342,4 +366,213 @@ def simulate_column_reference(
                     return RefColumn(trades, ERR_STALE_BOOK, i, pos, entry_i)
                 st, tg = math.nan, math.nan
             pos, entry_i, entry_px, stop, target = s, i, close, st, tg
+    return RefColumn(trades, ERR_NONE, -1, pos, entry_i, entry_px, stop)
+
+
+@dataclass(frozen=True)
+class _VenueCommand:
+    due: int
+    kind: str
+    entry: int
+
+
+def _simulate_venue_reference(
+    o: np.ndarray,
+    h: np.ndarray,
+    lo: np.ndarray,
+    c: np.ndarray,
+    side_sig: np.ndarray,
+    exit_sig: np.ndarray,
+    entry_stop: np.ndarray,
+    entry_target: np.ndarray,
+    *,
+    adaptive: bool,
+    reenter: bool,
+    entry_limit: np.ndarray | None,
+    stop_pts: np.ndarray | None,
+    target_pts: np.ndarray | None,
+    chase_after: int,
+    protect_flatten: bool,
+    new_day: np.ndarray | None,
+    latency_bars: int,
+    tick: float,
+) -> RefColumn:
+    """A16/A17: literal venue replay. Commands keep send order and incur a hop each time.
+
+    Protection is V2's fill-callback pattern, not an exchange-native OTO order list.
+    """
+    n = len(c)
+    nan = np.full(n, np.nan)
+    limits = nan if entry_limit is None else entry_limit
+    spts = nan if stop_pts is None else stop_pts
+    tpts = nan if target_pts is None else target_pts
+    days = np.zeros(n, bool) if new_day is None else new_day
+    commands: list[_VenueCommand] = []
+    trades: list[RefTrade] = []
+    pos, entry_i, generation = 0, -1, -1
+    entry_px, stop, target = math.nan, math.nan, math.nan
+    pending = -1
+    resting = False
+    chasing = False
+    protection = 0  # 0 absent, 1 in flight, 2 resting, 3 cancel in flight (still matches)
+    closing = False
+    close_reason = REASON_SIGNAL
+    rejected_stop = False
+
+    def send(kind: str, d: int) -> None:
+        commands.append(_VenueCommand(i + latency_bars, kind, d))
+
+    def close(price: float, reason: int) -> None:
+        nonlocal pos, exited
+        if pos:
+            trades.append(RefTrade(entry_i, i, pos, entry_px, price, reason, stop))
+            pos = 0
+            exited = True
+
+    def fill_entry(d: int, price: float, is_limit: bool) -> None:
+        nonlocal pos, entry_i, entry_px, stop, target, generation
+        nonlocal pending, resting, chasing, protection, rejected_stop
+        pos, entry_i, entry_px, generation = int(side_sig[d]), i, price, d
+        anchor = float(limits[d]) if is_limit else price
+        stop, target = _levels(
+            pos,
+            anchor,
+            float(entry_stop[d]),
+            float(entry_target[d]),
+            float(spts[d]),
+            float(tpts[d]),
+        )
+        pending, resting, chasing = -1, False, False
+        rejected_stop = False
+        if closing:
+            # Flatten cleared the logical attempt before its fill arrived. V2's
+            # late-entry guard unwinds it, without submitting protective legs.
+            protection = 0
+            send("close", d)
+        else:
+            protection = 1
+            send("protect", d)
+
+    for i in range(n):
+        exited = False
+        busy = pending >= 0
+        ci = float(c[i])
+        if pending >= 0 and not math.isnan(limits[pending]) and days[i]:
+            return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
+        if closing and pending < 0 and pos == 0 and protection in (0, 3):
+            closing = False
+        # Exchange's complete price path precedes the sleeve decision and command settlement.
+        for label, price in _price_points(float(o[i]), float(h[i]), float(lo[i]), ci, adaptive):
+            if pending >= 0 and resting:
+                s = int(side_sig[pending])
+                px = price + s * tick
+                if px <= limits[pending] if s > 0 else px >= limits[pending]:
+                    fill_entry(pending, px if tick else float(limits[pending]), True)
+            if not pos and protection == 2 and rejected_stop and not math.isnan(target):
+                # A rejected-stop flatten can leave its accepted target behind.
+                # NT cancels it on a touch against a flat position, before asking
+                # the fill model for liquidity (so even an exact touch clears it).
+                s = int(side_sig[generation])
+                if price >= target if s > 0 else price <= target:
+                    protection = 0
+            if pos and protection >= 2:
+                if (
+                    not rejected_stop
+                    and not math.isnan(stop)
+                    and (price <= stop if pos > 0 else price >= stop)
+                ):
+                    px = price - pos * tick if tick else (price if label == "O" else stop)
+                    close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
+                    send("cancel_protect", generation)
+                    protection = 3
+                elif not math.isnan(target):
+                    px = price - pos * tick
+                    if px >= target if pos > 0 else px <= target:
+                        close(px if tick else target, REASON_TARGET)
+                        send("cancel_protect", generation)
+                        protection = 3
+        # V2 sync sees protective fills/cancellations from this sweep before deciding.
+        if closing and pending < 0 and pos == 0 and protection in (0, 3):
+            closing = False
+        # A live protective leg which lost a flatten race is cancelled on V2's next sync.
+        if closing and pos == 0 and protection == 2:
+            send("cancel_protect", generation)
+            protection = 3
+        if (
+            pending >= 0
+            and not closing
+            and not math.isnan(limits[pending])
+            and i == pending + chase_after
+        ):
+            chasing = True
+            send("cancel_entry", pending)
+        if bool(exit_sig[i]):
+            chasing = False
+            if pending >= 0:
+                if not closing and not math.isnan(limits[pending]):
+                    send("cancel_entry", pending)
+                closing, close_reason = True, REASON_SIGNAL
+            if pos:
+                if protection == 2:
+                    send("cancel_protect", generation)
+                    protection = 3
+                if not closing:
+                    send("close", generation)
+                closing, close_reason = True, REASON_SIGNAL
+        if (
+            not pos
+            and pending < 0
+            and not busy
+            and not closing
+            and side_sig[i]
+            and (reenter or not exited)
+        ):
+            pending = i
+            send("market" if math.isnan(limits[i]) else "limit", i)
+        # FIFO settlement; a fill callback may append another command due now (zero latency).
+        while commands and commands[0].due <= i:
+            cmd = commands.pop(0)
+            d = cmd.entry
+            if cmd.kind in ("market", "limit"):
+                if pending != d:
+                    continue
+                s = int(side_sig[d])
+                px = ci + s * tick
+                if cmd.kind == "market":
+                    fill_entry(d, px, False)
+                elif px <= limits[d] if s > 0 else px >= limits[d]:
+                    fill_entry(d, px, True)
+                else:
+                    resting = True
+            elif cmd.kind == "cancel_entry":
+                if pending == d:
+                    pending, resting = -1, False
+                    if chasing:
+                        chasing = False
+                        pending = d
+                        send("market", d)
+            elif cmd.kind == "protect" and generation == d:
+                protection = 2
+                if pos:
+                    verdict = _protect_at_close(pos, stop, target, ci, protect_flatten)
+                    if verdict == REFUSE:
+                        return RefColumn(trades, ERR_PROTECT_REJECTED, i, pos, entry_i)
+                    if verdict == REASON_PROTECT_FAIL:
+                        rejected_stop = True
+                        if math.isnan(target):
+                            protection = 0
+                        if not closing:
+                            close_reason = REASON_PROTECT_FAIL
+                            send("close", d)
+                        closing = True
+                    if not math.isnan(target):
+                        px = ci - pos * tick
+                        if px >= target if pos > 0 else px <= target:
+                            close(px, REASON_TARGET)
+                            send("cancel_protect", d)
+                            protection = 3
+            elif cmd.kind == "cancel_protect" and generation == d:
+                protection = 0
+            elif cmd.kind == "close":
+                close(ci - pos * tick, close_reason)
     return RefColumn(trades, ERR_NONE, -1, pos, entry_i, entry_px, stop)

@@ -1,6 +1,6 @@
 """Numba kernel: closed-form per-bar execution rules, one column (config) at a time.
 
-The rules are written down in ``docs/vector-engine.md`` (A1-A15 and repro-only R1). ``reference.py`` is an
+The rules are written down in ``docs/vector-engine.md`` (A1-A17 and repro-only R1). ``reference.py`` is an
 independent, slow implementation of the same spec that matches orders price point by price point;
 ``tests`` check the two agree exactly and that both reproduce Nautilus golden data.
 
@@ -96,6 +96,289 @@ def _fill_then_protect(
 
 
 @nb.njit(cache=True, nogil=True)
+def _venue_record(
+    count_only,
+    k,
+    ei,
+    i,
+    side,
+    ep,
+    px,
+    why,
+    stop,
+    out_entry_i,
+    out_exit_i,
+    out_side,
+    out_entry_px,
+    out_exit_px,
+    out_reason,
+    out_stop,
+):
+    if not count_only:
+        out_entry_i[k], out_exit_i[k], out_side[k] = ei, i, side
+        out_entry_px[k], out_exit_px[k] = ep, px
+        out_reason[k], out_stop[k] = why, stop
+
+
+@nb.njit(cache=True, nogil=True)
+def _venue_column(
+    o,
+    h,
+    lo,
+    c,
+    side_sig,
+    exit_sig,
+    entry_stop,
+    entry_target,
+    entry_limit,
+    stop_pts,
+    target_pts,
+    new_day,
+    chase,
+    adaptive,
+    reenter,
+    protect_flatten,
+    latency,
+    slip,
+    count_only,
+    out_entry_i,
+    out_exit_i,
+    out_side,
+    out_entry_px,
+    out_exit_px,
+    out_reason,
+    out_stop,
+    base,
+):
+    """A16/A17 venue settlement, with a bounded-by-flight-time FIFO command list.
+
+    Commands: 1 market, 2 limit, 3 protection, 4 cancel entry, 5 cancel protection, 6 close.
+    A command's generation is its entry decision row; cancels cannot erase a later trade's legs.
+    """
+    commands = [(0, 0, 0)]
+    commands.pop()
+    pos, ei, gen = 0, -1, -1
+    ep, stop, target = np.nan, np.nan, np.nan
+    pending = -1
+    resting = False
+    chasing = False
+    protection = 0
+    closing = False
+    close_reason = REASON_SIGNAL
+    rejected_stop = False
+    cnt = 0
+    for i in range(len(c)):
+        ci = c[i]
+        exited = False
+        busy = pending >= 0
+        if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i]:
+            return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, stop
+        if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
+            closing = False
+        high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
+        # Locate the first matching point. A newly filled entry has no resting protection yet.
+        if pending >= 0 and resting:
+            d = pending
+            s = side_sig[d]
+            extreme = lo[i] if s > 0 else h[i]
+            if (s > 0 and extreme + slip <= entry_limit[d]) or (
+                s < 0 and extreme - slip >= entry_limit[d]
+            ):
+                px = entry_limit[d]
+                if slip:
+                    for m in range(4):
+                        pt = (
+                            o[i]
+                            if m == 0
+                            else (c[i] if m == 3 else (h[i] if (m == 1) == high_first else lo[i]))
+                        )
+                        candidate = pt + s * slip
+                        if (s > 0 and candidate <= entry_limit[d]) or (
+                            s < 0 and candidate >= entry_limit[d]
+                        ):
+                            px = candidate
+                            break
+                pos, ei, ep, gen = s, i, px, d
+                stop = _level(s, entry_limit[d], entry_stop[d], stop_pts[d], -1.0)
+                target = _level(s, entry_limit[d], entry_target[d], target_pts[d], 1.0)
+                pending, resting, chasing = -1, False, False
+                rejected_stop = False
+                protection = 0 if closing else 1
+                commands.append((i + latency, 6 if closing else 3, d))
+        elif pos == 0 and protection == 2 and rejected_stop and not np.isnan(target):
+            extreme = h[i] if side_sig[gen] > 0 else lo[i]
+            if _in_market(side_sig[gen], target, extreme, False):
+                protection = 0  # flat reduce-only target is cancelled before liquidity is checked
+        elif pos and protection >= 2:
+            reason = 0
+            px = 0.0
+            for m in range(4):
+                pt = (
+                    o[i]
+                    if m == 0
+                    else (c[i] if m == 3 else (h[i] if (m == 1) == high_first else lo[i]))
+                )
+                if not rejected_stop and _in_market(pos, stop, pt, True):
+                    reason = REASON_STOP_GAP if m == 0 else REASON_STOP
+                    px = pt - pos * slip if slip else (pt if m == 0 else stop)
+                    break
+                candidate = pt - pos * slip
+                if _in_market(pos, target, candidate, False):
+                    reason = REASON_TARGET
+                    px = candidate if slip else target
+                    break
+            if reason:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    ei,
+                    i,
+                    pos,
+                    ep,
+                    px,
+                    reason,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+                pos, exited = 0, True
+                commands.append((i + latency, 5, gen))
+                protection = 3
+        if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
+            closing = False
+        if closing and pos == 0 and protection == 2:
+            commands.append((i + latency, 5, gen))
+            protection = 3
+        if (
+            pending >= 0
+            and not closing
+            and not np.isnan(entry_limit[pending])
+            and i == pending + chase
+        ):
+            chasing = True
+            commands.append((i + latency, 4, pending))
+        if exit_sig[i]:
+            chasing = False
+            if pending >= 0:
+                if not closing and not np.isnan(entry_limit[pending]):
+                    commands.append((i + latency, 4, pending))
+                closing, close_reason = True, REASON_SIGNAL
+            if pos:
+                if protection == 2:
+                    commands.append((i + latency, 5, gen))
+                    protection = 3
+                if not closing:
+                    commands.append((i + latency, 6, gen))
+                closing, close_reason = True, REASON_SIGNAL
+        if (
+            pos == 0
+            and pending < 0
+            and not busy
+            and not closing
+            and side_sig[i] != 0
+            and (reenter or not exited)
+        ):
+            pending = i
+            commands.append((i + latency, 1 if np.isnan(entry_limit[i]) else 2, i))
+        while len(commands) and commands[0][0] <= i:
+            _, kind, d = commands.pop(0)
+            if kind == 1 or kind == 2:
+                if pending != d:
+                    continue
+                s = side_sig[d]
+                px = ci + s * slip
+                if (
+                    kind == 1
+                    or (s > 0 and px <= entry_limit[d])
+                    or (s < 0 and px >= entry_limit[d])
+                ):
+                    anchor = px if kind == 1 else entry_limit[d]
+                    pos, ei, ep, gen = s, i, px, d
+                    stop = _level(s, anchor, entry_stop[d], stop_pts[d], -1.0)
+                    target = _level(s, anchor, entry_target[d], target_pts[d], 1.0)
+                    pending, resting, chasing = -1, False, False
+                    rejected_stop = False
+                    protection = 0 if closing else 1
+                    commands.append((i + latency, 6 if closing else 3, d))
+                else:
+                    resting = True
+            elif kind == 4:
+                if pending == d:
+                    pending, resting = -1, False
+                    if chasing:
+                        chasing = False
+                        pending = d
+                        commands.append((i + latency, 1, d))
+            elif kind == 3 and gen == d:
+                protection = 2
+                if pos:
+                    if _in_market(pos, stop, ci, True):
+                        if not protect_flatten:
+                            return cnt, ERR_PROTECT_REJECTED, i, pos, ei, ep, stop
+                        rejected_stop = True
+                        if np.isnan(target):
+                            protection = 0
+                        if not closing:
+                            close_reason = REASON_PROTECT_FAIL
+                            commands.append((i + latency, 6, d))
+                        closing = True
+                    px = ci - pos * slip
+                    if _in_market(pos, target, px, False):
+                        _venue_record(
+                            count_only,
+                            base + cnt,
+                            ei,
+                            i,
+                            pos,
+                            ep,
+                            px,
+                            REASON_TARGET,
+                            stop,
+                            out_entry_i,
+                            out_exit_i,
+                            out_side,
+                            out_entry_px,
+                            out_exit_px,
+                            out_reason,
+                            out_stop,
+                        )
+                        cnt += 1
+                        pos, exited = 0, True
+                        commands.append((i + latency, 5, d))
+                        protection = 3
+            elif kind == 5 and gen == d:
+                protection = 0
+            elif kind == 6 and pos:
+                _venue_record(
+                    count_only,
+                    base + cnt,
+                    ei,
+                    i,
+                    pos,
+                    ep,
+                    ci - pos * slip,
+                    close_reason,
+                    stop,
+                    out_entry_i,
+                    out_exit_i,
+                    out_side,
+                    out_entry_px,
+                    out_exit_px,
+                    out_reason,
+                    out_stop,
+                )
+                cnt += 1
+                pos, exited = 0, True
+    return cnt, ERR_NONE, -1, pos, ei, ep, stop
+
+
+@nb.njit(cache=True, nogil=True)
 def _column(
     o,
     h,
@@ -115,6 +398,9 @@ def _column(
     stale_drop,
     protect_flatten,
     next_open,
+    latency_bars,
+    one_tick,
+    tick,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -130,6 +416,36 @@ def _column(
     Returns ``(n_trades, err, err_bar, final_side, final_entry_i, final_entry_px, final_stop)``.
     """
 
+    if latency_bars or one_tick:
+        return _venue_column(
+            o,
+            h,
+            lo,
+            c,
+            side_sig,
+            exit_sig,
+            entry_stop,
+            entry_target,
+            entry_limit,
+            stop_pts,
+            target_pts,
+            new_day,
+            chase,
+            adaptive,
+            reenter,
+            protect_flatten,
+            latency_bars,
+            tick if one_tick else 0.0,
+            count_only,
+            out_entry_i,
+            out_exit_i,
+            out_side,
+            out_entry_px,
+            out_exit_px,
+            out_reason,
+            out_stop,
+            base,
+        )
     n = o.shape[0]
     pos = 0
     entry_i = -1
@@ -373,6 +689,7 @@ def _column(
 def run_columns(
     o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts,
     new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False,
+    latency_bars=0, one_tick=False, tick=0.0,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -396,7 +713,7 @@ def run_columns(
         cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, True,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, True,
             e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -422,7 +739,7 @@ def run_columns(
             _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
