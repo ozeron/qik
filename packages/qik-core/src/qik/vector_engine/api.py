@@ -140,11 +140,9 @@ class Rules:
     def __post_init__(self) -> None:
         for name in ("entry_fill", "exit_fill"):
             value = getattr(self, name)
-            if value is None:
-                object.__setattr__(self, name, self.market_fill)
-            elif not isinstance(value, FillTiming):
+            if value is not None and not isinstance(value, FillTiming):
                 raise ValueError(f"{name} must be a FillTiming enum")
-        next_open = FillTiming.NEXT_OPEN in (self.entry_fill, self.exit_fill)
+        next_open = FillTiming.NEXT_OPEN in (self.effective_entry_fill, self.effective_exit_fill)
         for name, choices in (
             ("protection", ("callback", "oto")),
             ("target_order", ("limit", "mit")),
@@ -176,6 +174,14 @@ class Rules:
             raise ValueError(
                 f"limit_chase_bars must be an integer >= 1, got {self.limit_chase_bars!r}"
             )
+
+    @property
+    def effective_entry_fill(self) -> FillTiming:
+        return self.market_fill if self.entry_fill is None else self.entry_fill
+
+    @property
+    def effective_exit_fill(self) -> FillTiming:
+        return self.market_fill if self.exit_fill is None else self.exit_fill
 
 
 @dataclass(frozen=True)
@@ -373,12 +379,10 @@ def simulate(
     slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
     slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used)
     levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays)
-    next_open = rules.entry_fill is FillTiming.NEXT_OPEN
-    exit_next_open = rules.exit_fill is FillTiming.NEXT_OPEN
+    next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
+    exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
         raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
-    if (next_open or exit_next_open) and (slots or rules.protection != "callback"):
-        raise ValueError("NEXT_OPEN does not support A18/A19/A20 order slots")
     if not all(a.shape[1] == k for a in (exit_, *levels)):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():

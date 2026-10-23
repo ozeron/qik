@@ -93,3 +93,16 @@ def test_next_open_tags_are_repro() -> None:
     assert result.trades[["entry_i", "exit_i", "entry_px", "exit_px"]].values.tolist() == [
         [1, 2, 101, 102]
     ]
+
+
+def test_market_fill_alias_survives_dataclass_replace() -> None:
+    from dataclasses import replace
+
+    from qik.vector_engine import FillTiming
+
+    rules = replace(Rules(), profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN)
+    assert rules.effective_entry_fill is FillTiming.NEXT_OPEN
+    assert rules.effective_exit_fill is FillTiming.NEXT_OPEN
+    mixed = replace(rules, exit_fill=FillTiming.CLOSE)
+    assert mixed.effective_entry_fill is FillTiming.NEXT_OPEN
+    assert mixed.effective_exit_fill is FillTiming.CLOSE

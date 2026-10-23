@@ -39,7 +39,7 @@ def _bars(n: int = 5) -> Bars:
     )
 
 
-def test_slot_rules_validate_and_next_open_refuses_slots() -> None:
+def test_slot_rules_validate_and_next_open_accepts_slots() -> None:
     for field in (
         "protection",
         "target_order",
@@ -50,10 +50,9 @@ def test_slot_rules_validate_and_next_open_refuses_slots() -> None:
         with pytest.raises(ValueError, match=field):
             Rules(**{field: "unknown"})
     sig = Signals(np.array([1, 0, 0, 0, 0]), np.zeros(5, bool), entry_stop=np.full(5, 101.0))
-    with pytest.raises(ValueError, match="NEXT_OPEN.*order slots"):
-        simulate(
-            _bars(), sig, rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN)
-        )
+    assert simulate(
+        _bars(), sig, rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN)
+    ).trades.empty
     with pytest.raises(ValueError, match="both entry_stop and entry_limit"):
         simulate(_bars(), replace(sig, entry_limit=np.full(5, 99.0)))
     with pytest.raises(ValueError, match="timezone-aware"):
@@ -187,11 +186,16 @@ def test_invalid_core_slot_is_not_silently_dropped() -> None:
 
 
 @pytest.mark.parametrize(
-    "latency,one_tick,oto",
-    [(a, b, c) for a in (0, 1) for b in (False, True) for c in (False, True)],
+    "latency,one_tick,oto,next_open,exit_next_open",
+    [(a, b, c, False, False) for a in (0, 1) for b in (False, True) for c in (False, True)]
+    + [
+        (0, False, c, e, x)
+        for c in (False, True)
+        for e, x in ((True, True), (True, False), (False, True))
+    ],
 )
 def test_slots_kernel_equals_independent_reference_dense(
-    latency: int, one_tick: bool, oto: bool
+    latency: int, one_tick: bool, oto: bool, next_open: bool, exit_next_open: bool
 ) -> None:
     from test_vector_engine import _nan_free
 
@@ -245,6 +249,8 @@ def test_slots_kernel_equals_independent_reference_dense(
             stale_drop=stale,
             chase_after=chase,
             protect_flatten=flatten,
+            next_open=next_open,
+            exit_next_open=exit_next_open,
             latency_bars=latency,
             one_tick=one_tick,
             tick=0.25,
@@ -281,7 +287,7 @@ def test_slots_kernel_equals_independent_reference_dense(
             reenter,
             stale,
             flatten,
-            False,
+            next_open,
             latency,
             one_tick,
             0.25,
@@ -295,6 +301,7 @@ def test_slots_kernel_equals_independent_reference_dense(
             keep,
             ratchet,
             skip,
+            exit_next_open=exit_next_open,
         )
         assert (int(out[2][0]), int(out[3][0])) == (ref.err, ref.err_bar), dict(
             o=o,
@@ -339,5 +346,8 @@ def test_slots_kernel_equals_independent_reference_dense(
             _nan_free(ref.final_stop),
         )
         reasons.update(t.reason for t in ref.trades)
-    assert {K.ERR_NONE, K.ERR_STOP_ENTRY_IN_MARKET, K.ERR_AMEND_REJECTED} <= errors
+    if not (next_open or exit_next_open):
+        assert {K.ERR_NONE, K.ERR_STOP_ENTRY_IN_MARKET, K.ERR_AMEND_REJECTED} <= errors
+    else:
+        assert K.ERR_NEXT_OPEN_SESSION_END in errors
     assert reasons

@@ -212,6 +212,8 @@ def simulate_column_reference(
             entry_stop,
             entry_target,
             entry_limit=entry_limit,
+            next_open=next_open,
+            exit_next_open=exit_next_open,
             stop_pts=stop_pts,
             target_pts=target_pts,
             stop_entry=stop_entry,
@@ -662,6 +664,8 @@ def _simulate_slots_reference(
     stops: np.ndarray,
     targets: np.ndarray,
     *,
+    next_open: bool,
+    exit_next_open: bool,
     entry_limit: np.ndarray | None,
     stop_pts: np.ndarray | None,
     target_pts: np.ndarray | None,
@@ -712,7 +716,17 @@ def _simulate_slots_reference(
     book = _Book()
 
     def send(kind: str, d: int, value: float = math.nan) -> None:
-        queue.append((i + latency, kind, d, value))
+        delay = latency
+        if phase == 1:
+            if kind == "close":
+                delay += int(exit_next_open)
+            elif kind == "cancel":
+                delay += int(exit_next_open if exits[i] else next_open)
+            elif kind in ("submit", "replace", "stop", "target"):
+                delay += int(next_open)
+        if delay and not latency and (i + 1 == len(c) or days[i + 1]):
+            fail(ERR_NEXT_OPEN_SESSION_END)
+        queue.append((i + delay, kind, d, value))
 
     def fail(code: int) -> None:
         nonlocal error
@@ -721,7 +735,7 @@ def _simulate_slots_reference(
 
     def quote(side: int) -> float:
         # +1 is a buy (ask), -1 a sell (bid); the pinned side uses the old position sign.
-        return book.pinned_px if book.pinned_side == -side else float(c[i])
+        return book.pinned_px if book.pinned_side == -side else settlement
 
     def through(side: int, level: float, stop_kind: bool, price: float) -> bool:
         return not math.isnan(level) and (
@@ -786,163 +800,179 @@ def _simulate_slots_reference(
             and (not math.isnan(triggers[pending]) or not math.isnan(limits[pending]))
         ):
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, 0, last_entry, last_price, last_stop)
-        for label, price in _price_points(
-            float(o[i]), float(h[i]), float(lo[i]), float(c[i]), adaptive
-        ):
-            book.update(price)
-            entered = False
-            if pending >= 0 and resting:
-                d, s = pending, int(sides[pending])
-                stop_order = not math.isnan(triggers[d])
-                level = float(triggers[d] if stop_order else limits[d])
-                match = through(s, level, stop_order, price if stop_order else price + s * slip)
-                if match:
-                    px = (
-                        price + s * slip
-                        if slip
-                        else (price if stop_order and label == "O" else level)
-                    )
-                    fill(d, px, price)
-                    entered = True
-            p = position
-            if p is not None and p.live and not entered:
-                out = -p.side
-                if through(out, p.stop, True, price):
-                    px = price + out * slip if slip else (price if label == "O" else p.stop)
-                    close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
-                elif through(out, p.target, False, price if mit else price + out * slip):
-                    px = (
-                        price + out * slip
-                        if slip
-                        else (price if mit and label == "O" else p.target)
-                    )
-                    if not mit and not slip and label in ("H", "L"):
-                        book.pin(p.side, px)
-                    close(px, REASON_TARGET)
-        if position is None and pending < 0:
-            closing = False
-        if (
-            pending >= 0
-            and not math.isnan(limits[pending])
-            and not closing
-            and i == pending + chase
-        ):
-            chasing = True
-            send("cancel", pending)
-        if exits[i]:
-            chasing = False
-            if pending >= 0:
-                send("cancel", pending)
-                # Native OTO cancellation has no V2 late-fill unwind callback.
-                closing = not oto
-            if position is not None and not closing:
-                send("close", position.decision)
-                closing = True
-        elif position is not None:
-            p = position
-            update = float(su[i])
-            if not p.be_done and not math.isnan(ba[p.decision]):
-                reached = (
-                    h[i] >= p.price + ba[p.decision]
-                    if p.side > 0
-                    else lo[i] <= p.price - ba[p.decision]
-                )
-                if reached:
-                    offset = 0.0 if math.isnan(bo[p.decision]) else float(bo[p.decision])
+        for phase in range(2):
+            if phase == 0 and not (next_open or exit_next_open):
+                continue
+            settlement = float(o[i] if phase == 0 else c[i])
+            if phase == 1:
+                for label, price in _price_points(
+                    float(o[i]), float(h[i]), float(lo[i]), float(c[i]), adaptive
+                ):
+                    book.update(price)
+                    entered = False
+                    if pending >= 0 and resting:
+                        d, s = pending, int(sides[pending])
+                        stop_order = not math.isnan(triggers[d])
+                        level = float(triggers[d] if stop_order else limits[d])
+                        match = through(
+                            s, level, stop_order, price if stop_order else price + s * slip
+                        )
+                        if match:
+                            px = (
+                                price + s * slip
+                                if slip
+                                else (price if stop_order and label == "O" else level)
+                            )
+                            fill(d, px, price)
+                            entered = True
+                    p = position
+                    if p is not None and p.live and not entered:
+                        out = -p.side
+                        if through(out, p.stop, True, price):
+                            px = price + out * slip if slip else (price if label == "O" else p.stop)
+                            close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
+                        elif through(out, p.target, False, price if mit else price + out * slip):
+                            px = (
+                                price + out * slip
+                                if slip
+                                else (price if mit and label == "O" else p.target)
+                            )
+                            if not mit and not slip and label in ("H", "L"):
+                                book.pin(p.side, px)
+                            close(px, REASON_TARGET)
+                if position is None and pending < 0:
+                    closing = False
+                if (
+                    pending >= 0
+                    and not math.isnan(limits[pending])
+                    and not closing
+                    and i == pending + chase
+                ):
+                    chasing = True
+                    send("cancel", pending)
+                if exits[i]:
+                    chasing = False
+                    if pending >= 0:
+                        send("cancel", pending)
+                        # Native OTO cancellation has no V2 late-fill unwind callback.
+                        closing = not oto
+                    if position is not None and not closing:
+                        send("close", position.decision)
+                        closing = True
+                elif position is not None:
+                    p = position
+                    update = float(su[i])
+                    if not p.be_done and not math.isnan(ba[p.decision]):
+                        reached = (
+                            h[i] >= p.price + ba[p.decision]
+                            if p.side > 0
+                            else lo[i] <= p.price - ba[p.decision]
+                        )
+                        if reached:
+                            offset = 0.0 if math.isnan(bo[p.decision]) else float(bo[p.decision])
+                            if not math.isnan(update):
+                                fail(
+                                    ERR_AMEND_REJECTED
+                                )  # ambiguous two modifications of one slot on one close
+                            update = p.price + p.side * offset
+                            p.be_done = True
                     if not math.isnan(update):
-                        fail(
-                            ERR_AMEND_REJECTED
-                        )  # ambiguous two modifications of one slot on one close
-                    update = p.price + p.side * offset
-                    p.be_done = True
-            if not math.isnan(update):
-                bound = p.stop
-                for _, kind, d, value in queue:
-                    if kind == "stop" and d == p.decision and p.side * (value - bound) > 0:
-                        bound = value
-                if math.isnan(p.stop):
-                    fail(ERR_AMEND_NO_ORDER)
-                elif not ratchet or p.side * (update - bound) > 0:
-                    send("stop", p.decision, update)
-            if not math.isnan(tu[i]):
-                if math.isnan(p.target):
-                    fail(ERR_AMEND_NO_ORDER)
-                else:
-                    send("target", p.decision, float(tu[i]))
-        if (
-            position is None
-            and pending >= 0
-            and not math.isnan(triggers[pending])
-            and sides[i]
-            and not exits[i]
-        ):
-            if latency:
-                return RefColumn(
-                    trades, ERR_STOP_REPLACE_LATENCY, i, 0, last_entry, last_price, last_stop
-                )
-            send("cancel", pending)
-            send("replace", i)
-        elif (
-            position is None
-            and pending < 0
-            and not busy
-            and not closing
-            and sides[i]
-            and (reenter or not exited)
-        ):
-            pending = i
-            send("submit", i)
-        while queue and queue[0][0] <= i and not error:
-            _, kind, d, value = queue.pop(0)
-            if kind == "replace":
-                if position is not None or pending >= 0:
-                    continue
-                pending = d
-                kind = "submit"
-            if kind == "submit" and pending == d:
-                s = int(sides[d])
-                if not math.isnan(triggers[d]):
-                    if through(s, float(triggers[d]), True, quote(s)):
-                        if stop_skip:
-                            pending, resting = -1, False
+                        bound = p.stop
+                        for _, kind, d, value in queue:
+                            if kind == "stop" and d == p.decision and p.side * (value - bound) > 0:
+                                bound = value
+                        if math.isnan(p.stop):
+                            fail(ERR_AMEND_NO_ORDER)
+                        elif not ratchet or p.side * (update - bound) > 0:
+                            send("stop", p.decision, update)
+                    if not math.isnan(tu[i]):
+                        if math.isnan(p.target):
+                            fail(ERR_AMEND_NO_ORDER)
                         else:
-                            fail(ERR_STOP_ENTRY_IN_MARKET)
+                            send("target", p.decision, float(tu[i]))
+                if (
+                    position is None
+                    and pending >= 0
+                    and not math.isnan(triggers[pending])
+                    and sides[i]
+                    and not exits[i]
+                ):
+                    if latency:
+                        return RefColumn(
+                            trades,
+                            ERR_STOP_REPLACE_LATENCY,
+                            i,
+                            0,
+                            last_entry,
+                            last_price,
+                            last_stop,
+                        )
+                    send("cancel", pending)
+                    send("replace", i)
+                elif (
+                    position is None
+                    and pending < 0
+                    and not busy
+                    and not closing
+                    and sides[i]
+                    and (reenter or not exited)
+                ):
+                    pending = i
+                    send("submit", i)
+            while queue and queue[0][0] <= i and not error:
+                _, kind, d, value = queue.pop(0)
+                if kind == "replace":
+                    if position is not None or pending >= 0:
+                        continue
+                    pending = d
+                    kind = "submit"
+                if kind == "submit" and pending == d:
+                    s = int(sides[d])
+                    if not math.isnan(triggers[d]):
+                        if not (phase == 0 and next_open) and through(
+                            s, float(triggers[d]), True, quote(s)
+                        ):
+                            if stop_skip:
+                                pending, resting = -1, False
+                            else:
+                                fail(ERR_STOP_ENTRY_IN_MARKET)
+                        else:
+                            resting = True
+                    elif math.isnan(limits[d]) or through(
+                        s, float(limits[d]), False, settlement + s * slip
+                    ):
+                        fill(d, settlement + s * slip, quote(-s))
                     else:
                         resting = True
-                elif math.isnan(limits[d]) or through(
-                    s, float(limits[d]), False, float(c[i]) + s * slip
-                ):
-                    fill(d, float(c[i]) + s * slip, quote(-s))
-                else:
-                    resting = True
-            elif kind == "cancel" and pending == d:
-                pending, resting = -1, False
-                if chasing:
-                    pending = d
-                    send("chase", d)
-            elif kind == "chase" and pending == d:
-                fill(d, float(c[i]) + int(sides[d]) * slip, quote(-int(sides[d])), chased=True)
-            elif position is not None and position.decision == d:
-                p = position
-                q = quote(-p.side)
-                if kind == "protect":
-                    activate(q, False)
-                elif kind in ("close", "close_fail"):
-                    close(
-                        q - p.side * slip, REASON_SIGNAL if kind == "close" else REASON_PROTECT_FAIL
-                    )
-                elif kind in ("stop", "target"):
-                    is_stop = kind == "stop"
-                    invalid = through(-p.side, value, is_stop, q)
-                    if invalid and (is_stop or mit):
-                        if not amend_keep:
-                            fail(ERR_AMEND_REJECTED)
-                    elif is_stop:
-                        p.stop = value
-                    else:
-                        p.target = value
-                        if invalid:
-                            close(q - p.side * slip, REASON_TARGET)
+                elif kind == "cancel" and pending == d:
+                    pending, resting = -1, False
+                    if chasing:
+                        pending = d
+                        send("chase", d)
+                elif kind == "chase" and pending == d:
+                    fill(d, settlement + int(sides[d]) * slip, quote(-int(sides[d])), chased=True)
+                elif position is not None and position.decision == d:
+                    p = position
+                    q = quote(-p.side)
+                    if kind == "protect":
+                        activate(q, False)
+                    elif kind in ("close", "close_fail"):
+                        close(
+                            q - p.side * slip,
+                            REASON_SIGNAL if kind == "close" else REASON_PROTECT_FAIL,
+                        )
+                    elif kind in ("stop", "target"):
+                        is_stop = kind == "stop"
+                        invalid = through(-p.side, value, is_stop, q)
+                        if invalid and (is_stop or mit):
+                            if not amend_keep:
+                                fail(ERR_AMEND_REJECTED)
+                        elif is_stop:
+                            p.stop = value
+                        else:
+                            p.target = value
+                            if invalid:
+                                close(q - p.side * slip, REASON_TARGET)
         if error:
             p = position
             return RefColumn(
