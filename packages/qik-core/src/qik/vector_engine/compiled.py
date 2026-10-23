@@ -393,7 +393,11 @@ def _run_arrays(
         float,
     )
     pv = instrument.point_value if instrument else 1.0
-    friction = 2 * (costs.commission_per_side + costs.slippage_ticks * tick * pv) if costs else 0.0
+    from .account import fixed_cost
+
+    friction = (
+        fixed_cost(costs.commission_per_side, costs.slippage_ticks, tick, pv) if costs else 0.0
+    )
     economic = np.array(
         [
             pv,
@@ -666,9 +670,12 @@ def _bound(step: Any) -> Any:
 def _python_runner(module: Any) -> Callable[..., Any]:
     # Rebind every shared helper in a private namespace. No dispatcher or global
     # config is mutated: jit=False and JIT runs can coexist in one process.
+    from . import account, protection
     from . import sizing as sizing_module
 
-    namespace = dict(vars(sizing_module))
+    namespace = dict(vars(account))
+    namespace.update(vars(protection))
+    namespace.update(vars(sizing_module))
     namespace.update(vars(K))
     namespace.update(vars(module))
     originals = {name: getattr(value, "py_func", value) for name, value in namespace.items()}
@@ -679,6 +686,8 @@ def _python_runner(module: Any) -> Callable[..., Any]:
             K.__name__,
             module.__name__,
             sizing_module.__name__,
+            account.__name__,
+            protection.__name__,
         ):
             namespace[name] = FunctionType(
                 value.__code__, namespace, value.__name__, value.__defaults__, value.__closure__

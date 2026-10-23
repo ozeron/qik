@@ -18,16 +18,23 @@ import numba as nb
 import numpy as np
 
 from ._checks import is_int
+from .account import (
+    ERR_NO_STOP as ERR_NO_STOP,
+)
+from .account import (
+    ERR_NONE,
+    MODE_CONTRACTS,
+    MODE_RISK_FRACTION,
+    MODE_RISK_USD,
+)
+from .account import (
+    ERR_ZERO as ERR_ZERO,
+)
+from .account import (
+    quantity as _contracts_for,
+)
 
 __all__ = ["Sizing"]
-
-MODE_CONTRACTS = 0
-MODE_RISK_USD = 1
-MODE_RISK_FRACTION = 2
-
-ERR_NONE = 0
-ERR_ZERO = 1
-ERR_NO_STOP = 2
 
 
 @dataclass(frozen=True)
@@ -94,33 +101,6 @@ class Sizing[Quantity: int | float = int]:
     @property
     def cap(self) -> float:
         return float(self.max_contracts) if self.max_contracts is not None else 0
-
-
-@nb.njit(cache=True)
-def _contracts_for(
-    mode: int,
-    amount: float,
-    cap: float,
-    equity: float,
-    risk_per_contract: float,
-    lot_step: float = 1.0,
-    min_qty: float = 1.0,
-) -> float:
-    """Contracts for one entry, or a negative error code."""
-
-    if mode == MODE_CONTRACTS:
-        return amount
-    if not (risk_per_contract > 0.0):  # NaN stop
-        return float(-ERR_NO_STOP)
-    budget = amount if mode == MODE_RISK_USD else amount * equity
-    if not (budget > 0.0):
-        return float(-ERR_ZERO)
-    n = np.floor(budget / risk_per_contract / lot_step + 1e-9) * lot_step
-    if cap > 0 and n > cap:
-        n = cap
-    if n < min_qty - 1e-10:
-        return float(-ERR_ZERO)
-    return n
 
 
 @nb.njit(cache=True)

@@ -121,7 +121,10 @@ def _round_level(price: float, tick: float, mode: int, direction: int) -> float:
     if mode == 1:
         units = math.floor(units + 0.5)
     elif direction > 0:
-        units = math.ceil(units - 1e-10)
+        shifted = units - 1e-10
+        rounded = math.ceil(shifted)
+        # math.ceil returns int; retain the signed zero of the existing numeric policy.
+        units = math.copysign(0.0, shifted) if rounded == 0 else rounded
     else:
         units = math.floor(units + 1e-10)
     return units * tick
@@ -1266,3 +1269,55 @@ def _simulate_slots_reference(
     return RefColumn(
         trades, ERR_NONE, -1, 0 if p is None else p.side, last_entry, last_price, last_stop
     )
+
+
+# Independent economics oracle. No compiled account/protection imports belong here.
+def quantity_reference(
+    mode: int,
+    amount: float,
+    cap: float,
+    equity: float,
+    risk_per_contract: float,
+    lot_step: float = 1.0,
+    min_qty: float = 1.0,
+) -> float:
+    """Reference quantity, including the established negative refusal codes."""
+    if mode == 0:
+        return amount
+    if math.isnan(risk_per_contract) or risk_per_contract <= 0:
+        return -2.0
+    budget = amount
+    if mode != 1:
+        budget *= equity
+    if math.isnan(budget) or budget <= 0:
+        return -1.0
+    units = budget / risk_per_contract / lot_step + 1e-9
+    rounded = math.floor(units) if math.isfinite(units) else units
+    quantity = rounded * lot_step
+    if cap > 0:
+        quantity = min(quantity, cap)
+    return -1.0 if quantity < min_qty - 1e-10 else quantity
+
+
+def fixed_cost_reference(
+    commission: float, slippage: float, tick: float, point_value: float
+) -> float:
+    """Reference fixed round-trip friction, in the historical arithmetic order."""
+    slipped = slippage * tick
+    slipped *= point_value
+    return (commission + slipped) * 2.0
+
+
+def fill_cost_reference(entry: float, exit: float, point_value: float, bps: float) -> float:
+    """Reference proportional round-trip friction."""
+    notional = (abs(entry) + abs(exit)) * point_value
+    return notional * bps / 10000
+
+
+def settle_reference(
+    gross_points: float, point_value: float, friction: float, proportional: float
+) -> float:
+    """Reference net per unit, keeping both cost subtractions separate."""
+    gross = gross_points * point_value
+    after_fixed = gross - friction
+    return after_fixed - proportional

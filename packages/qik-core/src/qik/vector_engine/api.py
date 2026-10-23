@@ -25,6 +25,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 
+from . import account as A
 from . import kernel as K
 from . import sizing as S
 from ._checks import is_int
@@ -758,16 +759,18 @@ def _simulate(
     )
     if instrument is not None and costs is not None:
         c = costs
-        per_contract_cost = 2.0 * (
-            c.commission_per_side + c.slippage_ticks * instrument.tick * instrument.point_value
+        per_contract_cost = A.fixed_cost(
+            c.commission_per_side, c.slippage_ticks, instrument.tick, instrument.point_value
         )
-        proportional = (
-            (np.abs(e_px) + np.abs(x_px)) * instrument.point_value * c.proportional_bps / 10_000
-        )
-        net_1 = (
-            trades["gross_points"].to_numpy() * instrument.point_value
-            - per_contract_cost
-            - proportional
+        proportional = A.fill_cost(e_px, x_px, instrument.point_value, c.proportional_bps)
+        net_1 = cast(
+            np.ndarray,
+            A.settle(
+                trades["gross_points"].to_numpy(),
+                instrument.point_value,
+                per_contract_cost,
+                proportional,
+            ),
         )
         contracts = np.ones(len(trades), np.int64)
         open_contracts = np.ones(len(open_positions), np.int64)

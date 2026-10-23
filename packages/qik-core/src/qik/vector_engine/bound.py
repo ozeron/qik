@@ -14,7 +14,7 @@ import textwrap
 from pathlib import Path
 from typing import Any, cast
 
-from . import compiled, kernel
+from . import account, compiled, kernel, protection
 
 
 def write_bound_module(
@@ -138,7 +138,10 @@ def write_bound_module(
     functions.append(runner)
     strategy = importlib.import_module(strategy_module)
     fingerprint = hashlib.sha256(
-        "\n".join(inspect.getsource(module) for module in (kernel, compiled, strategy)).encode()
+        "\n".join(
+            inspect.getsource(module)
+            for module in (kernel, compiled, protection, account, strategy)
+        ).encode()
     ).hexdigest()
     imports = ", ".join(
         sorted(

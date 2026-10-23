@@ -15,19 +15,27 @@ import numba as nb
 import numpy as np
 from numba.extending import overload
 
-from .sizing import _contracts_for
+from .account import fill_cost, settle
+from .account import quantity as _contracts_for
+from .protection import (
+    ERR_NONE,
+    ERR_PROTECT_REJECTED,
+    REASON_PROTECT_FAIL,
+    REASON_TARGET,
+    _anchor,
+    _fill_then_protect,
+    _in_market,
+    _round_price,
+    levels,
+)
 
 REASON_SIGNAL = 1  # market exit at the decision close (R1: the next open)
 REASON_STOP = 2  # resting stop-market hit during a bar, filled at the stop level
-REASON_TARGET = 3  # resting limit hit during a bar, filled at the limit level
 REASON_STOP_GAP = 4  # resting stop already through at the bar's open, filled at the open
-REASON_PROTECT_FAIL = 5  # limit-then-market entry's stop rejected; V2 flattens at that close
 
-ERR_NONE = 0
 ERR_STOP_IN_MARKET = 1  # stop level not strictly beyond the entry close (Nautilus rejects it)
 ERR_TARGET_IN_MARKET = 2  # target level not strictly beyond the entry close (would fill at once)
 ERR_STALE_BOOK = 3  # new stop falls inside the stale quote a same-bar limit fill left (A13)
-ERR_PROTECT_REJECTED = 4  # limit-then-market entry's stop at or through its fill bar's close (A15)
 ERR_PENDING_NEW_DAY = 5  # a limit entry still working when the New York date changes (A15)
 ERR_NEXT_OPEN_SESSION_END = 6  # R1 decision has no following bar on the same New York date
 ERR_STOP_ENTRY_IN_MARKET = 7
@@ -66,24 +74,6 @@ def _no_reversal(o, e1, e2, c, m, pos):
 
 
 @nb.njit(cache=True, nogil=True)
-def _level(side, anchor, level, pts, sign, tick=0.0, rounding=0):
-    """A level as given, or ``pts`` points from ``anchor`` (``sign`` +1 target side, -1 stop side)."""
-
-    value = level if np.isnan(pts) else anchor + sign * side * pts
-    return _round_price(value, tick, rounding, sign * side)
-
-
-@nb.njit(cache=True, nogil=True)
-def _round_price(value, tick, rounding, direction):
-    if rounding == 0 or np.isnan(value):
-        return value
-    steps = value / tick
-    if rounding == 1:
-        return np.floor(steps + 0.5) * tick
-    return (np.ceil(steps - 1e-10) if direction > 0 else np.floor(steps + 1e-10)) * tick
-
-
-@nb.njit(cache=True, nogil=True)
 def _force_for(mask, side):
     return bool(mask & 1) or (side > 0 and bool(mask & 2)) or (side < 0 and bool(mask & 4))
 
@@ -91,54 +81,6 @@ def _force_for(mask, side):
 @nb.njit(cache=True, nogil=True)
 def _exit_for(global_exit, long_exit, short_exit, side):
     return global_exit or (side > 0 and long_exit) or (side < 0 and short_exit)
-
-
-@nb.njit(cache=True, nogil=True)
-def _anchor(mode, decision, fill, legacy):
-    if mode == 1:
-        return decision
-    return fill if mode == 2 else legacy
-
-
-@nb.njit(cache=True, nogil=True)
-def _in_market(side, level, close, is_stop):
-    """A stop at or through ``close``, or a limit target at or through it (A10 / A11)."""
-
-    if np.isnan(level):
-        return False
-    if is_stop:
-        return level >= close if side > 0 else level <= close
-    return level <= close if side > 0 else level >= close
-
-
-@nb.njit(cache=True, nogil=True)
-def _fill_then_protect(
-    s, i, fill_px, st, tg, ci, protect_flatten, count_only,
-    out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px, out_reason, out_stop, k,
-):  # fmt: skip
-    """V2 pattern (A15): an entry filled at ``fill_px`` whose protection meets the close ``ci``.
-
-    A stop at or through the close is rejected (refused, or V2's flatten at the close); a target at
-    or through it fills at the close. Returns ``(err, reason)``: reason 0 = position opened, else
-    the reason of the same-bar trade written at row ``k``.
-    """
-
-    reason = 0
-    if _in_market(s, st, ci, True):
-        if not protect_flatten:
-            return ERR_PROTECT_REJECTED, 0
-        reason = REASON_PROTECT_FAIL
-    elif _in_market(s, tg, ci, False):
-        reason = REASON_TARGET
-    if reason != 0 and not count_only:
-        out_entry_i[k] = i
-        out_exit_i[k] = i
-        out_side[k] = s
-        out_entry_px[k] = fill_px
-        out_exit_px[k] = ci
-        out_reason[k] = reason
-        out_stop[k] = st
-    return ERR_NONE, reason
 
 
 @nb.njit(cache=True, nogil=True)
@@ -413,21 +355,13 @@ def _venue_column_advance(state, i, inputs, core=None):
                         px = candidate
                         break
             pos, ei, ep, gen = s, i, px, d
-            stop = _level(
+            stop, target = levels(
                 s,
                 _anchor(bracket_anchor, c[d], px, entry_limit[d]),
                 entry_stop[d],
-                stop_pts[d],
-                -1.0,
-                round_tick,
-                tick_round,
-            )
-            target = _level(
-                s,
-                _anchor(bracket_anchor, c[d], px, entry_limit[d]),
                 entry_target[d],
+                stop_pts[d],
                 target_pts[d],
-                1.0,
                 round_tick,
                 tick_round,
             )
@@ -651,9 +585,15 @@ def _venue_column_advance(state, i, inputs, core=None):
             if kind == 1 or (s > 0 and px <= entry_limit[d]) or (s < 0 and px >= entry_limit[d]):
                 anchor = _anchor(bracket_anchor, c[d], px, px if kind == 1 else entry_limit[d])
                 pos, ei, ep, gen = s, i, px, d
-                stop = _level(s, anchor, entry_stop[d], stop_pts[d], -1.0, round_tick, tick_round)
-                target = _level(
-                    s, anchor, entry_target[d], target_pts[d], 1.0, round_tick, tick_round
+                stop, target = levels(
+                    s,
+                    anchor,
+                    entry_stop[d],
+                    entry_target[d],
+                    stop_pts[d],
+                    target_pts[d],
+                    round_tick,
+                    tick_round,
                 )
                 pending, resting, chasing = -1, False, False
                 rejected_stop = False
@@ -1062,21 +1002,13 @@ def _column_advance(state, i, inputs, core=None):
     if market_entry >= 0:
         d = market_entry
         s = side_sig[d]
-        st = _level(
+        st, tg = levels(
             s,
             _anchor(bracket_anchor, c[d], o[i], o[i]),
             entry_stop[d],
-            stop_pts[d],
-            -1.0,
-            round_tick,
-            tick_round,
-        )
-        tg = _level(
-            s,
-            _anchor(bracket_anchor, c[d], o[i], o[i]),
             entry_target[d],
+            stop_pts[d],
             target_pts[d],
-            1.0,
             round_tick,
             tick_round,
         )
@@ -1174,21 +1106,13 @@ def _column_advance(state, i, inputs, core=None):
             # same bar flattens instead, and V2's flatten clears the chase)
             pend = 0
             px = p_lim if filled else ci
-            st = _level(
+            st, tg = levels(
                 s,
                 _anchor(bracket_anchor, c[p_chase - chase], px, px),
                 p_st,
-                p_stp,
-                -1.0,
-                round_tick,
-                tick_round,
-            )
-            tg = _level(
-                s,
-                _anchor(bracket_anchor, c[p_chase - chase], px, px),
                 p_tg,
+                p_stp,
                 p_tgp,
-                1.0,
                 round_tick,
                 tick_round,
             )
@@ -1580,21 +1504,13 @@ def _column_advance(state, i, inputs, core=None):
             # ltm_bracket, 100+ such entries, all equal to Nautilus).
             if (s > 0 and lim >= ci) or (s < 0 and lim <= ci):
                 # marketable: fills at the close (A11); V2 anchors point levels to the limit
-                st = _level(
+                st, tg = levels(
                     s,
                     _anchor(bracket_anchor, ci, ci, lim),
                     entry_stop[i],
-                    stop_pts[i],
-                    -1.0,
-                    round_tick,
-                    tick_round,
-                )
-                tg = _level(
-                    s,
-                    _anchor(bracket_anchor, ci, ci, lim),
                     entry_target[i],
+                    stop_pts[i],
                     target_pts[i],
-                    1.0,
                     round_tick,
                     tick_round,
                 )
@@ -1663,8 +1579,16 @@ def _column_advance(state, i, inputs, core=None):
                 ERR_NONE,
                 -1,
             )
-        st = _level(s, ci, entry_stop[i], stop_pts[i], -1.0, round_tick, tick_round)
-        tg = _level(s, ci, entry_target[i], target_pts[i], 1.0, round_tick, tick_round)
+        st, tg = levels(
+            s,
+            ci,
+            entry_stop[i],
+            entry_target[i],
+            stop_pts[i],
+            target_pts[i],
+            round_tick,
+            tick_round,
+        )
         if _in_market(s, st, ci, True):
             return (
                 ColumnState(
@@ -2283,8 +2207,9 @@ def _slots_column_advance(state, i, inputs, core=None):
                             px,
                             limits[d] if not np.isnan(limits[d]) else px,
                         )
-                        stop = _level(s, anchor, stops[d], sp[d], -1.0, round_tick, tick_round)
-                        target = _level(s, anchor, targets[d], tp[d], 1.0, round_tick, tick_round)
+                        stop, target = levels(
+                            s, anchor, stops[d], targets[d], sp[d], tp[d], round_tick, tick_round
+                        )
                         pos, ei, ep, gen, risk_stop = s, i, px, d, stop
                         be_done = False
                         pending, resting, chasing = -1, False, False
@@ -2639,8 +2564,9 @@ def _slots_column_advance(state, i, inputs, core=None):
                 s, px, anchor = 0, 0.0, 0.0
             if s:
                 pos, ei, ep, gen = s, i, px, d
-                stop = _level(s, anchor, stops[d], sp[d], -1.0, round_tick, tick_round)
-                target = _level(s, anchor, targets[d], tp[d], 1.0, round_tick, tick_round)
+                stop, target = levels(
+                    s, anchor, stops[d], targets[d], sp[d], tp[d], round_tick, tick_round
+                )
                 risk_stop, be_done = stop, False
                 pending, resting, chasing, live = -1, False, False, False
                 if oto:
@@ -2833,10 +2759,11 @@ def _core_decision(
         qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum)
         if qty < 0:
             raise ValueError("compiled core: entry sizing refused")
-        net = (
-            out_sd[k] * (out_xp[k] - out_ep[k]) * pv
-            - friction
-            - (abs(out_ep[k]) + abs(out_xp[k])) * pv * bps / 10000
+        net = settle(
+            out_sd[k] * (out_xp[k] - out_ep[k]),
+            pv,
+            friction,
+            fill_cost(out_ep[k], out_xp[k], pv, bps),
         )
         core.account[1] += qty * net
         core.position_view[V_LAST_EXIT_I] = out_xi[k]
