@@ -15,8 +15,9 @@ non-finite prices, inconsistent OHLC) raise ``ValueError`` naming the config and
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import date
 from enum import StrEnum
 from typing import Any, Literal
@@ -61,11 +62,18 @@ REASON_NAMES = {
 class Profile(StrEnum):
     NAUTILUS = "nautilus"
     TRADINGVIEW = "tradingview"
+    REPRO = "repro"
 
 
 class Compliance(StrEnum):
     NAUTILUS = "nautilus"
     REPRO_TRADINGVIEW = "repro:tradingview"
+
+
+class _ReproCompliance(str):
+    @property
+    def value(self) -> str:
+        return str(self)
 
 
 class FillModel(StrEnum):
@@ -125,7 +133,7 @@ class Rules:
     ``"nautilus"`` reproduces Nautilus: entry fills, stop rejected, linked target cancelled, the
     position runs with no levels. The second is a venue-simulation artifact, not market behaviour.
 
-    NEXT_OPEN is available only under Profile.TRADINGVIEW, for external-author reproduction;
+    NEXT_OPEN is available under Profile.TRADINGVIEW or Profile.REPRO for author reproduction;
     it requires timezone-aware Bars.index and excludes limit-then-market entries.
     ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
     changes venue liquidity and needs Instrument.tick. Neither combines with NEXT_OPEN.
@@ -138,11 +146,12 @@ class Rules:
     # a limit entry's stop at or through its fill bar's close: "error", or "flatten" as V2 does
     protect_rejected: Literal["error", "flatten"] = "error"
     profile: Profile = Profile.NAUTILUS
+    author_platform: str = field(default="tradingview", kw_only=True)
     market_fill: MarketFill = MarketFill.CLOSE
-    entry_fill: FillTiming | None = None
-    exit_fill: FillTiming | None = None
-    bracket_policy: BracketPolicy = BracketPolicy.STOP_FIRST
-    bracket_anchor: BracketAnchor | None = None
+    entry_fill: FillTiming | None = field(default=None, kw_only=True)
+    exit_fill: FillTiming | None = field(default=None, kw_only=True)
+    bracket_policy: BracketPolicy = field(default=BracketPolicy.STOP_FIRST, kw_only=True)
+    bracket_anchor: BracketAnchor | None = field(default=None, kw_only=True)
     latency_bars: Literal[0, 1] = 0
     fill_model: FillModel = FillModel.DEFAULT
     protection: Literal["callback", "oto"] = "callback"
@@ -152,6 +161,15 @@ class Rules:
     stop_entry_in_market: Literal["error", "skip"] = "error"
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.author_platform, str)
+            or re.fullmatch(r"[a-z][a-z0-9_-]*", self.author_platform) is None
+        ):
+            raise ValueError("author_platform must be a nonempty lowercase platform identifier")
+        if self.profile is not Profile.REPRO and self.author_platform != "tradingview":
+            raise ValueError(
+                "custom author_platform requires Profile.REPRO; TRADINGVIEW is its preset"
+            )
         for name in ("entry_fill", "exit_fill"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, FillTiming):
@@ -184,8 +202,13 @@ class Rules:
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
             raise ValueError(f"market_fill must be a MarketFill enum, got {self.market_fill!r}")
-        if next_open and self.profile is not Profile.TRADINGVIEW:
-            raise ValueError("MarketFill.NEXT_OPEN requires Profile.TRADINGVIEW (repro only)")
+        if (next_open or self.market_fill is MarketFill.NEXT_OPEN) and self.profile not in (
+            Profile.TRADINGVIEW,
+            Profile.REPRO,
+        ):
+            raise ValueError(
+                "MarketFill.NEXT_OPEN requires Profile.TRADINGVIEW or Profile.REPRO (repro only)"
+            )
         if self.stale_book not in ("error", "nautilus"):
             raise ValueError(f"stale_book must be 'error' or 'nautilus', got {self.stale_book!r}")
         if self.protect_rejected not in ("error", "flatten"):
@@ -309,7 +332,7 @@ class Result:
     n_configs: int
     index: pd.DatetimeIndex | None = None  # the bars' timestamps
     initial_cash: float | None = None
-    compliance: Compliance = Compliance.NAUTILUS
+    compliance: Compliance | _ReproCompliance = Compliance.NAUTILUS
     research_only: bool = False
 
     @property
@@ -578,9 +601,13 @@ def simulate(
                     f"raise initial_cash or size smaller"
                 )
         open_positions["contracts"] = open_contracts
-    compliance = (
-        Compliance.NAUTILUS if rules.profile is Profile.NAUTILUS else Compliance.REPRO_TRADINGVIEW
-    )
+    compliance: Compliance | _ReproCompliance
+    if rules.profile is Profile.NAUTILUS:
+        compliance = Compliance.NAUTILUS
+    elif rules.author_platform == "tradingview":
+        compliance = Compliance.REPRO_TRADINGVIEW
+    else:
+        compliance = _ReproCompliance(f"repro:{rules.author_platform}")
     return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, slots)
 
 

@@ -121,3 +121,79 @@ def test_repro_bracket_rules_refuse_nautilus() -> None:
         Rules(profile=Profile.TRADINGVIEW, **values)
     with pytest.raises(ValueError, match="BracketPolicy"):
         Rules(profile=Profile.TRADINGVIEW, bracket_policy="target_first")
+
+
+@pytest.mark.parametrize("platform", ["tradingview", "nt8", "mt5", "custom_author"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_generic_repro_tags_and_boundary(platform: str, empty: bool) -> None:
+    from qik.vector_engine import BracketAnchor, BracketPolicy, FillTiming
+
+    bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
+    result = simulate(
+        bars,
+        Signals(np.array([0 if empty else 1, 0, 0]), np.array([False, True, False])),
+        rules=Rules(
+            profile=Profile.REPRO,
+            author_platform=platform,
+            entry_fill=FillTiming.NEXT_OPEN,
+            exit_fill=FillTiming.CLOSE,
+            bracket_policy=BracketPolicy.ADVERSE_FIRST,
+            bracket_anchor=BracketAnchor.FILL,
+        ),
+        instrument=Instrument(1, 1),
+        costs=Costs(),
+        initial_cash=1000,
+    )
+    assert result.compliance == f"repro:{platform}"
+    assert result.compliance.value == f"repro:{platform}"
+    assert result.summary().compliance.tolist() == [f"repro:{platform}"]
+    assert not result.deployable
+    with pytest.raises(ValueError, match=f"repro:{platform}"):
+        require_nautilus(result)
+
+
+@pytest.mark.parametrize("platform", ["", "NT8", "white space", "nt8:live", None, 1])
+def test_invalid_platform_is_refused(platform: object) -> None:
+    with pytest.raises(ValueError, match="author_platform"):
+        Rules(profile=Profile.REPRO, author_platform=platform)
+
+
+def test_custom_platform_requires_generic_repro() -> None:
+    for profile in (Profile.NAUTILUS, Profile.TRADINGVIEW):
+        with pytest.raises(ValueError, match="Profile.REPRO"):
+            Rules(profile=profile, author_platform="nt8")
+
+
+def test_legacy_rules_positional_arguments_are_unchanged() -> None:
+    from qik.vector_engine import FillModel
+
+    rules = Rules(
+        False,
+        True,
+        "error",
+        1,
+        "error",
+        Profile.TRADINGVIEW,
+        MarketFill.NEXT_OPEN,
+        0,
+        FillModel.DEFAULT,
+        "callback",
+        "limit",
+        "error",
+        "any",
+        "error",
+    )
+    assert rules.market_fill is MarketFill.NEXT_OPEN
+    assert rules.effective_entry_fill is MarketFill.NEXT_OPEN
+    assert rules.latency_bars == 0
+
+
+def test_nautilus_refuses_nondefault_alias_even_if_both_clocks_override_it() -> None:
+    from qik.vector_engine import FillTiming
+
+    with pytest.raises(ValueError, match="repro only"):
+        Rules(
+            market_fill=MarketFill.NEXT_OPEN,
+            entry_fill=FillTiming.CLOSE,
+            exit_fill=FillTiming.CLOSE,
+        )
