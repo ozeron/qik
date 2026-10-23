@@ -71,3 +71,15 @@ def test_exact_float_and_large_integer_evidence_is_lossless(tmp_path: Path) -> N
     c = pd.DataFrame({"value": [2**60]})
     d = pd.DataFrame({"value": [2**60 + 1]})
     assert diff_fields(c, d, fields=["value"], tol=0).changed_rows == 1
+
+
+@pytest.mark.parametrize("other", [[], [None], [float("inf")]])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_nonfinite_cells_are_refused_even_without_known_counterpart(
+    other: list, reverse: bool
+) -> None:
+    a = pd.DataFrame({"px": [float("inf")]})
+    b = pd.DataFrame({"px": other})
+    old, new = (b, a) if reverse else (a, b)
+    with pytest.raises(ValueError, match="nonfinite"):
+        diff_fields(old, new, fields=["px"], tol=0)

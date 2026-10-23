@@ -76,6 +76,11 @@ def diff_fields(
     for frame in (old, new):
         if not frame.columns.is_unique or set(names) - set(frame):
             raise ValueError("missing or duplicate comparison fields")
+        for name in names:
+            for i, value in enumerate(frame[name]):
+                if isinstance(value, (int, float, np.number)) and not pd.isna(value):
+                    if not np.isfinite(value):
+                        raise ValueError(f"nonfinite comparison value at row {i}, field {name}")
     a, b = old.reset_index(drop=True), new.reset_index(drop=True)
     changes: list[dict[str, Any]] = []
     changed: set[int] = set()
