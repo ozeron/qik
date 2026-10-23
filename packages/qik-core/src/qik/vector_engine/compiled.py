@@ -49,9 +49,12 @@ from .api import (
 from .api import (
     Result as EngineResult,
 )
-from .schema import Features, State, StrategySpec
+from .core import Core
+from .schema import Features, Params, Scalar, State, StrategySpec
 from .types import Bar, Decision
 from .types import Position as AuthorPosition
+
+_legacy_warning_sites: set[tuple[str, int]] = set()
 
 
 def _initial_core_state(init_state: Any, cores: Any, j: int | np.integer[Any]) -> Any:
@@ -687,7 +690,7 @@ def _record_run(
     step: Any,
     bars: Bars,
     *,
-    grid: Mapping[str, Sequence[Any]] | None,
+    grid: Mapping[str, Sequence[Scalar]] | None,
     features: Features | Mapping[str, np.ndarray] | None,
     jit: bool,
     _capture_signals: list[Signals] | None = None,
@@ -759,8 +762,8 @@ def _record_run(
 
 
 @typing_overload
-def run[S: State](
-    step: Callable[[S, Any, Any, Bar, AuthorPosition], Decision],
+def run[S: State, P: Params, F: Features](
+    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
     bars: Bars,
     *,
     grid: None = None,
@@ -777,11 +780,11 @@ def run[S: State](
 
 
 @typing_overload
-def run[S: State](
-    step: Callable[[S, Any, Any, Bar, AuthorPosition], Decision],
+def run[S: State, P: Params, F: Features](
+    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
     bars: Bars,
     *,
-    grid: Mapping[str, Sequence[Any]],
+    grid: Mapping[str, Sequence[Scalar]],
     features: Features | Mapping[str, np.ndarray] | None = None,
     rules: Rules = NAUTILUS,
     instrument: Instrument | None = None,
@@ -795,14 +798,11 @@ def run[S: State](
 
 
 @typing_overload
-def run(step: Any, bars: Bars, **kwargs: Any) -> Any: ...
-
-
-def run(
-    step: Any,
+def run[S: State, P: Params, F: Features](
+    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
     bars: Bars,
     *,
-    grid: Mapping[str, Sequence[Any]] | None = None,
+    grid: Mapping[str, Sequence[Scalar]] | None,
     features: Features | Mapping[str, np.ndarray] | None = None,
     rules: Rules = NAUTILUS,
     instrument: Instrument | None = None,
@@ -812,11 +812,65 @@ def run(
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
-) -> Any:
+) -> Result[S] | GridResult[S]: ...
+
+
+@typing_overload
+def run(
+    step: Signals | Callable[..., Core],
+    bars: Bars,
+    *,
+    grid: None = None,
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> Result[State]: ...
+
+
+@typing_overload
+def run(
+    step: Callable[..., Core],
+    bars: Bars,
+    *,
+    grid: Mapping[str, Sequence[Scalar]],
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> list[Result[State]]: ...
+
+
+def run(
+    step: object,
+    bars: Bars,
+    *,
+    grid: Mapping[str, Sequence[Scalar]] | None = None,
+    features: Features | Mapping[str, np.ndarray] | None = None,
+    rules: Rules = NAUTILUS,
+    instrument: Instrument | None = None,
+    costs: Costs | None = None,
+    sizing: Sizing[int] | Sizing[float] | None = None,
+    initial_cash: float | None = None,
+    jit: bool = True,
+    signal_fields: Sequence[str] = SIGNAL_FIELDS,
+    cash_accumulation: str = "batch",
+) -> Result[State] | GridResult[State] | list[Result[State]]:
     """Execute a typed strategy through the cacheable, strategy-bound shared engine.
 
     No grid returns Result[S]; an explicit grid (including {}) returns GridResult[S].
-    Legacy stateless Core classes and Signals remain supported with a warning.
+    Legacy stateless Core classes and Signals remain supported with one deprecation
+    warning per source call site per process.
     """
     kwargs: dict[str, Any] = dict(
         rules=rules, instrument=instrument, costs=costs, sizing=sizing, initial_cash=initial_cash
@@ -832,9 +886,18 @@ def run(
             cash_accumulation=cash_accumulation,
             **kwargs,
         )
-    warnings.warn(
-        "Core/Signals API is deprecated; use @strategy and run", DeprecationWarning, stacklevel=2
-    )
+    caller = sys._getframe(1)
+    warning_site = (caller.f_code.co_filename, caller.f_lineno)
+    del caller
+    # Numba/pandas can invalidate Python's warning registry by changing filters.
+    # Keep the public once-per-call-site contract independent of those changes.
+    if warning_site not in _legacy_warning_sites:
+        warnings.warn(
+            "Core/Signals API is deprecated; use @strategy and run",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        _legacy_warning_sites.add(warning_site)
     if hasattr(step, "class_type"):
         return _run_jitclass(
             step,
@@ -865,7 +928,7 @@ def run(
     from .api import simulate
 
     for row in rows:
-        config = dict(zip(axes, row, strict=True))
+        config: dict[str, object] = dict(zip(axes, row, strict=True))
         config.update(supplied)
 
         class LegacyView:
@@ -877,7 +940,7 @@ def run(
                 return LegacyDecision(*decision) if isinstance(decision, Decision) else decision
 
         def make(config=config):
-            return LegacyView(step(**config))
+            return LegacyView(cast(Callable[..., Core], step)(**config))
 
         results.append(simulate(bars, signals_from_core(make, bars), **kwargs))
     return results[0] if grid is None else results
