@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -118,3 +120,26 @@ def test_current_tradingview_headers(tmp_path: Path) -> None:
     )
     got = parse_tradingview_list_of_trades(path)
     assert got.trades.qty.tolist() == [2] and got.trades.pnl.tolist() == [3.5]
+
+
+def test_oracles_import_without_vector_engine() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.abc
+import sys
+
+class NoEngine(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'qik.vector_engine' or fullname.startswith('qik.vector_engine.'):
+            raise AssertionError('oracle imported vector_engine: ' + fullname)
+
+sys.meta_path.insert(0, NoEngine())
+import qik.oracles
+assert not any(name.startswith('qik.vector_engine') for name in sys.modules)
+""",
+        ],
+        check=True,
+    )
