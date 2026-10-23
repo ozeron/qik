@@ -106,3 +106,18 @@ def test_market_fill_alias_survives_dataclass_replace() -> None:
     mixed = replace(rules, exit_fill=FillTiming.CLOSE)
     assert mixed.effective_entry_fill is FillTiming.NEXT_OPEN
     assert mixed.effective_exit_fill is FillTiming.CLOSE
+
+
+def test_repro_bracket_rules_refuse_nautilus() -> None:
+    from qik.vector_engine import BracketAnchor, BracketPolicy
+
+    for values in (
+        {"bracket_policy": BracketPolicy.ADVERSE_FIRST},
+        {"bracket_anchor": BracketAnchor.SIGNAL},
+        {"bracket_anchor": BracketAnchor.FILL},
+    ):
+        with pytest.raises(ValueError, match="repro profile"):
+            Rules(**values)
+        Rules(profile=Profile.TRADINGVIEW, **values)
+    with pytest.raises(ValueError, match="BracketPolicy"):
+        Rules(profile=Profile.TRADINGVIEW, bracket_policy="target_first")

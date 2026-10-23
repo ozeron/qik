@@ -76,7 +76,7 @@ def _nan_free(x: float) -> float | None:
 def _run_kernel(
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
     limit=None, stop_pts=None, target_pts=None, chase=1, protect_flatten=False, new_day=None,
-    next_open=False, latency_bars=0, one_tick=False, tick=0.0, exit_next_open=None, slots=False,
+    next_open=False, latency_bars=0, one_tick=False, tick=0.0, exit_next_open=None, slots=False, adverse_first=False, bracket_anchor=0,
 ):  # fmt: skip
     n = len(side)
     nan = np.full(n, np.nan)
@@ -88,6 +88,7 @@ def _run_kernel(
         extra[0][None, :], extra[1][None, :], extra[2][None, :],
         day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open,
         latency_bars, one_tick, tick, exit_next_open=exit_next_open,
+        adverse_first=adverse_first, bracket_anchor=bracket_anchor,
         entry_trigger=nan[None, :] if slots else None,
         stop_updates=nan[None, :] if slots else None, target_updates=nan[None, :] if slots else None,
         be_after=nan[None, :] if slots else None, be_offset=nan[None, :] if slots else None,
@@ -141,16 +142,29 @@ def _kernel_final(final: tuple) -> tuple:
 @pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
 @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(case=_case())
-def test_kernel_equals_reference(case, next_open: bool, exit_next_open: bool, slots: bool) -> None:
+@given(case=_case(), adverse_first=st.booleans(), bracket_anchor=st.integers(0, 2))
+def test_kernel_equals_reference(
+    case,
+    next_open: bool,
+    exit_next_open: bool,
+    slots: bool,
+    adverse_first: bool,
+    bracket_anchor: int,
+) -> None:
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop = case
     ref = simulate_column_reference(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
         adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open, exit_next_open=exit_next_open,
         stop_update=np.full(len(side), np.nan) if slots else None,
+        adverse_first=adverse_first, bracket_anchor=bracket_anchor,
     )  # fmt: skip
     trades, err, err_bar, final, cnt = _run_kernel(
-        *case, next_open=next_open, exit_next_open=exit_next_open, slots=slots
+        *case,
+        next_open=next_open,
+        exit_next_open=exit_next_open,
+        slots=slots,
+        adverse_first=adverse_first,
+        bracket_anchor=bracket_anchor,
     )
     if err:
         # on error the kernel stops; the table is not built (api raises), so compare the verdict
@@ -225,6 +239,7 @@ def test_kernel_equals_reference_dense_both_stale_modes(
     for stale_drop in (False, True):
         for _ in range(2500):
             arrays, side, exit_, stop, target = _dense_case(rng)
+            adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
             adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
             new_day = rng.random(len(side)) < 0.04 if next_open else None
             # Mixed absolute/point protection, with occasional no levels, in next-open mode.
@@ -240,6 +255,7 @@ def test_kernel_equals_reference_dense_both_stale_modes(
                 arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
                 adaptive=adaptive, reenter=reenter, stale_drop=stale_drop,
                 next_open=next_open, exit_next_open=exit_next_open, new_day=new_day, stop_pts=stop_pts, target_pts=target_pts,
+                adverse_first=adverse_first, bracket_anchor=bracket_anchor,
             )  # fmt: skip
             trades, err, err_bar, final, _ = _run_kernel(
                 arrays,
@@ -252,6 +268,8 @@ def test_kernel_equals_reference_dense_both_stale_modes(
                 stale_drop,
                 next_open=next_open,
                 exit_next_open=exit_next_open,
+                adverse_first=adverse_first,
+                bracket_anchor=bracket_anchor,
                 new_day=new_day,
                 stop_pts=stop_pts,
                 target_pts=target_pts,

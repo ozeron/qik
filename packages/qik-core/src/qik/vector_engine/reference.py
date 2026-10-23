@@ -68,6 +68,12 @@ def _price_points(
     return [("O", o), *extremes, ("C", c)]
 
 
+def _anchor(mode: int, decision: float, fill: float, legacy: float) -> float:
+    if mode == 1:
+        return decision
+    return fill if mode == 2 else legacy
+
+
 def _stop_fill(side: int, stop: float, label: str, price: float) -> float | None:
     """Price at which a resting stop-market closing ``side`` fills on this update, or None."""
 
@@ -152,6 +158,7 @@ class _Pending:
 
 @dataclass
 class _MarketEntry:
+    decision_close: float
     """R1 entry decided at a close, held until the following open."""
 
     side: int
@@ -182,6 +189,8 @@ def simulate_column_reference(
     new_day: np.ndarray | None = None,
     next_open: bool = False,
     exit_next_open: bool | None = None,
+    adverse_first: bool = False,
+    bracket_anchor: int = 0,
     latency_bars: int = 0,
     one_tick: bool = False,
     tick: float = 0.0,
@@ -211,6 +220,8 @@ def simulate_column_reference(
             exit_sig,
             entry_stop,
             entry_target,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
             entry_limit=entry_limit,
             next_open=next_open,
             exit_next_open=exit_next_open,
@@ -253,6 +264,8 @@ def simulate_column_reference(
             chase_after=chase_after,
             protect_flatten=protect_flatten,
             new_day=new_day,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
             latency_bars=latency_bars,
             tick=tick if one_tick else 0.0,
         )
@@ -284,7 +297,14 @@ def simulate_column_reference(
         if market_entry is not None:
             m = market_entry
             px = float(o[i])
-            st, tg = _levels(m.side, px, m.stop, m.target, m.stop_pts, m.target_pts)
+            st, tg = _levels(
+                m.side,
+                _anchor(bracket_anchor, m.decision_close, px, px),
+                m.stop,
+                m.target,
+                m.stop_pts,
+                m.target_pts,
+            )
             # R1's newly placed protection cannot retroactively gap-fill across the entry open.
             if not math.isnan(st) and (st >= px if m.side > 0 else st <= px):
                 return RefColumn(trades, ERR_STOP_IN_MARKET, i, pos, entry_i)
@@ -314,7 +334,14 @@ def simulate_column_reference(
                 # before the sleeve's own decisions on the bar); levels from that fill.
                 pending = None
                 px = p.limit if filled else close
-                st, tg = _levels(p.side, px, p.stop, p.target, p.stop_pts, p.target_pts)
+                st, tg = _levels(
+                    p.side,
+                    _anchor(bracket_anchor, float(c[p.chase_bar - chase_after]), px, px),
+                    p.stop,
+                    p.target,
+                    p.stop_pts,
+                    p.target_pts,
+                )
                 verdict = _protect_at_close(p.side, st, tg, close, protect_flatten)
                 if verdict == REFUSE:
                     return RefColumn(trades, ERR_PROTECT_REJECTED, i, pos, entry_i)
@@ -326,6 +353,11 @@ def simulate_column_reference(
                     trades.append(RefTrade(i, i, p.side, px, close, verdict, st))
                     exited = True
         elif pos != 0:
+            adverse_hit = (
+                adverse_first
+                and not math.isnan(stop)
+                and (lo[i] <= stop if pos > 0 else h[i] >= stop)
+            )
             fill: tuple[int, float] | None = None
             for label, price in _price_points(
                 float(o[i]), float(h[i]), float(lo[i]), float(c[i]), adaptive
@@ -338,7 +370,7 @@ def simulate_column_reference(
                     if px is not None:
                         fill = (REASON_STOP_GAP if label == "O" else REASON_STOP, px)
                         continue
-                if not math.isnan(target):
+                if not adverse_hit and not math.isnan(target):
                     px = _limit_fill(pos, target, price)
                     if px is not None:
                         fill = (REASON_TARGET, px)
@@ -370,6 +402,7 @@ def simulate_column_reference(
                     return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
                 if enter:
                     market_entry = _MarketEntry(
+                        close,
                         int(side_sig[i]),
                         float(entry_stop[i]),
                         float(entry_target[i]),
@@ -400,7 +433,7 @@ def simulate_column_reference(
                 if (lim >= close) if s > 0 else (lim <= close):
                     # Marketable: fills at the close (A11). V2 still anchors point levels to the
                     # limit price, not the fill.
-                    st, tg = _levels(s, lim, *spec)
+                    st, tg = _levels(s, _anchor(bracket_anchor, close, close, lim), *spec)
                     verdict = _protect_at_close(s, st, tg, close, protect_flatten)
                     if verdict == REFUSE:
                         return RefColumn(trades, ERR_PROTECT_REJECTED, i, pos, entry_i)
@@ -449,6 +482,8 @@ def _simulate_venue_reference(
     entry_stop: np.ndarray,
     entry_target: np.ndarray,
     *,
+    adverse_first: bool,
+    bracket_anchor: int,
     adaptive: bool,
     reenter: bool,
     entry_limit: np.ndarray | None,
@@ -496,7 +531,9 @@ def _simulate_venue_reference(
         nonlocal pos, entry_i, entry_px, stop, target, generation
         nonlocal pending, resting, chasing, protection, rejected_stop
         pos, entry_i, entry_px, generation = int(side_sig[d]), i, price, d
-        anchor = float(limits[d]) if is_limit else price
+        anchor = _anchor(
+            bracket_anchor, float(c[d]), price, float(limits[d]) if is_limit else price
+        )
         stop, target = _levels(
             pos,
             anchor,
@@ -524,6 +561,14 @@ def _simulate_venue_reference(
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
         if closing and pending < 0 and pos == 0 and protection in (0, 3):
             closing = False
+        adverse_hit = (
+            adverse_first
+            and bool(pos)
+            and protection >= 2
+            and not rejected_stop
+            and not math.isnan(stop)
+            and (lo[i] <= stop if pos > 0 else h[i] >= stop)
+        )
         # Exchange's complete price path precedes the sleeve decision and command settlement.
         for label, price in _price_points(float(o[i]), float(h[i]), float(lo[i]), ci, adaptive):
             if pending >= 0 and resting:
@@ -548,7 +593,7 @@ def _simulate_venue_reference(
                     close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
                     send("cancel_protect", generation)
                     protection = 3
-                elif not math.isnan(target):
+                elif not adverse_hit and not math.isnan(target):
                     px = price - pos * tick
                     if px >= target if pos > 0 else px <= target:
                         close(px if tick else target, REASON_TARGET)
@@ -664,6 +709,8 @@ def _simulate_slots_reference(
     stops: np.ndarray,
     targets: np.ndarray,
     *,
+    adverse_first: bool,
+    bracket_anchor: int,
     next_open: bool,
     exit_next_open: bool,
     entry_limit: np.ndarray | None,
@@ -779,6 +826,7 @@ def _simulate_slots_reference(
         nonlocal position, pending, resting, chasing, last_entry, last_price, last_stop
         s = int(sides[d])
         anchor = float(limits[d]) if not math.isnan(limits[d]) and not chased else price
+        anchor = _anchor(bracket_anchor, float(c[d]), price, anchor)
         st, tg = _levels(s, anchor, float(stops[d]), float(targets[d]), float(sp[d]), float(tp[d]))
         position = _SlotPosition(d, s, i, price, st, tg, st)
         last_entry, last_price, last_stop = i, price, st
@@ -805,6 +853,13 @@ def _simulate_slots_reference(
                 continue
             settlement = float(o[i] if phase == 0 else c[i])
             if phase == 1:
+                adverse_hit = (
+                    adverse_first
+                    and position is not None
+                    and position.live
+                    and not math.isnan(position.stop)
+                    and (lo[i] <= position.stop if position.side > 0 else h[i] >= position.stop)
+                )
                 for label, price in _price_points(
                     float(o[i]), float(h[i]), float(lo[i]), float(c[i]), adaptive
                 ):
@@ -831,7 +886,9 @@ def _simulate_slots_reference(
                         if through(out, p.stop, True, price):
                             px = price + out * slip if slip else (price if label == "O" else p.stop)
                             close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
-                        elif through(out, p.target, False, price if mit else price + out * slip):
+                        elif not adverse_hit and through(
+                            out, p.target, False, price if mit else price + out * slip
+                        ):
                             px = (
                                 price + out * slip
                                 if slip
@@ -919,8 +976,11 @@ def _simulate_slots_reference(
                 ):
                     pending = i
                     send("submit", i)
-            while queue and queue[0][0] <= i and not error:
-                _, kind, d, value = queue.pop(0)
+            while not error:
+                ready = next((q for q, cmd in enumerate(queue) if cmd[0] <= i), None)
+                if ready is None:
+                    break
+                _, kind, d, value = queue.pop(ready)
                 if kind == "replace":
                     if position is not None or pending >= 0:
                         continue

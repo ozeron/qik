@@ -5,6 +5,8 @@ Contract and assumptions: ``docs/vector-engine.md``. Entry point: ``simulate``.
 
 from .api import (
     Bars,
+    BracketAnchor,
+    BracketPolicy,
     Compliance,
     Costs,
     FillModel,
@@ -25,6 +27,8 @@ from .grid import grid, stack
 __all__ = [
     "BarView",
     "Bars",
+    "BracketAnchor",
+    "BracketPolicy",
     "Compliance",
     "Core",
     "Costs",

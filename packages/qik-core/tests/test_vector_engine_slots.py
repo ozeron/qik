@@ -230,6 +230,7 @@ def test_slots_kernel_equals_independent_reference_dense(
         adaptive, reenter, keep, ratchet, mit, flatten, stale, skip = (
             bool(rng.integers(2)) for _ in range(8)
         )
+        adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
         chase = int(rng.integers(1, 4))
         ref = simulate_column_reference(
             o,
@@ -249,6 +250,8 @@ def test_slots_kernel_equals_independent_reference_dense(
             stale_drop=stale,
             chase_after=chase,
             protect_flatten=flatten,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
             next_open=next_open,
             exit_next_open=exit_next_open,
             latency_bars=latency,
@@ -302,6 +305,8 @@ def test_slots_kernel_equals_independent_reference_dense(
             ratchet,
             skip,
             exit_next_open=exit_next_open,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
         )
         assert (int(out[2][0]), int(out[3][0])) == (ref.err, ref.err_bar), dict(
             o=o,

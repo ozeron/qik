@@ -66,6 +66,7 @@ def test_venue_kernel_equals_independent_reference_dense(latency: int, one_tick:
     for _ in range(2000):
         a, side, exit_, stop, target, limit, sp, tp, chase, day = _dense_limit_case(rng)
         adaptive, reenter, flatten = (bool(rng.integers(2)) for _ in range(3))
+        adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
         ref = simulate_column_reference(
             a["o"],
             a["h"],
@@ -83,6 +84,8 @@ def test_venue_kernel_equals_independent_reference_dense(latency: int, one_tick:
             chase_after=chase,
             protect_flatten=flatten,
             new_day=day,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
             latency_bars=latency,
             one_tick=one_tick,
             tick=0.25,
@@ -102,6 +105,8 @@ def test_venue_kernel_equals_independent_reference_dense(latency: int, one_tick:
             chase,
             flatten,
             day,
+            adverse_first=adverse_first,
+            bracket_anchor=bracket_anchor,
             latency_bars=latency,
             one_tick=one_tick,
             tick=0.25,

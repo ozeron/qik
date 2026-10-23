@@ -32,6 +32,8 @@ from .sizing import Sizing
 __all__ = [
     "SIGNAL_FIELDS",
     "Bars",
+    "BracketAnchor",
+    "BracketPolicy",
     "Compliance",
     "Costs",
     "Instrument",
@@ -78,6 +80,16 @@ class FillTiming(StrEnum):
 
 # Backwards-compatible spelling, including enum identity checks.
 MarketFill = FillTiming
+
+
+class BracketPolicy(StrEnum):
+    STOP_FIRST = "stop_first"
+    ADVERSE_FIRST = "adverse_first"
+
+
+class BracketAnchor(StrEnum):
+    SIGNAL = "signal"
+    FILL = "fill"
 
 
 @dataclass(frozen=True)
@@ -129,6 +141,8 @@ class Rules:
     market_fill: MarketFill = MarketFill.CLOSE
     entry_fill: FillTiming | None = None
     exit_fill: FillTiming | None = None
+    bracket_policy: BracketPolicy = BracketPolicy.STOP_FIRST
+    bracket_anchor: BracketAnchor | None = None
     latency_bars: Literal[0, 1] = 0
     fill_model: FillModel = FillModel.DEFAULT
     protection: Literal["callback", "oto"] = "callback"
@@ -142,6 +156,14 @@ class Rules:
             value = getattr(self, name)
             if value is not None and not isinstance(value, FillTiming):
                 raise ValueError(f"{name} must be a FillTiming enum")
+        if not isinstance(self.bracket_policy, BracketPolicy):
+            raise ValueError("bracket_policy must be a BracketPolicy enum")
+        if self.bracket_anchor is not None and not isinstance(self.bracket_anchor, BracketAnchor):
+            raise ValueError("bracket_anchor must be a BracketAnchor enum")
+        if self.profile is Profile.NAUTILUS and (
+            self.bracket_policy is not BracketPolicy.STOP_FIRST or self.bracket_anchor is not None
+        ):
+            raise ValueError("non-default bracket rules require a repro profile")
         next_open = FillTiming.NEXT_OPEN in (self.effective_entry_fill, self.effective_exit_fill)
         for name, choices in (
             ("protection", ("callback", "oto")),
@@ -406,7 +428,9 @@ def simulate(
     if slots and rules.protection == "oto":
         if np.isfinite(limit).any():
             raise ValueError("OTO order slots do not support entry_limit / chase; use callback")
-        if np.any(entries & (np.isfinite(stop_pts) | np.isfinite(target_pts))):
+        if rules.bracket_anchor is not BracketAnchor.FILL and np.any(
+            entries & (np.isfinite(stop_pts) | np.isfinite(target_pts))
+        ):
             raise ValueError(
                 "OTO order slots need absolute protection; use callback for point offsets"
             )
@@ -466,6 +490,8 @@ def simulate(
         amend_keep=rules.amend_rejected == "keep", ratchet=rules.stop_update_mode == "ratchet",
         stop_skip=rules.stop_entry_in_market == "skip",
         exit_next_open=exit_next_open,
+        adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
+        bracket_anchor=0 if rules.bracket_anchor is None else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
     )  # fmt: skip
     (counts, _, errs, err_bar, final_side, final_entry, final_px, final_stop,
      e_i, x_i, sd, e_px, x_px, why, trade_stop) = out  # fmt: skip

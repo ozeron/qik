@@ -70,6 +70,13 @@ def _level(side, anchor, level, pts, sign):
 
 
 @nb.njit(cache=True, nogil=True)
+def _anchor(mode, decision, fill, legacy):
+    if mode == 1:
+        return decision
+    return fill if mode == 2 else legacy
+
+
+@nb.njit(cache=True, nogil=True)
 def _in_market(side, level, close, is_stop):
     """A stop at or through ``close``, or a limit target at or through it (A10 / A11)."""
 
@@ -155,6 +162,8 @@ def _venue_column(
     protect_flatten,
     latency,
     slip,
+    adverse_first,
+    bracket_anchor,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -214,8 +223,20 @@ def _venue_column(
                             px = candidate
                             break
                 pos, ei, ep, gen = s, i, px, d
-                stop = _level(s, entry_limit[d], entry_stop[d], stop_pts[d], -1.0)
-                target = _level(s, entry_limit[d], entry_target[d], target_pts[d], 1.0)
+                stop = _level(
+                    s,
+                    _anchor(bracket_anchor, c[d], px, entry_limit[d]),
+                    entry_stop[d],
+                    stop_pts[d],
+                    -1.0,
+                )
+                target = _level(
+                    s,
+                    _anchor(bracket_anchor, c[d], px, entry_limit[d]),
+                    entry_target[d],
+                    target_pts[d],
+                    1.0,
+                )
                 pending, resting, chasing = -1, False, False
                 rejected_stop = False
                 protection = 0 if closing else 1
@@ -225,6 +246,12 @@ def _venue_column(
             if _in_market(side_sig[gen], target, extreme, False):
                 protection = 0  # flat reduce-only target is cancelled before liquidity is checked
         elif pos and protection >= 2:
+            adverse_hit = (
+                adverse_first
+                and not rejected_stop
+                and not np.isnan(stop)
+                and (lo[i] <= stop if pos > 0 else h[i] >= stop)
+            )
             reason = 0
             px = 0.0
             for m in range(4):
@@ -238,7 +265,7 @@ def _venue_column(
                     px = pt - pos * slip if slip else (pt if m == 0 else stop)
                     break
                 candidate = pt - pos * slip
-                if _in_market(pos, target, candidate, False):
+                if not adverse_hit and _in_market(pos, target, candidate, False):
                     reason = REASON_TARGET
                     px = candidate if slip else target
                     break
@@ -313,7 +340,7 @@ def _venue_column(
                     or (s > 0 and px <= entry_limit[d])
                     or (s < 0 and px >= entry_limit[d])
                 ):
-                    anchor = px if kind == 1 else entry_limit[d]
+                    anchor = _anchor(bracket_anchor, c[d], px, px if kind == 1 else entry_limit[d])
                     pos, ei, ep, gen = s, i, px, d
                     stop = _level(s, anchor, entry_stop[d], stop_pts[d], -1.0)
                     target = _level(s, anchor, entry_target[d], target_pts[d], 1.0)
@@ -417,6 +444,8 @@ def _column(
     latency_bars,
     one_tick,
     tick,
+    adverse_first,
+    bracket_anchor,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -452,6 +481,8 @@ def _column(
             protect_flatten,
             latency_bars,
             tick if one_tick else 0.0,
+            adverse_first,
+            bracket_anchor,
             count_only,
             out_entry_i,
             out_exit_i,
@@ -502,8 +533,12 @@ def _column(
         if market_entry >= 0:
             d = market_entry
             s = side_sig[d]
-            st = _level(s, o[i], entry_stop[d], stop_pts[d], -1.0)
-            tg = _level(s, o[i], entry_target[d], target_pts[d], 1.0)
+            st = _level(
+                s, _anchor(bracket_anchor, c[d], o[i], o[i]), entry_stop[d], stop_pts[d], -1.0
+            )
+            tg = _level(
+                s, _anchor(bracket_anchor, c[d], o[i], o[i]), entry_target[d], target_pts[d], 1.0
+            )
             # Newly placed protection is validated at the actual entry open. A4's resting-stop
             # gap rule cannot be applied retroactively across this entry fill (R1).
             if _in_market(s, st, o[i], True):
@@ -530,8 +565,12 @@ def _column(
                 # same bar flattens instead, and V2's flatten clears the chase)
                 pend = 0
                 px = p_lim if filled else ci
-                st = _level(s, px, p_st, p_stp, -1.0)
-                tg = _level(s, px, p_tg, p_tgp, 1.0)
+                st = _level(
+                    s, _anchor(bracket_anchor, c[p_chase - chase], px, px), p_st, p_stp, -1.0
+                )
+                tg = _level(
+                    s, _anchor(bracket_anchor, c[p_chase - chase], px, px), p_tg, p_tgp, 1.0
+                )
                 err, why = _fill_then_protect(
                     s, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i, out_exit_i,
                     out_side, out_entry_px, out_exit_px, out_reason, out_stop, base + cnt,
@@ -550,6 +589,11 @@ def _column(
                     stop = st
                     target = tg
         elif pos != 0:
+            adverse_hit = (
+                adverse_first
+                and not np.isnan(stop)
+                and (lo[i] <= stop if pos > 0 else h[i] >= stop)
+            )
             reason = 0
             px = 0.0
             fill_point = 0  # path point (0=O, 1=first extreme, 2=second) that produced the fill
@@ -562,12 +606,12 @@ def _column(
             if pos > 0:
                 if not np.isnan(stop) and o[i] <= stop:
                     reason, px = REASON_STOP_GAP, o[i]
-                elif not np.isnan(target) and o[i] >= target:
+                elif not adverse_hit and not np.isnan(target) and o[i] >= target:
                     reason, px = REASON_TARGET, target
             else:
                 if not np.isnan(stop) and o[i] >= stop:
                     reason, px = REASON_STOP_GAP, o[i]
-                elif not np.isnan(target) and o[i] <= target:
+                elif not adverse_hit and not np.isnan(target) and o[i] <= target:
                     reason, px = REASON_TARGET, target
             if reason == 0:
                 # Extremes: high then low, or the one nearer the open first when adaptive
@@ -577,7 +621,7 @@ def _column(
                     fill_point = step + 1
                     if use_high:
                         if pos > 0:
-                            if not np.isnan(target) and h[i] >= target:
+                            if not adverse_hit and not np.isnan(target) and h[i] >= target:
                                 reason, px = REASON_TARGET, target
                         else:
                             if not np.isnan(stop) and h[i] >= stop:
@@ -587,7 +631,7 @@ def _column(
                             if not np.isnan(stop) and lo[i] <= stop:
                                 reason, px = REASON_STOP, stop
                         else:
-                            if not np.isnan(target) and lo[i] <= target:
+                            if not adverse_hit and not np.isnan(target) and lo[i] <= target:
                                 reason, px = REASON_TARGET, target
                     if reason != 0:
                         break
@@ -674,8 +718,12 @@ def _column(
                 # ltm_bracket, 100+ such entries, all equal to Nautilus).
                 if (s > 0 and lim >= ci) or (s < 0 and lim <= ci):
                     # marketable: fills at the close (A11); V2 anchors point levels to the limit
-                    st = _level(s, lim, entry_stop[i], stop_pts[i], -1.0)
-                    tg = _level(s, lim, entry_target[i], target_pts[i], 1.0)
+                    st = _level(
+                        s, _anchor(bracket_anchor, ci, ci, lim), entry_stop[i], stop_pts[i], -1.0
+                    )
+                    tg = _level(
+                        s, _anchor(bracket_anchor, ci, ci, lim), entry_target[i], target_pts[i], 1.0
+                    )
                     err, why = _fill_then_protect(
                         s, i, ci, st, tg, ci, protect_flatten, count_only, out_entry_i,
                         out_exit_i, out_side, out_entry_px, out_exit_px, out_reason, out_stop,
@@ -733,7 +781,7 @@ def run_columns(
     target_updates: np.ndarray | None = None, be_after: np.ndarray | None = None,
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
-    exit_next_open=None,
+    exit_next_open=None, adverse_first=False, bracket_anchor=0,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -798,6 +846,8 @@ def run_columns(
                 amend_keep,
                 ratchet,
                 stop_skip,
+                adverse_first,
+                bracket_anchor,
                 True,
                 e0,
                 e0,
@@ -812,7 +862,7 @@ def run_columns(
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, True,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, True,
             e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -874,6 +924,8 @@ def run_columns(
                     amend_keep,
                     ratchet,
                     stop_skip,
+                    adverse_first,
+                    bracket_anchor,
                     False,
                     entry_i,
                     exit_i,
@@ -888,7 +940,7 @@ def run_columns(
                 _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
@@ -932,6 +984,8 @@ def _slots_column(
     amend_keep,
     ratchet,
     stop_skip,
+    adverse_first,
+    bracket_anchor,
     count_only,
     out_ei,
     out_xi,
@@ -964,6 +1018,13 @@ def _slots_column(
                 continue
             ci = o[i] if phase == 0 else c[i]
             if phase == 1:
+                adverse_hit = (
+                    adverse_first
+                    and pos != 0
+                    and live
+                    and not np.isnan(stop)
+                    and (lo[i] <= stop if pos > 0 else h[i] >= stop)
+                )
                 high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
                 for m in range(4):
                     pt = (
@@ -984,7 +1045,12 @@ def _slots_column(
                         )
                         if match:
                             px = pt + s * slip if slip else (pt if stop_order and m == 0 else level)
-                            anchor = limits[d] if not np.isnan(limits[d]) else px
+                            anchor = _anchor(
+                                bracket_anchor,
+                                c[d],
+                                px,
+                                limits[d] if not np.isnan(limits[d]) else px,
+                            )
                             stop = _level(s, anchor, stops[d], sp[d], -1.0)
                             target = _level(s, anchor, targets[d], tp[d], 1.0)
                             pos, ei, ep, gen, risk_stop = s, i, px, d, stop
@@ -1033,7 +1099,9 @@ def _slots_column(
                         if _in_market(pos, stop, pt, True):
                             reason = REASON_STOP_GAP if m == 0 else REASON_STOP
                             px = pt - pos * slip if slip else (pt if m == 0 else stop)
-                        elif _in_market(pos, target, pt if mit else pt - pos * slip, False):
+                        elif not adverse_hit and _in_market(
+                            pos, target, pt if mit else pt - pos * slip, False
+                        ):
                             reason = REASON_TARGET
                             px = pt - pos * slip if slip else (pt if mit and m == 0 else target)
                             if not mit and not slip and (m == 1 or m == 2):
@@ -1148,8 +1216,15 @@ def _slots_column(
                 for due, _, _, _ in queue:
                     if due > i and (i + 1 == len(c) or days[i + 1]):
                         error = ERR_NEXT_OPEN_SESSION_END
-            while len(queue) and queue[0][0] <= i and error == 0:
-                _, kind, d, value = queue.pop(0)
+            while len(queue) and error == 0:
+                ready = -1
+                for q in range(len(queue)):
+                    if queue[q][0] <= i:
+                        ready = q
+                        break
+                if ready < 0:
+                    break
+                _, kind, d, value = queue.pop(ready)
                 if kind == _SLOT_REPLACE:
                     if pos or pending >= 0:
                         continue
@@ -1170,10 +1245,13 @@ def _slots_column(
                         resting = True
                         continue
                     px = ci + s * slip
-                    anchor = limits[d] if not np.isnan(limits[d]) else px
+                    anchor = _anchor(
+                        bracket_anchor, c[d], px, limits[d] if not np.isnan(limits[d]) else px
+                    )
                 elif kind == _SLOT_CHASE and pending == d:
                     s = sides[d]
-                    px, anchor = ci + s * slip, ci + s * slip
+                    px = ci + s * slip
+                    anchor = _anchor(bracket_anchor, c[d], px, px)
                 else:
                     s, px, anchor = 0, 0.0, 0.0
                 if s:
