@@ -231,7 +231,7 @@ class Side(IntEnum):
 class ExitReason(IntEnum):
     """Kernel exit codes; NONE means no prior exit."""
 
-    NONE = 0
+    NONE = -1
     SIGNAL = 1
     STOP = 2
     TARGET = 3

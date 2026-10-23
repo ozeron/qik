@@ -116,3 +116,29 @@ def test_refuse_malformed_and_incomplete_inputs():
         htf(bars, "bad", close_values)
     with pytest.raises(ValueError, match="timezone"):
         htf(bars.assign(datetime=bars.datetime.dt.tz_localize(None)), "15min", close_values)
+
+
+@pytest.mark.parametrize("day,utc_hour", [("2023-11-03", 21), ("2023-11-06", 22)])
+def test_daily_fall_dst_and_sunday_open(day, utc_hour):
+    end = pd.Timestamp(day + " 17:00", tz="America/New_York")
+    start = (
+        end.tz_localize(None).normalize() - pd.Timedelta(days=1) + pd.Timedelta(hours=18)
+    ).tz_localize("America/New_York")
+    bars = minute_bars(start=start, periods=1380, step=1.0)
+    captured = []
+
+    def capture(frame):
+        captured.extend(frame.datetime)
+        return close_values(frame)
+
+    out = htf(bars, "1D", capture, label="close")
+    assert np.isnan(out[:-1]).all()
+    assert out[-1] == 1479.0
+    assert captured == [end]
+    assert captured[0].tz_convert("UTC").hour == utc_hour
+    assert_causal_feature(lambda b: htf(b, "1D", close_values), bars, len(bars) - 1)
+
+
+def test_refuse_nonclose_label():
+    with pytest.raises(ValueError, match="label"):
+        htf(minute_bars(tz="UTC"), "15min", close_values, label="open")

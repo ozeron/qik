@@ -154,6 +154,7 @@ def test_invalid_schemas_and_features():
 
 def test_decision_order_and_reason_codes():
     assert ("entry_side", *Decision._fields[1:]) == SIGNAL_FIELDS
+    assert ExitReason.NONE == -1  # compiled position adapter uses -1 before an exit
     for name in ("SIGNAL", "STOP", "TARGET", "STOP_GAP", "PROTECT_FAIL"):
         assert ExitReason[name] == getattr(kernel, "REASON_" + name)
 
@@ -229,6 +230,12 @@ def broken(s: S, p: P, f: F) -> Decision:
     p.kk
     f.atrr
     return 42
+@strategy(state=S, params=P, features=F)
+def wrong_return(s: S, p: P, f: F, bar: Bar, pos: Position) -> int:
+    return 42
+@strategy(state=S, params=P, features=F)
+def wrong_args(s: str, p: P, f: F, bar: Bar, pos: Position) -> Decision:
+    return enter(1)
 """
     )
 
@@ -259,7 +266,7 @@ def broken(s: S, p: P, f: F) -> Decision:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     proc = check(bad)
     assert proc.returncode == 1
-    for text in ("hihg", "high", "kk", "atrr", "return"):
+    for text in ("hihg", "high", "kk", "atrr", "return", "wrong_return", "wrong_args"):
         assert text in proc.stdout, proc.stdout
     print(proc.stdout)
 
@@ -305,3 +312,32 @@ def test_helpers_normalize_enum_and_integer_literals():
             np.asarray(mixed_numeric_decision(which)),
             np.asarray(mixed_numeric_decision.py_func(which)),
         )
+
+
+@pytest.mark.parametrize("field", ["shape", "dtype", "new", "to_bytes", "_allocate"])
+def test_reject_reserved_record_fields(field):
+    with pytest.raises(TypeError, match=f"Reserved.{field}"):
+        type("Reserved", (State,), {"__annotations__": {field: float}, field: 1.0})
+
+
+def test_reject_unannotated_fields():
+    for base in (State, Params, Features):
+        with pytest.raises(TypeError, match="Missing.value.*annotation"):
+            type("Missing", (base,), {"value": 1})
+
+
+@pytest.mark.parametrize(
+    "kind,value",
+    [(int, 1.9), (int, 2**63), (bool, 2), (Mode, 3), (float, "1.5")],
+)
+def test_reject_lossy_defaults_and_grid_values(kind, value):
+    with pytest.raises(TypeError, match="Bad.value"):
+        type("Bad", (State,), {"__annotations__": {"value": kind}, "value": value})
+    schema = type("Grid", (Params,), {"__annotations__": {"value": kind}})
+    with pytest.raises(TypeError, match="Grid.value"):
+        schema.from_grid({"value": [value]})
+
+
+def test_feature_field_cannot_shadow_validation():
+    with pytest.raises(TypeError, match="Bad.validate"):
+        type("Bad", (Features,), {"__annotations__": {"validate": FloatArray}})

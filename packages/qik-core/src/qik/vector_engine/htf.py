@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import datetime
+from typing import Literal
 
 import numpy as np
 import pandas as pd
+from numpy.typing import NDArray
 
 from .schema import FloatArray
 
 _ET = "America/New_York"
+Clock = Sequence[int | str | datetime] | NDArray[np.int64] | pd.DatetimeIndex
 
 
-def _timestamps(values: Sequence | np.ndarray | pd.Series | pd.DatetimeIndex) -> np.ndarray:
+def _timestamps(values: Clock) -> NDArray[np.int64]:
     raw = np.asarray(values)
     if raw.dtype == np.dtype("int64"):
         return raw
@@ -24,8 +28,8 @@ def _timestamps(values: Sequence | np.ndarray | pd.Series | pd.DatetimeIndex) ->
 
 def htf_align(
     htf_values: FloatArray,
-    htf_close_ts: Sequence | np.ndarray | pd.DatetimeIndex,
-    base_ts: Sequence | np.ndarray | pd.DatetimeIndex,
+    htf_close_ts: Clock,
+    base_ts: Clock,
 ) -> FloatArray:
     """Map last fully closed HTF value to each base close; prehistory is NaN.
 
@@ -54,7 +58,8 @@ def htf(
     every: str,
     fn: Callable[[pd.DataFrame], FloatArray | pd.Series],
     *,
-    session: str | Sequence | None = None,
+    session: str | Sequence[str | datetime] | None = None,
+    label: Literal["close"] = "close",
 ) -> FloatArray:
     """Resample minute-open OHLCV, apply fn, align at base close without lookahead.
 
@@ -66,6 +71,8 @@ def htf(
     convention). Missing minutes are never synthesized. The caller owns daily
     tape completeness/holiday QA. fn must itself be causal; use the prefix test.
     """
+    if label != "close":
+        raise ValueError("label must be 'close' for causal HTF features")
     required = {"datetime", "open", "high", "low", "close", "volume"}
     if missing := required.difference(bars.columns):
         raise ValueError(f"missing OHLCV columns: {sorted(missing)}")

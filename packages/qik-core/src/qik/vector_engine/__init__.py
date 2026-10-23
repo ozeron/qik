@@ -25,7 +25,7 @@ from .api import (
     require_nautilus,
     simulate,
 )
-from .compiled import CompiledBar, Position, run
+from .compiled import CompiledBar, run
 from .core import BarView, Core, Decision, check_causal, signals_from_core
 from .grid import grid, stack
 from .kernel import (
