@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+class _SnapshotColumns(Mapping[str, NDArray]):
+    """Expose fresh array views so callers cannot mutate stored metadata."""
+
+    def __init__(self, columns: Mapping[str, NDArray]) -> None:
+        self._columns = MappingProxyType(dict(columns))
+
+    def __getitem__(self, name: str) -> NDArray:
+        column = self._columns[name]
+        raw = column.base
+        assert isinstance(raw, bytes)
+        return np.frombuffer(raw, dtype=column.dtype)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._columns)
+
+    def __len__(self) -> int:
+        return len(self._columns)
 
 
 @dataclass(frozen=True, eq=False)
@@ -42,7 +61,7 @@ class CandidatePool:
             digest.update(header)
             digest.update(raw)
             frozen[name] = np.frombuffer(raw, dtype=a.dtype)
-        object.__setattr__(self, "columns", MappingProxyType(frozen))
+        object.__setattr__(self, "columns", _SnapshotColumns(frozen))
         object.__setattr__(self, "sha256", digest.hexdigest())
 
     def assert_counts(self, columns: tuple[str, ...], expected: Mapping[tuple, int]) -> None:

@@ -1,5 +1,8 @@
 """Failure contracts that matter independently of project callback dispatch."""
 
+import os
+import subprocess
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -40,6 +43,52 @@ def test_pool_cannot_be_changed_through_inputs_or_public_arrays() -> None:
 def test_malformed_pool_refused(columns, count) -> None:
     with pytest.raises(ValueError):
         CandidatePool(columns, count)
+
+
+def test_public_array_metadata_cannot_change_pool_snapshot() -> None:
+    pool = CandidatePool({"entry": np.array([1, 2, 3], dtype=np.int64)}, 3)
+    sha = pool.sha256
+    exposed = pool.columns["entry"]
+    assert isinstance(exposed.base, bytes)
+    exposed.dtype = np.uint8
+    exposed.shape = (3, 8)
+    original = pool.columns["entry"]
+    assert original.dtype == np.dtype("int64")
+    assert original.shape == (3,)
+    np.testing.assert_array_equal(original, [1, 2, 3])
+    pool.assert_counts(("entry",), {(1,): 1, (2,): 1, (3,): 1})
+    assert pool.sha256 == sha
+
+
+def test_hash_and_null_seeds_replay_across_fresh_processes() -> None:
+    script = """
+import hashlib
+import json
+import sys
+import numpy as np
+from qik.battery import CandidatePool, NullJob, run_nulls
+from qik.falsify import random_entry_null
+columns = {name: np.arange(10, dtype=np.int64) for name in {'entry', 'exit'}}
+pool = CandidatePool(columns, 10)
+def run(seed, draws):
+    return random_entry_null(
+        year=np.full(10, 2020), side=np.ones(10, int),
+        entry=pool.columns['entry'], exit=pool.columns['exit'],
+        target_year=np.array([2020, 2020]), target_side=np.array([1, 1]),
+        score=lambda ix: float(ix.sum()), observed=3.0, seed=seed, draws=draws,
+    )
+result = run_nulls([NullJob('test', 123, 50, run)])['test']
+assert 'qik.vector_engine' not in sys.modules
+print(json.dumps([pool.sha256, result.seed, result.draws, result.counts_sha256,
+                  hashlib.sha256(result.stats.tobytes()).hexdigest()]))
+"""
+    outputs = [
+        subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, "PYTHONHASHSEED": seed}, text=True
+        )
+        for seed in ("1", "987")
+    ]
+    assert outputs[0] == outputs[1]
 
 
 def test_callbacks_keep_order_and_fail_without_partial_stitch() -> None:
