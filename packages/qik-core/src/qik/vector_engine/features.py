@@ -99,14 +99,14 @@ def session_masks(
     last_ns = np.where(valid, pd.DatetimeIndex(aligned.close_ts).as_unit("ns").asi8, 0) - duration
     now = ts.as_unit("ns").asi8
     active = valid & (now >= start_ns) & (now <= last_ns)
-    cut_ns = (day + pd.Timedelta(minutes=cutoff_min)).tz_localize(_ET).as_unit("ns").asi8
+    # Compare wall-clock minutes without localizing an inactive DST Sunday's cutoff.
     return SessionFeatures(
         date=np.asarray(local.strftime("%Y%m%d"), dtype=np.int64),
         clock_min=clock,
         active=active,
         start=active & (now == start_ns),
         end=active & (now == last_ns),
-        cutoff=active & (now >= np.minimum(cut_ns, last_ns)),
+        cutoff=active & ((clock >= cutoff_min) | (now >= last_ns)),
         early_close=aligned.early_close.eq(True).to_numpy(dtype=np.bool_),
     )
 
