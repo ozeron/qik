@@ -220,17 +220,21 @@ def _venue_column(
     cnt = 0
     for i in range(len(c)):
         ci = c[i]
+        long_exit_i = False if long_exits is None else long_exits[i]
+        short_exit_i = False if short_exits is None else short_exits[i]
+        close_mask = 0 if force_close is None else force_close[i]
+        open_flatten = False if force_open is None else force_open[i]
         exit_now = _exit_for(
             exit_sig[i],
-            long_exits[i],
-            short_exits[i],
+            long_exit_i,
+            short_exit_i,
             pos if pos else (side_sig[pending] if pending >= 0 else 0),
         )
         exited = False
         busy = pending >= 0
         if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i]:
             return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, stop
-        if force_open[i]:
+        if open_flatten:
             if pos:
                 _venue_record(
                     count_only,
@@ -352,13 +356,13 @@ def _venue_column(
                 pos, exited = 0, True
                 commands.append((i + latency, 5, gen))
                 protection = 3
-        if force_close[i] & 8:
+        if close_mask & 8:
             if pos or pending >= 0:
                 return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, ei, ep, stop
             continue
         if (
-            _force_for(force_close[i], pos if pos else (side_sig[pending] if pending >= 0 else 0))
-            or force_open[i]
+            _force_for(close_mask, pos if pos else (side_sig[pending] if pending >= 0 else 0))
+            or open_flatten
         ):
             if pos:
                 _venue_record(
@@ -390,8 +394,8 @@ def _venue_column(
             protection = 3
         exit_now = _exit_for(
             exit_sig[i],
-            long_exits[i],
-            short_exits[i],
+            long_exit_i,
+            short_exit_i,
             pos if pos else (side_sig[pending] if pending >= 0 else 0),
         )
         if (
@@ -634,11 +638,15 @@ def _column(
         stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
         stale_px = 0.0
         ci = c[i]
-        exit_now = _exit_for(exit_sig[i], long_exits[i], short_exits[i], pos if pos else pend)
+        long_exit_i = False if long_exits is None else long_exits[i]
+        short_exit_i = False if short_exits is None else short_exits[i]
+        close_mask = 0 if force_close is None else force_close[i]
+        open_flatten = False if force_open is None else force_open[i]
+        exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
         if pend != 0 and new_day[i]:
             # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
             return cnt, ERR_PENDING_NEW_DAY, i, pos, entry_i, entry_px, stop
-        if force_open[i]:
+        if open_flatten:
             if pos:
                 _venue_record(
                     count_only,
@@ -821,11 +829,11 @@ def _column(
                         stale_px = px
                 pos = 0
                 exited = True
-        if force_close[i] & 8:
+        if close_mask & 8:
             if pos or pend:
                 return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
             continue
-        if _force_for(force_close[i], pos if pos else pend):
+        if _force_for(close_mask, pos if pos else pend):
             if pos:
                 _venue_record(
                     count_only,
@@ -848,9 +856,9 @@ def _column(
                 cnt += 1
             pos, pend, market_entry, market_exit = 0, 0, -1, False
             continue
-        if force_open[i]:
+        if open_flatten:
             continue
-        exit_now = _exit_for(exit_sig[i], long_exits[i], short_exits[i], pos if pos else pend)
+        exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
         market_exit = exit_now and pos != 0 and exit_next_open
         if market_exit and (i + 1 == n or (new_day[i + 1] and not cross_session)):
             return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i, entry_px, stop
@@ -998,18 +1006,11 @@ def run_columns(
     without over-allocating ``k * n`` rows.
     """
 
+    # Keep absent masks as None so Numba removes their checks from each bar.
     exit_next_open = next_open if exit_next_open is None else exit_next_open
     if entry_trigger is not None:
         assert stop_updates is not None and target_updates is not None
         assert be_after is not None and be_offset is not None
-    if exit_long is None:
-        exit_long = np.zeros_like(exit_sig)
-    if exit_short is None:
-        exit_short = np.zeros_like(exit_sig)
-    if force_close is None:
-        force_close = np.zeros(exit_sig.shape, np.int8)
-    if force_open is None:
-        force_open = np.zeros_like(exit_sig)
     if tick_round:
         entry_limit = entry_limit.copy()
         for j in range(side_sig.shape[0]):
@@ -1037,6 +1038,10 @@ def run_columns(
     s0 = np.empty(0, np.int8)
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
+        long_column = None if exit_long is None else exit_long[j]
+        short_column = None if exit_short is None else exit_short[j]
+        close_column = None if force_close is None else force_close[j]
+        open_column = None if force_open is None else force_open[j]
         if (
             entry_trigger is not None
             and stop_updates is not None
@@ -1081,10 +1086,10 @@ def run_columns(
                 target_gap,
                 tick_round,
                 tick,
-                exit_long[j],
-                exit_short[j],
-                force_close[j],
-                force_open[j],
+                long_column,
+                short_column,
+                close_column,
+                open_column,
                 cross_session,
                 True,
                 e0,
@@ -1100,7 +1105,7 @@ def run_columns(
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, exit_long[j], exit_short[j], force_close[j], force_open[j], cross_session, True,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, True,
             e0, e0, s0, f0, f0, s0, f0, 0,
         )  # fmt: skip
         counts[j] = cnt
@@ -1122,6 +1127,10 @@ def run_columns(
     reason = np.empty(total, np.int8)
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
+        long_column = None if exit_long is None else exit_long[j]
+        short_column = None if exit_short is None else exit_short[j]
+        close_column = None if force_close is None else force_close[j]
+        open_column = None if force_open is None else force_open[j]
         if errs[j] == 0:
             if (
                 entry_trigger is not None
@@ -1167,10 +1176,10 @@ def run_columns(
                     target_gap,
                     tick_round,
                     tick,
-                    exit_long[j],
-                    exit_short[j],
-                    force_close[j],
-                    force_open[j],
+                    long_column,
+                    short_column,
+                    close_column,
+                    open_column,
                     cross_session,
                     False,
                     entry_i,
@@ -1186,7 +1195,7 @@ def run_columns(
                 _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, exit_long[j], exit_short[j], force_close[j], force_open[j], cross_session, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
                 stop, offsets[j],
@@ -1259,10 +1268,14 @@ def _slots_column(
     cnt, error = 0, ERR_NONE
     for i in range(len(c)):
         ci = c[i]
+        long_exit_i = False if long_exits is None else long_exits[i]
+        short_exit_i = False if short_exits is None else short_exits[i]
+        close_mask = 0 if force_close is None else force_close[i]
+        open_flatten = False if force_open is None else force_open[i]
         exit_now = _exit_for(
             exits[i],
-            long_exits[i],
-            short_exits[i],
+            long_exit_i,
+            short_exit_i,
             pos if pos else (sides[pending] if pending >= 0 else 0),
         )
         exited, busy = False, pending >= 0
@@ -1273,7 +1286,7 @@ def _slots_column(
             and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
         ):
             return cnt, ERR_PENDING_NEW_DAY, i, pos, ei, ep, risk_stop
-        if force_open[i]:
+        if open_flatten:
             if pos:
                 _venue_record(
                     count_only,
@@ -1418,15 +1431,13 @@ def _slots_column(
                             pos, exited, live = 0, True, False
                 if error:
                     return cnt, error, i, pos, ei, ep, risk_stop
-                if force_close[i] & 8:
+                if close_mask & 8:
                     if pos or pending >= 0:
                         return cnt, ERR_NEXT_OPEN_SESSION_END, i, pos, ei, ep, risk_stop
                     continue
                 if (
-                    _force_for(
-                        force_close[i], pos if pos else (sides[pending] if pending >= 0 else 0)
-                    )
-                    or force_open[i]
+                    _force_for(close_mask, pos if pos else (sides[pending] if pending >= 0 else 0))
+                    or open_flatten
                 ):
                     if pos:
                         _venue_record(
@@ -1460,8 +1471,8 @@ def _slots_column(
                     continue
                 exit_now = _exit_for(
                     exits[i],
-                    long_exits[i],
-                    short_exits[i],
+                    long_exit_i,
+                    short_exit_i,
                     pos if pos else (sides[pending] if pending >= 0 else 0),
                 )
                 if pos == 0 and pending < 0:

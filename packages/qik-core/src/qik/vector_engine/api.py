@@ -479,11 +479,16 @@ def simulate(
     k = side.shape[1]
 
     def exit_mask(a: np.ndarray | None, name: str) -> np.ndarray:
-        return np.zeros((n, k), np.bool_) if a is None else _as_2d(a, n, np.bool_, name)
+        return (
+            np.broadcast_to(np.zeros((n, 1), np.bool_), (n, k))
+            if a is None
+            else _as_2d(a, n, np.bool_, name)
+        )
 
     exit_long = exit_mask(signals.exit_long, "exit_long")
     exit_short = exit_mask(signals.exit_short, "exit_short")
     flatten = exit_mask(signals.flatten, "flatten")
+    flatten_used = signals.flatten is not None and bool(flatten.any())
     exit_ = _as_2d(signals.exit, n, np.bool_, "exit")
     nan = np.full((n, k), np.nan)
 
@@ -600,7 +605,7 @@ def simulate(
         new_day = _new_york_days(bars, "stop entries")
     session_days = new_day.copy()
     needs_sessions = rules.flatten is Flatten.SESSION_END or (
-        rules.flatten is Flatten.NEXT_OPEN and bool(flatten.any())
+        rules.flatten is Flatten.NEXT_OPEN and flatten_used
     )
     if bars.session_labels is not None:
         session_days = (
@@ -611,31 +616,39 @@ def simulate(
     if bars.session_labels is not None and (next_open or exit_next_open):
         new_day = session_days.copy()
     ends = np.r_[session_days[1:], True] if n else np.zeros(0, bool)
-    force_close = np.zeros((n, k), np.int8)
-    force_open = np.zeros((n, k), bool)
-    if rules.session_boundary is SessionBoundary.LAST_BAR_CLOSE and exit_next_open:
-        force_close |= (ends[:, None] & exit_).astype(np.int8)
-        force_close |= 2 * (ends[:, None] & exit_long).astype(np.int8)
-        force_close |= 4 * (ends[:, None] & exit_short).astype(np.int8)
-        exit_ = exit_ & ~ends[:, None]
-        exit_long = exit_long & ~ends[:, None]
-        exit_short = exit_short & ~ends[:, None]
-    if rules.flatten is Flatten.SESSION_END:
-        force_close |= np.broadcast_to(ends[:, None], (n, k))
-    elif rules.flatten is Flatten.LAST_BAR_CLOSE:
-        force_close |= flatten
-    elif flatten.any():
-        for i in np.flatnonzero(flatten.any(axis=1)):
-            boundary = i + 1 == n or (
-                session_days[i + 1] and rules.session_boundary is not SessionBoundary.NEXT_OBSERVED
-            )
-            if boundary:
-                if rules.session_boundary is not SessionBoundary.LAST_BAR_CLOSE:
-                    force_close[i] |= 8 * flatten[i].astype(np.int8)
-                    continue
-                force_close[i] |= flatten[i]
-            else:
-                force_open[i + 1] |= flatten[i]
+    force_close: np.ndarray | None = None
+    force_open: np.ndarray | None = None
+    if (
+        flatten_used
+        or rules.flatten is not Flatten.NEXT_OPEN
+        or (rules.session_boundary is SessionBoundary.LAST_BAR_CLOSE and exit_next_open)
+    ):
+        force_close = np.zeros((n, k), np.int8)
+        force_open = np.zeros((n, k), bool)
+        if rules.session_boundary is SessionBoundary.LAST_BAR_CLOSE and exit_next_open:
+            force_close |= (ends[:, None] & exit_).astype(np.int8)
+            force_close |= 2 * (ends[:, None] & exit_long).astype(np.int8)
+            force_close |= 4 * (ends[:, None] & exit_short).astype(np.int8)
+            exit_ = exit_ & ~ends[:, None]
+            exit_long = exit_long & ~ends[:, None]
+            exit_short = exit_short & ~ends[:, None]
+        if rules.flatten is Flatten.SESSION_END:
+            force_close |= np.broadcast_to(ends[:, None], (n, k))
+        elif rules.flatten is Flatten.LAST_BAR_CLOSE:
+            force_close |= flatten
+        elif flatten_used:
+            for i in np.flatnonzero(flatten.any(axis=1)):
+                boundary = i + 1 == n or (
+                    session_days[i + 1]
+                    and rules.session_boundary is not SessionBoundary.NEXT_OBSERVED
+                )
+                if boundary:
+                    if rules.session_boundary is not SessionBoundary.LAST_BAR_CLOSE:
+                        force_close[i] |= 8 * flatten[i].astype(np.int8)
+                        continue
+                    force_close[i] |= flatten[i]
+                else:
+                    force_open[i + 1] |= flatten[i]
     t = np.ascontiguousarray
     slot_data: tuple[np.ndarray | None, ...] = (None,) * 5
     if slots:
@@ -657,8 +670,10 @@ def simulate(
         exit_next_open=exit_next_open,
         target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,
         tick_round=tuple(TickRound).index(rules.tick_round),
-        exit_long=t(exit_long.T), exit_short=t(exit_short.T),
-        force_close=t(force_close.T), force_open=t(force_open.T),
+        exit_long=t(exit_long.T) if signals.exit_long is not None and exit_long.any() else None,
+        exit_short=t(exit_short.T) if signals.exit_short is not None and exit_short.any() else None,
+        force_close=t(force_close.T) if force_close is not None and force_close.any() else None,
+        force_open=t(force_open.T) if force_open is not None and force_open.any() else None,
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         bracket_anchor=0 if rules.bracket_anchor is None else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
