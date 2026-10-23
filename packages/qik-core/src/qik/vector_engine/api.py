@@ -337,7 +337,7 @@ class Result:
 
     @property
     def deployable(self) -> bool:
-        """V2 has no stop-entry/amend/MIT API; compliant research can still be undeployable."""
+        """Nautilus compliance plus a V2-supported execution and sizing contract."""
 
         return self.compliance is Compliance.NAUTILUS and not self.research_only
 
@@ -608,7 +608,14 @@ def simulate(
         compliance = Compliance.REPRO_TRADINGVIEW
     else:
         compliance = _ReproCompliance(f"repro:{rules.author_platform}")
-    return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, slots)
+    research_only = slots and (
+        rules.protection == "oto"
+        or rules.adaptive_high_low_ordering
+        or not rules.reenter_on_exit_bar
+        or bool(np.any(entries & np.isnan(stop) & np.isnan(stop_pts)))
+        or (sizing is not None and sizing.contracts is None)
+    )
+    return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, research_only)
 
 
 def _limit_entry_checks(

@@ -13,6 +13,7 @@ from qik.vector_engine import (
     Compliance,
     Costs,
     Decision,
+    FillModel,
     Instrument,
     MarketFill,
     Profile,
@@ -100,12 +101,43 @@ def test_slot_decisions_and_deployability_include_empty_results() -> None:
     np.testing.assert_array_equal(sig.breakeven_after_points, np.full(5, 2.0))
     np.testing.assert_array_equal(sig.breakeven_offset_points, np.full(5, 0.25))
     res = simulate(_bars(), sig, instrument=Instrument(0.25, 1), costs=Costs(), initial_cash=10000)
-    assert res.compliance is Compliance.NAUTILUS and not res.deployable
+    assert res.compliance is Compliance.NAUTILUS and res.deployable
     assert res.trades.empty
-    assert res.summary().deployable.tolist() == [False]
-    assert not simulate(
+    assert res.summary().deployable.tolist() == [True]
+    assert simulate(
         _bars(), Signals(np.zeros(5), np.zeros(5)), rules=Rules(target_order="mit")
     ).deployable
+
+
+@pytest.mark.parametrize("latency", [0, 1])
+@pytest.mark.parametrize("fill", [FillModel.DEFAULT, FillModel.ONE_TICK])
+def test_proven_callback_models_deploy_but_absolute_oto_does_not(latency, fill):
+    signals = Signals(np.zeros(5), np.zeros(5))
+    for protection, expected in (("callback", True), ("oto", False)):
+        result = simulate(
+            _bars(),
+            signals,
+            rules=Rules(
+                target_order="mit", protection=protection, latency_bars=latency, fill_model=fill
+            ),
+            instrument=Instrument(0.25, 1),
+            costs=Costs(),
+            sizing=Sizing(contracts=1),
+        )
+        assert result.deployable is expected
+
+
+def test_unproved_slot_contracts_and_repro_remain_research_only():
+    side = np.array([1, 0, 0, 0, 0])
+    sig = Signals(side, np.array([False, False, False, True, False]), stop=np.full(5, 90.0))
+    for rules, signals in (
+        (Rules(target_order="mit", adaptive_high_low_ordering=True), sig),
+        (Rules(target_order="mit", reenter_on_exit_bar=False), sig),
+        (Rules(target_order="mit"), replace(sig, stop=None)),
+        (Rules(target_order="mit", profile=Profile.TRADINGVIEW), sig),
+        (Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN), sig),
+    ):
+        assert not simulate(_bars(), signals, rules=rules).deployable
 
 
 def test_amendments_preserve_entry_risk_for_sizing() -> None:
@@ -131,7 +163,7 @@ def test_slot_refusals_and_stop_entry_skip() -> None:
     with pytest.raises(ValueError, match="stop entry.*in the market"):
         simulate(_bars(), sig)
     skipped = simulate(_bars(), sig, rules=Rules(stop_entry_in_market="skip"))
-    assert skipped.trades.empty and skipped.open_positions.empty and not skipped.deployable
+    assert skipped.trades.empty and skipped.open_positions.empty and skipped.deployable
     with pytest.raises(ValueError, match="new New York date"):
         simulate(
             replace(_bars(), index=pd.date_range("2023-01-03", periods=5, freq="D", tz="UTC")),
