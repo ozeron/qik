@@ -142,7 +142,12 @@ def _kernel_final(final: tuple) -> tuple:
 @pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
 @settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
-@given(case=_case(), adverse_first=st.booleans(), bracket_anchor=st.integers(0, 2))
+@given(
+    case=_case(),
+    adverse_first=st.booleans(),
+    bracket_anchor=st.integers(0, 2),
+    point_brackets=st.booleans(),
+)
 def test_kernel_equals_reference(
     case,
     next_open: bool,
@@ -150,16 +155,35 @@ def test_kernel_equals_reference(
     slots: bool,
     adverse_first: bool,
     bracket_anchor: int,
+    point_brackets: bool,
 ) -> None:
     arrays, side, exit_, stop, target, adaptive, reenter, stale_drop = case
+    # Anchor changes have no effect on absolute levels. Include distances so
+    # SIGNAL versus FILL really diverges on next-open gaps.
+    stop_pts = target_pts = None
+    if point_brackets:
+        stop_pts = np.full(len(side), 1.0)
+        target_pts = np.full(len(side), 1.5)
+        stop = np.full(len(side), np.nan)
+        target = np.full(len(side), np.nan)
     ref = simulate_column_reference(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
         adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, next_open=next_open, exit_next_open=exit_next_open,
         stop_update=np.full(len(side), np.nan) if slots else None,
+        stop_pts=stop_pts, target_pts=target_pts,
         adverse_first=adverse_first, bracket_anchor=bracket_anchor,
     )  # fmt: skip
     trades, err, err_bar, final, cnt = _run_kernel(
-        *case,
+        arrays,
+        side,
+        exit_,
+        stop,
+        target,
+        adaptive,
+        reenter,
+        stale_drop,
+        stop_pts=stop_pts,
+        target_pts=target_pts,
         next_open=next_open,
         exit_next_open=exit_next_open,
         slots=slots,
@@ -361,15 +385,18 @@ def test_kernel_equals_reference_dense_limit_entries() -> None:
         adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
         stale_drop = bool(rng.random() < 0.5)
         flat = bool(rng.random() < 0.5)
+        adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
         ref = simulate_column_reference(
             arrays["o"], arrays["h"], arrays["lo"], arrays["c"], side, exit_, stop, target,
             adaptive=adaptive, reenter=reenter, stale_drop=stale_drop, entry_limit=limit,
             stop_pts=stop_pts, target_pts=target_pts, chase_after=chase, protect_flatten=flat,
             new_day=new_day,
+            adverse_first=adverse_first, bracket_anchor=bracket_anchor,
         )  # fmt: skip
         trades, err, err_bar, final, _ = _run_kernel(
             arrays, side, exit_, stop, target, adaptive, reenter, stale_drop,
             limit, stop_pts, target_pts, chase, flat, new_day,
+            adverse_first=adverse_first, bracket_anchor=bracket_anchor,
         )  # fmt: skip
         assert (err, err_bar if err else -1) == (ref.err, ref.err_bar if ref.err else -1)
         seen["err_protect"] += err == K.ERR_PROTECT_REJECTED
