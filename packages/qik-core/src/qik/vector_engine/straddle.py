@@ -21,6 +21,7 @@ def validate_pair(
     one_tick: bool,
     arm_stop: bool = False,
     day_cancel: bool = False,
+    next_open: bool = False,
 ) -> bool:
     """Validate before an order can be sent, including from a compiled strategy."""
     if np.isnan(pair).all():
@@ -47,5 +48,11 @@ def validate_pair(
     if oto:
         raise ValueError("straddle OTO composition is unproved; use callback protection")
     if one_tick:
-        raise ValueError("straddle ONE_TICK execution is unproved")
+        if not next_open:
+            raise ValueError("straddle ONE_TICK execution is unproved")
+        if not np.isnan(pair[1]) or not np.isnan(pair[7]):
+            raise ValueError("straddle ONE_TICK IOC execution is unproved")
+        for offset in (0, 6):
+            if not np.isnan(pair[offset + 3]) or not np.isnan(pair[offset + 5]):
+                raise ValueError("straddle ONE_TICK targets execution is unproved")
     return True

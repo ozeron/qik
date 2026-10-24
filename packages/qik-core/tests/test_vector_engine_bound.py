@@ -84,6 +84,7 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         return
     raw = module.run(*args)
     decisions = raw[-1]
+    assert raw[-2].shape == (2, len(x))  # Submitted sizing risk, before the Decision array.
     assert decisions.shape == (2, 31, len(x))
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
     batch = K.run_columns(

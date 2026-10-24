@@ -85,13 +85,14 @@ def compare(*args, **kwargs):
             0,
             # Numba does not bounds-check: the replay vector must cover every
             # index _run reads (combine, amend_close, completed_close,
-            # arm_stop, day_cancel, next_bar).
+            # arm_stop, day_cancel, next_bar, exit_and_rearm).
             d["combine"],
             d["amend_close"],
             d["completed_close"],
             d["arm_stop"],
             d["day_cancel"],
             d["next_bar"],
+            d["exit_and_rearm"],
         ],
         float,
     )

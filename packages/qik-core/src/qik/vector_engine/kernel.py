@@ -45,6 +45,7 @@ ERR_AMEND_REJECTED = 9
 ERR_AMEND_NO_ORDER = 10
 ERR_STOP_REPLACE_LATENCY = 11
 ERR_STRADDLE_SIDE_CANCEL = 12
+ERR_BUSY_ENTRY_DROPPED = 13  # R15b: a whole-bar busy guard would silently discard an entry
 
 _SLOT_SUBMIT = 1
 _SLOT_PROTECT = 2
@@ -1821,6 +1822,8 @@ def run_columns(
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
     target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None,
     entry_from_open=None, stop_fraction=None, target_fraction=None, next_bar=False,
+    sizing_risks=None,
+    exit_and_rearm=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1873,6 +1876,7 @@ def run_columns(
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
         pair_column = _straddle_column(straddle, j)
+        risk_column = None if sizing_risks is None else sizing_risks[j]
         rel_column = None if entry_from_open is None else entry_from_open[j]
         sf_column = None if stop_fraction is None else stop_fraction[j]
         tf_column = None if target_fraction is None else target_fraction[j]
@@ -1951,6 +1955,8 @@ def run_columns(
                 stop_fracs=sf_column,
                 target_fracs=tf_column,
                 next_bar=next_bar,
+                sizing_risks=risk_column,
+                exit_and_rearm=exit_and_rearm,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
@@ -1979,6 +1985,7 @@ def run_columns(
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
         pair_column = _straddle_column(straddle, j)
+        risk_column = None if sizing_risks is None else sizing_risks[j]
         rel_column = None if entry_from_open is None else entry_from_open[j]
         sf_column = None if stop_fraction is None else stop_fraction[j]
         tf_column = None if target_fraction is None else target_fraction[j]
@@ -2058,6 +2065,8 @@ def run_columns(
                     stop_fracs=sf_column,
                     target_fracs=tf_column,
                     next_bar=next_bar,
+                    sizing_risks=risk_column,
+                    exit_and_rearm=exit_and_rearm,
                 )
             else:
                 _column(
@@ -2139,6 +2148,8 @@ def _slots_column(
     stop_fracs=None,
     target_fracs=None,
     next_bar=False,
+    sizing_risks=None,
+    exit_and_rearm=False,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     if straddle is not None and np.isfinite(straddle).any():
@@ -2215,6 +2226,8 @@ def _slots_column(
         stop_fracs,
         target_fracs,
         next_bar,
+        sizing_risks,
+        exit_and_rearm,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2294,6 +2307,8 @@ def _slots_column_advance(state, i, inputs, core=None):
         stop_fracs,
         target_fracs,
         next_bar,
+        sizing_risks,
+        exit_and_rearm,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2453,7 +2468,13 @@ def _slots_column_advance(state, i, inputs, core=None):
                         -s, level, pt if stop_order else pt + s * slip, stop_order
                     )
                     if match:
-                        px = pt + s * slip if slip else (pt if stop_order and m == 0 else level)
+                        if slip and next_open and stop_order:
+                            # R15b: the A4 price (trigger on a touch, open on a gap) plus one tick.
+                            px = _round_price(
+                                (pt if m == 0 else level) + s * slip, round_tick, tick_round, s
+                            )
+                        else:
+                            px = pt + s * slip if slip else (pt if stop_order and m == 0 else level)
                         anchor = _anchor(
                             bracket_anchor,
                             c[d],
@@ -2479,6 +2500,24 @@ def _slots_column_advance(state, i, inputs, core=None):
                             stop_frac=_optional_at(stop_fracs, d, np.nan),
                             target_frac=_optional_at(target_fracs, d, np.nan),
                         )
+                        if slip and next_open and stop_order:
+                            # Quantity is submitted against the trigger geometry, before slippage.
+                            submitted_stop, _ = levels(
+                                s,
+                                _anchor(bracket_anchor, c[d], level, level),
+                                leg_stop,
+                                leg_target,
+                                leg_sp,
+                                leg_tp,
+                                round_tick,
+                                tick_round,
+                                combine=combine,
+                                fill=level,
+                            )
+                            submitted_risk = abs(level - submitted_stop)
+                            _store_risk(sizing_risks, i, submitted_risk)
+                            if core is not None:
+                                core.sizing_risks[i] = submitted_risk
                         pos, ei, ep, gen, risk_stop = s, i, px, d, stop
                         be_done = False
                         pending, resting, chasing = -1, False, False
@@ -2524,7 +2563,10 @@ def _slots_column_advance(state, i, inputs, core=None):
                     reason, px = 0, 0.0
                     if _in_market(pos, stop, pt, True):
                         reason = REASON_STOP_GAP if m == 0 else REASON_STOP
-                        px = pt - pos * slip if slip else (pt if m == 0 else stop)
+                        if slip and next_open:
+                            px = (pt if m == 0 else stop) - pos * slip
+                        else:
+                            px = pt - pos * slip if slip else (pt if m == 0 else stop)
                     elif not adverse_hit and _in_market(
                         pos, target, pt if mit else pt - pos * slip, False
                     ):
@@ -2682,7 +2724,9 @@ def _slots_column_advance(state, i, inputs, core=None):
                     False,
                     False,
                 )
-                continue
+                if not (exit_and_rearm and reenter and (sides[i] or _pair_at(straddle, i))):
+                    continue
+                exited, busy = True, False
             exit_now = _exit_for(
                 exits[i],
                 long_exit_i,
@@ -2735,7 +2779,18 @@ def _slots_column_advance(state, i, inputs, core=None):
                 )
             if exit_now:
                 chasing = False
-                if pending >= 0:
+                if (
+                    pending >= 0
+                    and exit_and_rearm
+                    and reenter
+                    and (sides[i] or _pair_at(straddle, i))
+                ):
+                    # A23: this close cancels the working entry, then submits the new one.
+                    for q in range(len(queue) - 1, -1, -1):
+                        if queue[q][2] == pending:
+                            queue.pop(q)
+                    pending, resting, closing = -1, False, False
+                elif pending >= 0:
                     queue.append(
                         (
                             i + latency + (exit_next_open if exit_now else next_open),
@@ -2840,10 +2895,10 @@ def _slots_column_advance(state, i, inputs, core=None):
                 )
                 queue.append((i + latency + next_open, _SLOT_REPLACE, i, 0.0))
             elif (
-                pos == 0
+                (pos == 0 or (exit_and_rearm and exit_now and reenter))
                 and pending < 0
-                and not busy
-                and not closing
+                and (not busy or (exit_and_rearm and exit_now and reenter))
+                and (not closing or (exit_and_rearm and exit_now and reenter))
                 and (sides[i] or _pair_at(straddle, i))
                 and (reenter or not exited)
             ):
@@ -2866,6 +2921,19 @@ def _slots_column_advance(state, i, inputs, core=None):
                         0.0,
                     )
                 )
+            elif (
+                slip
+                and next_open
+                and pos == 0
+                and pending < 0
+                and busy
+                and not closing
+                and (sides[i] or _pair_at(straddle, i))
+                and (reenter or not exited)
+                and not error
+            ):
+                # R15b: refuse instead of letting the whole-bar busy guard drop this entry.
+                error = ERR_BUSY_ENTRY_DROPPED
             if next_open and exit_now and pos and reenter and sides[i] and pending < 0:
                 pending = i
                 queue.append((i + 1, _SLOT_SUBMIT, i, 0.0))
@@ -3116,7 +3184,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                         out_st,
                     )
                     cnt += 1
-                    if next_open and pending >= 0 and pending != gen:
+                    if (next_open or exit_and_rearm) and pending >= 0 and pending != gen:
                         closing = False
                     pos, exited, live = 0, True, False
         if not error and not latency and (next_open or exit_next_open):
@@ -3184,7 +3252,7 @@ V_LAST_EXIT_I, V_LAST_EXIT_PX, V_LAST_EXIT_REASON, V_EQUITY = range(8, 12)
 CoreContext = namedtuple(
     "CoreContext",
     "step state params feats volume position_view decision sides exits levels long_exits short_exits "
-    "force_close force_open days ends economic account flatten_mode boundary tick rounding decisions exit_next_open pair_rules",
+    "force_close force_open days ends economic account flatten_mode boundary tick rounding decisions exit_next_open pair_rules sizing_risks",
 )
 
 
@@ -3227,7 +3295,8 @@ def _core_decision(
     pv, friction, bps, mode, amount, cap, lot, minimum = core.economic[:8]
     clamp = len(core.economic) > 8 and bool(core.economic[8])
     for k in range(seen, cnt):
-        risk = abs(out_ep[k] - out_st[k]) * pv
+        points = core.sizing_risks[out_ei[k]]
+        risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
         qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
         if qty < 0:
             core.account[2] = 1
@@ -3248,9 +3317,9 @@ def _core_decision(
     view[V_ENTRY_I], view[V_ENTRY_PX] = (ei if pos else -1), (ep if pos else np.nan)
     view[V_STOP], view[V_TARGET] = (stop if pos else np.nan), (target if pos else np.nan)
     if pos:
-        qty = _contracts_for(
-            mode, amount, cap, core.account[1], abs(ep - risk_stop) * pv, lot, minimum, clamp
-        )
+        points = core.sizing_risks[ei]
+        risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
+        qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
         if qty < 0:
             core.account[2] = 2
             return
@@ -3286,18 +3355,40 @@ def _core_decision(
             core.account[2] = 4
             return
         if core.pair_rules & 8:
-            core.account[2] = 5
-            return
+            if not core.pair_rules & 64:
+                core.account[2] = 5
+                return
+            if not np.isnan(pair[1]) or not np.isnan(pair[7]):
+                core.account[2] = 7
+                return
+            if (
+                not np.isnan(pair[3])
+                or not np.isnan(pair[5])
+                or not np.isnan(pair[9])
+                or not np.isnan(pair[11])
+            ):
+                core.account[2] = 6
+                return
+    if d[12] and core.pair_rules & 128 and core.flatten_mode == 0:
+        # A23 settles a flatten at this close only; a future-open flatten is refused.
+        core.account[2] = 8
+        return
     if validate_pair(
         pair,
         d[2:12],
         d[0],
-        bool(d[1] or d[12] or d[13] or d[14] or not np.isnan(d[15])),
+        bool(
+            d[13]
+            or d[14]
+            or not np.isnan(d[15])
+            or ((d[1] or d[12]) and not (core.pair_rules & 128))
+        ),
         core.pair_rules & 3,
         bool(core.pair_rules & 4),
         bool(core.pair_rules & 8),
         bool(core.pair_rules & 16),
         bool(core.pair_rules & 32),
+        bool(core.pair_rules & 64),
     ):
         if core.levels.shape[0] < 23:
             raise ValueError("straddle requires the slots scheduler")
@@ -3387,6 +3478,12 @@ def _open_in_market(triggers, pair, sides, d, opening):
             not np.isnan(pair[6, d]) and opening <= pair[6, d]
         )
     return _in_market(-sides[d], triggers[d], opening, True)
+
+
+@nb.njit(cache=True)
+def _store_risk(buffer, i, risk):
+    if buffer is not None:
+        buffer[i] = risk
 
 
 @nb.njit(cache=True)

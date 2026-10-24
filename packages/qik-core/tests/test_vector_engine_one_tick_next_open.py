@@ -197,8 +197,6 @@ def test_refusals() -> None:
         with pytest.raises(ValueError, match="does not support targets"):
             one_tick(sig)
     for sig, rules in (
-        (entry(1, stop_points=2.0, stop_update=99.5), RULES),
-        (entry(1, entry_stop=101.5), RULES),
         (entry(1, stop_points=2.0), replace(RULES, target_order="mit")),
         (entry(1, stop=99.0), replace(RULES, protection="oto")),
     ):
@@ -242,8 +240,9 @@ def test_typed_python_equals_jit_and_slots_refuse_before_matching() -> None:
     pd.testing.assert_frame_equal(j.trades, p.trades, check_exact=True)
     np.testing.assert_array_equal(j.states, p.states)
     assert j.trades.iloc[0].entry_px == 101.25 and j.trades.iloc[0].exit_px == 99.0
-    with pytest.raises(ValueError, match="does not support order slots"):
-        typed(("entry_side", "stop_update"))
+    pd.testing.assert_frame_equal(
+        j.trades, typed(("entry_side", "stop_points", "stop_update")).trades, check_exact=True
+    )
     with pytest.raises(ValueError, match="does not support order slots"):
         typed(("entry_side", "stop_points"), rules=replace(RULES, protection="oto"))
 
@@ -375,9 +374,14 @@ def test_kernel_equals_reference_dense(exit_next_open: bool) -> None:
         {"amend_timing": "close_submit", "entry_bar_decision": "completed_close"},
     ],
 )
-def test_slot_clock_overrides_refuse_before_any_matching(overrides: dict[str, str]) -> None:
-    with pytest.raises(ValueError, match="does not support amend_timing or entry_bar_decision"):
-        replace(RULES, **overrides)
+def test_slot_clock_overrides_depend_on_config_not_data(overrides: dict[str, str]) -> None:
+    # R15b: clock overrides always select the slots scheduler, so a run without any
+    # amendment and one with a no-op amendment (same level) are both accepted and equal.
+    rules = replace(RULES, **overrides)
+    plain = one_tick(entry(1, stop_points=2.0), rules)
+    amended = replace(entry(1, stop_points=2.0), stop_update=np.array([NAN, 99.25, NAN, NAN]))
+    pd.testing.assert_frame_equal(plain, one_tick(amended, rules), check_exact=True)
+    assert plain.entry_px.tolist() == [101.25] and plain.stop.tolist() == [99.25]
 
 
 @strategy(state=S, params=P, features=F)

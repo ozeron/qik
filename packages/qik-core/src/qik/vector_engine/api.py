@@ -66,8 +66,7 @@ REASON_NAMES = {
 
 
 ONE_TICK_SLOTS = (
-    "ONE_TICK with next-open entries does not support order slots "
-    "(entry_stop, amendments, breakeven, MIT or OTO): unproved"
+    "ONE_TICK with next-open entries does not support order slots (MIT or OTO): unproved"
 )
 
 
@@ -201,6 +200,10 @@ class Rules:
     closes intrabar schedule a fresh entry at this close for the following open.
     ``reenter_on_exit_bar`` still gates that entry; resting-entry callbacks keep A15.
 
+    ``exit_and_rearm=True`` settles a close exit before submitting a fresh pair
+    for the next bar. It requires close exits, zero latency and callback DEFAULT
+    execution. Sizing includes the realized close P&L. V2 refuses this opt-in.
+
     ``order_lifetime="next_bar"`` makes a pending stop entry (or stop pair) submitted at
     a close valid for exactly the next bar, across a date or session boundary, then
     expire before that bar's close decision (GTD next bar). The default ``"day"``
@@ -239,7 +242,23 @@ class Rules:
     day_order_expiry: Literal["refuse", "cancel"] = "refuse"
     order_lifetime: Literal["day", "next_bar"] = field(default="day", kw_only=True)
 
+    exit_and_rearm: bool = field(default=False, kw_only=True)
+
     def __post_init__(self) -> None:
+        if not isinstance(self.exit_and_rearm, bool):
+            raise ValueError("exit_and_rearm must be bool")
+        if self.exit_and_rearm and (
+            self.effective_exit_fill is not FillTiming.CLOSE
+            or self.latency_bars
+            or self.fill_model is not FillModel.DEFAULT
+            or self.protection != "callback"
+            or self.arm_stop != "refuse"
+            or self.day_order_expiry != "refuse"
+        ):
+            raise ValueError(
+                "exit_and_rearm requires close exits, zero latency, callback protection, "
+                "DEFAULT fills, arm_stop=refuse and day_order_expiry=refuse"
+            )
         if (
             not isinstance(self.author_platform, str)
             or re.fullmatch(r"[a-z][a-z0-9_-]*", self.author_platform) is None
@@ -298,14 +317,17 @@ class Rules:
         if self.amend_timing == "close_submit" and self.latency_bars:
             raise ValueError("close_submit requires latency_bars=0")
         if self.order_lifetime == "next_bar":
+            if (
+                self.fill_model is FillModel.ONE_TICK
+                and self.effective_entry_fill is not FillTiming.NEXT_OPEN
+            ):
+                raise ValueError("order_lifetime=next_bar ONE_TICK execution is unproved")
             if self.latency_bars:
                 raise ValueError("order_lifetime=next_bar requires latency_bars=0: unproved")
             if self.day_order_expiry == "cancel":
                 raise ValueError(
                     "order_lifetime=next_bar and day_order_expiry=cancel are two lifetimes"
                 )
-            if self.fill_model is FillModel.ONE_TICK:
-                raise ValueError("order_lifetime=next_bar ONE_TICK execution is unproved")
         if not isinstance(self.fill_model, FillModel):
             raise ValueError("fill_model must be a FillModel enum")
         if next_open and (
@@ -316,15 +338,6 @@ class Rules:
             )
         ):
             raise ValueError("NEXT_OPEN cannot mix with latency_bars or a venue fill_model")
-        if (
-            self.effective_entry_fill is FillTiming.NEXT_OPEN
-            and self.fill_model is FillModel.ONE_TICK
-        ):
-            if self.amend_timing != "next_open" or self.entry_bar_decision != "legacy":
-                raise ValueError(
-                    "ONE_TICK with next-open entries does not support "
-                    "amend_timing or entry_bar_decision overrides: unproved"
-                )
         if not isinstance(self.profile, Profile):
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
@@ -662,11 +675,13 @@ def _simulate(
     target_frac = opt(signals.target_fraction, "target_fraction")
     frac_used = bool(np.isfinite(stop_frac).any() or np.isfinite(target_frac).any())
     slots = (
-        rules.target_order == "mit"
+        rules.exit_and_rearm
+        or rules.target_order == "mit"
         or rules.protection == "oto"
         or any(slot_used)
         or pair_used
         or frac_used
+        or _one_tick_clock_slots(rules)
     )
     levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc, *pair_arrays)
     validation_levels = (*levels, stop_frac, target_frac)
@@ -683,6 +698,8 @@ def _simulate(
     if any(np.isinf(a).any() for a in validation_levels if a is not nan):
         raise ValueError("levels must be finite or NaN")
     entries = side != 0
+    if rules.exit_and_rearm and flatten_used and rules.flatten is Flatten.NEXT_OPEN:
+        raise ValueError("exit_and_rearm flatten requires SESSION_END or LAST_BAR_CLOSE")
     if pair_used:
         for i, j in np.argwhere(pair_rows):
             validate_pair(
@@ -694,12 +711,17 @@ def _simulate(
                     ]
                 ),
                 float(side[i, j]),
-                bool(exit_[i, j] or exit_long[i, j] or exit_short[i, j] or flatten[i, j]),
+                bool(
+                    exit_long[i, j]
+                    or exit_short[i, j]
+                    or ((exit_[i, j] or flatten[i, j]) and not rules.exit_and_rearm)
+                ),
                 (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
                 rules.protection == "oto",
                 rules.fill_model is FillModel.ONE_TICK,
                 rules.arm_stop == "next_bar",
                 rules.day_order_expiry == "cancel",
+                next_open,
             )
         entries = entries | pair_rows
     if frac_used:
@@ -722,9 +744,10 @@ def _simulate(
     if ioc_used and rules.fill_model is FillModel.ONE_TICK:
         raise ValueError("entry_limit_ioc ONE_TICK execution is unproved")
     if next_open and rules.fill_model is FillModel.ONE_TICK:
-        # R15 admits market entries, market/flatten exits and stops; the rest is unproved.
-        if slots:
+        if rules.protection == "oto" or rules.target_order == "mit":
             raise ValueError(ONE_TICK_SLOTS)
+        if np.isfinite(slot_arrays[2]).any():
+            raise ValueError("ONE_TICK with next-open entries does not support targets: unproved")
         if np.any(entries & (np.isfinite(target) | np.isfinite(target_pts))):
             raise ValueError("ONE_TICK with next-open entries does not support targets: unproved")
     if instrument is not None:
@@ -889,6 +912,11 @@ def _simulate(
                         pair_data[j, offset + 1, i] = round_price(
                             pair_data[j, offset + 1, i], instrument.tick, rounding, -direction
                         )
+    sizing_risks = (
+        np.full((k, n), np.nan)
+        if sizing is not None and slots and next_open and rules.fill_model is FillModel.ONE_TICK
+        else None
+    )
     run_columns = K.run_columns if _run_columns is None else _run_columns
     out = run_columns(
         bars.open, bars.high, bars.low, bars.close,
@@ -921,6 +949,8 @@ def _simulate(
         stop_fraction=t(stop_frac.T) if frac_used else None,
         target_fraction=t(target_frac.T) if frac_used else None,
         next_bar=rules.order_lifetime == "next_bar",
+        **({"sizing_risks": sizing_risks} if sizing_risks is not None else {}),
+        exit_and_rearm=rules.exit_and_rearm,
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         combine=(rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
@@ -988,9 +1018,15 @@ def _simulate(
         if sizing is not None:
             pv = instrument.point_value
             risk = np.abs(e_px - trade_stop) * pv
+            if sizing_risks is not None:
+                submitted = sizing_risks[cfg, e_i]
+                risk = np.where(np.isnan(submitted), risk, submitted * pv)
             o_cfg = open_positions["config"].to_numpy()
             o_entry = open_positions["entry_i"].to_numpy()
             o_risk = np.abs(open_positions["entry_px"].to_numpy() - final_stop[held]) * pv
+            if sizing_risks is not None:
+                submitted = sizing_risks[o_cfg, o_entry]
+                o_risk = np.where(np.isnan(submitted), o_risk, submitted * pv)
             cash = float(initial_cash) if initial_cash is not None else np.nan  # risk_usd: unused
             contracts, final_equity, err, row = S.size_trades(
                 cfg,
@@ -1056,7 +1092,8 @@ def _simulate(
         compliance = _ReproCompliance(f"repro:{rules.author_platform}")
     # V2 leaves a DAY limit resting across the NY date (A15): civil-date expiry is research-only.
     research_only = (
-        pair_used
+        rules.exit_and_rearm
+        or pair_used
         or ioc_used
         or rules.day_order_expiry == "cancel"
         or rules.order_lifetime == "next_bar"
@@ -1074,6 +1111,18 @@ def _simulate(
         )
     )
     return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, research_only)
+
+
+def _one_tick_clock_slots(rules: Rules) -> bool:
+    """R15b: clock overrides with ONE_TICK next-open entries always use the slots scheduler.
+
+    The choice depends on the configuration only, never on whether a slot level is finite.
+    """
+    return (
+        rules.fill_model is FillModel.ONE_TICK
+        and rules.effective_entry_fill is FillTiming.NEXT_OPEN
+        and (rules.amend_timing != "next_open" or rules.entry_bar_decision != "legacy")
+    )
 
 
 def _resolve_from_open(
@@ -1094,7 +1143,10 @@ def _resolve_from_open(
     n = len(bars)
     if rules.latency_bars:
         raise ValueError("entry_from_open requires latency_bars=0: unproved")
-    if rules.fill_model is FillModel.ONE_TICK:
+    if (
+        rules.fill_model is FillModel.ONE_TICK
+        and rules.effective_entry_fill is not FillTiming.NEXT_OPEN
+    ):
         raise ValueError("entry_from_open ONE_TICK execution is unproved")
     if rules.protection == "oto":
         raise ValueError("entry_from_open OTO composition is unproved; use callback protection")
@@ -1214,6 +1266,7 @@ def _new_york_date_starts(stamps: pd.DatetimeIndex) -> np.ndarray:
 
 _KERNEL_ERRORS = {
     K.ERR_STRADDLE_SIDE_CANCEL: "straddle side-specific cancellation at bar {bar}, config {j} is unproved; use exit",
+    K.ERR_BUSY_ENTRY_DROPPED: "entry decided at bar {bar}, config {j} would be dropped: an entry order already resolved on this bar keeps it busy (A15/R14 whole-bar guard). ONE_TICK next-open refuses a silent drop; use entry_bar_decision='completed_close' for market entries",
     K.ERR_STOP_REPLACE_LATENCY: "stop entry replacement at bar {bar}, config {j} with latency is not pinned: cancel the old entry and wait before replacing it",
     K.ERR_STOP_ENTRY_IN_MARKET: "stop entry at bar {bar}, config {j} is in the market at submission",
     K.ERR_MIT_IN_MARKET: "MIT target at bar {bar}, config {j} is touched at submission",

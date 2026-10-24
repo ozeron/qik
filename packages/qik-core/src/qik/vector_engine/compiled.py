@@ -46,6 +46,7 @@ from .api import (
     TickRound,
     _day_order_dates,
     _new_york_days,
+    _one_tick_clock_slots,
     _raise_kernel_error,
     _simulate,
 )
@@ -58,7 +59,7 @@ from .straddle import PAIR_FIELDS
 from .types import Bar, Decision
 from .types import Position as AuthorPosition
 
-RULES_WIDTH = 28
+RULES_WIDTH = 29
 
 _legacy_warning_sites: set[tuple[str, int]] = set()
 
@@ -122,6 +123,7 @@ def _run(
     levels_all = np.full((k, 26, n), np.nan)
     bools_all = np.zeros((k, 3, n), np.bool_)
     decisions_all = np.full((k, 31, n), np.nan)
+    sizing_risks_all = np.full((k, n), np.nan)
     for column in nb.prange(k):  # ty: ignore[not-iterable]  (Numba ships prange as a class)
         j = np.int64(column)
         sides, exits, levels = sides_all[j], exits_all[j], levels_all[j]
@@ -163,7 +165,10 @@ def _run(
             + 4 * int(rules[16])
             + 8 * int(rules[8])
             + 16 * int(rules[25])
-            + 32 * int(rules[26]),
+            + 32 * int(rules[26])
+            + 64 * int(rules[5])
+            + 128 * int(rules[28]),
+            sizing_risks_all[j],
         )
         a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
         slip = rules[9] if rules[8] else 0.0
@@ -235,6 +240,7 @@ def _run(
                 stop_fracs=levels[24],
                 target_fracs=levels[25],
                 next_bar=bool(rules[27]),
+                exit_and_rearm=bool(rules[28]),
             )
         else:
             result = K._compiled_column(
@@ -310,6 +316,7 @@ def _run(
         exits_all,
         levels_all,
         bools_all,
+        sizing_risks_all,
         decisions_all,
     )
 
@@ -357,27 +364,33 @@ def _run_arrays(
     if _bound_runner is None and len(features) != len(bars):
         raise ValueError("features must have one row per bar")
     pair_declared = bool(fields & set(PAIR_FIELDS))
-    slots = pair_declared or (
-        rules.target_order == "mit"
-        or rules.protection == "oto"
-        or bool(
-            fields
-            & {
-                "entry_stop",
-                "stop_update",
-                "target_update",
-                "breakeven_after_points",
-                "breakeven_offset_points",
-                "entry_from_open",
-                "stop_fraction",
-                "target_fraction",
-            }
+    slots = (
+        rules.exit_and_rearm
+        or pair_declared
+        or (
+            rules.target_order == "mit"
+            or rules.protection == "oto"
+            or bool(
+                fields
+                & {
+                    "entry_stop",
+                    "stop_update",
+                    "target_update",
+                    "breakeven_after_points",
+                    "breakeven_offset_points",
+                    "entry_from_open",
+                    "stop_fraction",
+                    "target_fraction",
+                }
+            )
         )
+        or _one_tick_clock_slots(rules)
     )
     if (
         slots
         and rules.fill_model is FillModel.ONE_TICK
         and rules.effective_entry_fill is FillTiming.NEXT_OPEN
+        and (rules.protection == "oto" or rules.target_order == "mit")
     ):
         raise ValueError(ONE_TICK_SLOTS)
     dates_needed = (
@@ -450,6 +463,7 @@ def _run_arrays(
             rules.arm_stop == "next_bar",
             rules.day_order_expiry == "cancel",
             rules.order_lifetime == "next_bar",
+            rules.exit_and_rearm,
         ],
         float,
     )
@@ -505,7 +519,10 @@ def _run_arrays(
         raw = raw[:-1]
     counts, meta, *tail = raw
     arrays = tail[:7]
-    sides, exits, levels, booleans, decisions = tail[7:]
+    sides, exits, levels, booleans, sizing_risks, decisions = tail[7:]
+    # Refusals carried out of prange; translate before any row's arrays are read.
+    if (counts == -8).any():
+        raise ValueError("exit_and_rearm flatten requires SESSION_END or LAST_BAR_CLOSE")
     results = []
     for j, cnt in enumerate(counts):
         if cnt == -3:
@@ -514,6 +531,10 @@ def _run_arrays(
             raise ValueError("straddle day_order_expiry=cancel composition is unproved")
         if cnt == -5:
             raise ValueError("straddle ONE_TICK execution is unproved")
+        if cnt == -6:
+            raise ValueError("straddle ONE_TICK targets execution is unproved")
+        if cnt == -7:
+            raise ValueError("straddle ONE_TICK IOC execution is unproved")
         # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
         # refusal first, retaining complete terminal captures for causality checks.
         if meta[j, 0] and (_capture_signals is None or np.isnan(decisions[j, 0]).any()):
@@ -556,6 +577,8 @@ def _run_arrays(
         )
 
         def already_matched(*args: Any, _values: tuple = values, **kwargs: Any) -> tuple:
+            if "sizing_risks" in kwargs:
+                kwargs["sizing_risks"][0] = sizing_risks[j]
             return _values
 
         results.append(

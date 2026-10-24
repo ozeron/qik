@@ -483,15 +483,20 @@ def enter_straddle(
     stop_points_short: float = math.nan,
     target_points_short: float = math.nan,
     entry_from_open: bool = False,
+    exit: bool = False,
+    flatten: bool = False,
 ) -> Decision:
     """Submit mutually exclusive long/short legs from this completed close.
+
+    ``exit=True`` or ``flatten=True`` combines close settlement with rearming;
+    requires Rules(exit_and_rearm=True) and a close-settling flatten policy.
 
     ``entry_from_open=True`` makes both stop triggers signed offsets from the next
     bar's open (long above, short below), resolved by the engine at that open.
     """
     return Decision(
         0,
-        False,
+        exit,
         math.nan,
         math.nan,
         math.nan,
@@ -502,7 +507,7 @@ def enter_straddle(
         math.nan,
         math.nan,
         math.nan,
-        False,
+        flatten,
         False,
         False,
         math.nan,

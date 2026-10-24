@@ -18,6 +18,7 @@ import numpy as np
 from .kernel import (
     ERR_AMEND_NO_ORDER,
     ERR_AMEND_REJECTED,
+    ERR_BUSY_ENTRY_DROPPED,
     ERR_MIT_IN_MARKET,
     ERR_NEXT_OPEN_SESSION_END,
     ERR_NONE,
@@ -274,6 +275,7 @@ def simulate_column_reference(
     stop_fraction: np.ndarray | None = None,
     target_fraction: np.ndarray | None = None,
     next_bar: bool = False,
+    exit_and_rearm: bool = False,
 ) -> RefColumn:
     if straddle is not None and np.isfinite(straddle).any():
         if arm_stop:
@@ -316,7 +318,8 @@ def simulate_column_reference(
                     float(straddle[offset + 1, i]), tick, tick_round, -direction
                 )
     slots = (
-        straddle is not None
+        exit_and_rearm
+        or straddle is not None
         or oto
         or mit
         or any(
@@ -331,9 +334,11 @@ def simulate_column_reference(
                 target_fraction,
             )
         )
+        # R15b: a ONE_TICK next-open run with a clock override always uses order slots.
+        or (one_tick and next_open and (amend_close or completed_close))
     )
-    if one_tick and next_open and (slots or latency_bars):
-        raise ValueError("R15 covers the next-open scalar path only")
+    if one_tick and next_open and latency_bars:
+        raise ValueError("ONE_TICK next-open latency is unproved")
     if slots:
         return _simulate_slots_reference(
             o,
@@ -389,6 +394,7 @@ def simulate_column_reference(
             stop_fraction=stop_fraction,
             target_fraction=target_fraction,
             next_bar=next_bar,
+            exit_and_rearm=exit_and_rearm,
         )
     if latency_bars or (one_tick and not next_open):
         return _simulate_venue_reference(
@@ -1055,6 +1061,7 @@ def _simulate_slots_reference(
     stop_fraction: np.ndarray | None = None,
     target_fraction: np.ndarray | None = None,
     next_bar: bool = False,
+    exit_and_rearm: bool = False,
 ) -> RefColumn:
     nan = np.full(len(c), np.nan)
     relative = np.zeros(len(c), bool) if entry_from_open is None else entry_from_open
@@ -1266,6 +1273,47 @@ def _simulate_slots_reference(
         else:
             send("protect", d)
 
+    def close_transition() -> bool:
+        """A23 venue transition at this completed close (docs/vector-engine.md, A23).
+
+        The close callback emits venue messages in order: (1) cancel the old generation
+        (the working entry and its queued messages; a flatten cancels everything queued);
+        (2) a reduce-only close of the open position; (3) the new submission. Messages
+        are consumed serially below, so the close is realized before the replacement
+        can fill (and so before it is sized). Protection binds to the order that fills.
+        Returns False, leaving the default path, unless this close both closes (exit or
+        flatten) and enters, with re-entry enabled.
+        """
+        nonlocal pending, resting, chasing, closing
+        owner = (
+            position.side if position is not None else (int(sides[pending]) if pending >= 0 else 0)
+        )
+        mask = int(force_close[i])
+        flatten = _force_for(mask, owner)
+        signal = _wants_exit(bool(exits[i]), bool(long_exits[i]), bool(short_exits[i]), owner)
+        if not (reenter and (flatten or signal) and (sides[i] or paired(i))):
+            return False
+        if pending >= 0 and paired(pending) and (long_exits[i] or short_exits[i] or mask & 6):
+            return False  # side-specific cancellation of a pair keeps its refusal
+        # (1) Cancel. A flatten supersedes every queued message (as without A23); an exit
+        # cancels the working entry, while the open position's messages already due at
+        # this close (its protection activation) are consumed ahead of its close.
+        if flatten:
+            queue.clear()
+        elif pending >= 0:
+            queue[:] = [cmd for cmd in queue if cmd[2] != pending]
+        pending, resting, chasing, closing = -1, False, False, False
+        # (2) Reduce-only close: a flatten settles at this close now, an exit is queued.
+        if position is not None:
+            if flatten:
+                close(float(c[i]) - position.side * slip, REASON_SIGNAL)
+            else:
+                send("close", position.decision)
+        # (3) The new generation; old protection and amendments never match it.
+        pending = i
+        send("submit", i)
+        return True
+
     for i in range(len(c)):
         exit_now = _wants_exit(
             exits[i],
@@ -1358,6 +1406,10 @@ def _simulate_slots_reference(
                                 if slip
                                 else (price if stop_order and label == "O" else level)
                             )
+                            if slip and next_open and stop_order:
+                                # R15b: a gap fills at the open, a touch at the trigger; +1 tick.
+                                base = price if label == "O" else float(level)
+                                px = _round_level(base + s * slip, round_tick, tick_round, s)
                             winner = s
                             fill(d, px, price)
                             entered = True
@@ -1365,7 +1417,14 @@ def _simulate_slots_reference(
                     if p is not None and p.live and not entered:
                         out = -p.side
                         if through(out, p.stop, True, price):
-                            px = price + out * slip if slip else (price if label == "O" else p.stop)
+                            if slip and next_open:
+                                px = (price if label == "O" else p.stop) + out * slip
+                            else:
+                                px = (
+                                    price + out * slip
+                                    if slip
+                                    else (price if label == "O" else p.stop)
+                                )
                             close(px, REASON_STOP_GAP if label == "O" else REASON_STOP)
                         elif not adverse_hit and through(
                             out, p.target, False, price if mit else price + out * slip
@@ -1398,146 +1457,163 @@ def _simulate_slots_reference(
                             last_entry,
                         )
                     continue
-                if (
-                    _force_for(
-                        int(force_close[i]),
-                        position.side if position else (int(sides[pending]) if pending >= 0 else 0),
-                    )
-                    or force_open[i]
-                ):
-                    if position is not None:
-                        close(float(c[i]) - position.side * slip, REASON_SIGNAL)
-                    queue.clear()
-                    pending, resting, chasing, closing = -1, False, False, False
-                    continue
-                if (
-                    pending >= 0
-                    and paired(pending)
-                    and (long_exits[i] or short_exits[i] or int(force_close[i]) & 6)
-                ):
-                    return RefColumn(
-                        trades,
-                        ERR_STRADDLE_SIDE_CANCEL,
-                        i,
-                        0 if position is None else position.side,
-                        last_entry,
-                    )
-                if position is None and pending < 0:
-                    closing = False
-                if (
-                    pending >= 0
-                    and not math.isnan(limits[pending])
-                    and not closing
-                    and i == pending + chase
-                ):
-                    chasing = True
-                    send("cancel", pending)
-                exit_now = _wants_exit(
-                    exits[i],
-                    long_exits[i],
-                    short_exits[i],
-                    position.side if position else (int(sides[pending]) if pending >= 0 else 0),
-                )
-                if exit_now:
-                    chasing = False
-                    if pending >= 0:
-                        send("cancel", pending)
-                        # Native OTO cancellation has no V2 late-fill unwind callback.
-                        closing = not oto
-                    if position is not None and not closing:
-                        send("close", position.decision)
-                        closing = True
-                elif position is not None:
-                    p = position
-                    update = float(su[i])
-                    if not p.be_done and not math.isnan(ba[p.decision]):
-                        reached = (
-                            h[i] >= p.price + ba[p.decision]
-                            if p.side > 0
-                            else lo[i] <= p.price - ba[p.decision]
+                if not (exit_and_rearm and close_transition()):
+                    if (
+                        _force_for(
+                            int(force_close[i]),
+                            position.side
+                            if position
+                            else (int(sides[pending]) if pending >= 0 else 0),
                         )
-                        if reached:
-                            offset = 0.0 if math.isnan(bo[p.decision]) else float(bo[p.decision])
-                            if not math.isnan(update):
-                                fail(
-                                    ERR_AMEND_REJECTED
-                                )  # ambiguous two modifications of one slot on one close
-                            update = p.price + p.side * offset
-                            p.be_done = True
-                    if not math.isnan(update):
-                        update = _round_level(update, round_tick, tick_round, -p.side)
-                        bound = p.stop
-                        has_stop = not math.isnan(p.stop)
-                        for _, kind, d, value in queue:
-                            if kind in ("stop", "arm_stop") and d == p.decision:
-                                has_stop = True
-                                if math.isnan(bound) or p.side * (value - bound) > 0:
-                                    bound = value
-                        if not has_stop and arm_stop:
-                            send("arm_stop", p.decision, update)
-                        elif not has_stop:
-                            fail(ERR_AMEND_NO_ORDER)
-                        elif not ratchet or p.side * (update - bound) > 0:
-                            send("stop", p.decision, update)
-                    if not math.isnan(tu[i]):
-                        if (
-                            math.isnan(p.target)
-                            and arm_stop
-                            and math.isnan(p.stop)
-                            and not math.isnan(update)
-                        ):
-                            send(
-                                "arm_target",
-                                p.decision,
-                                _round_level(float(tu[i]), round_tick, tick_round, p.side),
-                            )
-                        elif math.isnan(p.target):
-                            fail(ERR_AMEND_NO_ORDER)
-                        else:
-                            send(
-                                "target",
-                                p.decision,
-                                _round_level(float(tu[i]), round_tick, tick_round, p.side),
-                            )
-                if (
-                    position is None
-                    and pending >= 0
-                    and (paired(pending) or not math.isnan(triggers[pending]))
-                    and (sides[i] or paired(i))
-                    and not exit_now
-                ):
-                    if latency:
+                        or force_open[i]
+                    ):
+                        if position is not None:
+                            close(float(c[i]) - position.side * slip, REASON_SIGNAL)
+                        queue.clear()
+                        pending, resting, chasing, closing = -1, False, False, False
+                        continue
+                    if (
+                        pending >= 0
+                        and paired(pending)
+                        and (long_exits[i] or short_exits[i] or int(force_close[i]) & 6)
+                    ):
                         return RefColumn(
                             trades,
-                            ERR_STOP_REPLACE_LATENCY,
+                            ERR_STRADDLE_SIDE_CANCEL,
                             i,
-                            0,
+                            0 if position is None else position.side,
                             last_entry,
-                            last_price,
-                            last_stop,
                         )
-                    send("cancel", pending)
-                    send("replace", i)
-                elif (
-                    position is None
-                    and pending < 0
-                    and not busy
-                    and not closing
-                    and (sides[i] or paired(i))
-                    and (reenter or not exited)
-                ):
-                    pending = i
-                    send("submit", i)
-                if (
-                    next_open
-                    and exit_now
-                    and position is not None
-                    and reenter
-                    and sides[i]
-                    and pending < 0
-                ):
-                    pending = i
-                    send("submit", i)
+                    if position is None and pending < 0:
+                        closing = False
+                    if (
+                        pending >= 0
+                        and not math.isnan(limits[pending])
+                        and not closing
+                        and i == pending + chase
+                    ):
+                        chasing = True
+                        send("cancel", pending)
+                    exit_now = _wants_exit(
+                        exits[i],
+                        long_exits[i],
+                        short_exits[i],
+                        position.side if position else (int(sides[pending]) if pending >= 0 else 0),
+                    )
+                    if exit_now:
+                        chasing = False
+                        if pending >= 0:
+                            send("cancel", pending)
+                            # Native OTO cancellation has no V2 late-fill unwind callback.
+                            closing = not oto
+                        if position is not None and not closing:
+                            send("close", position.decision)
+                            closing = True
+                    elif position is not None:
+                        p = position
+                        update = float(su[i])
+                        if not p.be_done and not math.isnan(ba[p.decision]):
+                            reached = (
+                                h[i] >= p.price + ba[p.decision]
+                                if p.side > 0
+                                else lo[i] <= p.price - ba[p.decision]
+                            )
+                            if reached:
+                                offset = (
+                                    0.0 if math.isnan(bo[p.decision]) else float(bo[p.decision])
+                                )
+                                if not math.isnan(update):
+                                    fail(
+                                        ERR_AMEND_REJECTED
+                                    )  # ambiguous two modifications of one slot on one close
+                                update = p.price + p.side * offset
+                                p.be_done = True
+                        if not math.isnan(update):
+                            update = _round_level(update, round_tick, tick_round, -p.side)
+                            bound = p.stop
+                            has_stop = not math.isnan(p.stop)
+                            for _, kind, d, value in queue:
+                                if kind in ("stop", "arm_stop") and d == p.decision:
+                                    has_stop = True
+                                    if math.isnan(bound) or p.side * (value - bound) > 0:
+                                        bound = value
+                            if not has_stop and arm_stop:
+                                send("arm_stop", p.decision, update)
+                            elif not has_stop:
+                                fail(ERR_AMEND_NO_ORDER)
+                            elif not ratchet or p.side * (update - bound) > 0:
+                                send("stop", p.decision, update)
+                        if not math.isnan(tu[i]):
+                            if (
+                                math.isnan(p.target)
+                                and arm_stop
+                                and math.isnan(p.stop)
+                                and not math.isnan(update)
+                            ):
+                                send(
+                                    "arm_target",
+                                    p.decision,
+                                    _round_level(float(tu[i]), round_tick, tick_round, p.side),
+                                )
+                            elif math.isnan(p.target):
+                                fail(ERR_AMEND_NO_ORDER)
+                            else:
+                                send(
+                                    "target",
+                                    p.decision,
+                                    _round_level(float(tu[i]), round_tick, tick_round, p.side),
+                                )
+                    if (
+                        position is None
+                        and pending >= 0
+                        and (paired(pending) or not math.isnan(triggers[pending]))
+                        and (sides[i] or paired(i))
+                        and not exit_now
+                    ):
+                        if latency:
+                            return RefColumn(
+                                trades,
+                                ERR_STOP_REPLACE_LATENCY,
+                                i,
+                                0,
+                                last_entry,
+                                last_price,
+                                last_stop,
+                            )
+                        send("cancel", pending)
+                        send("replace", i)
+                    elif (
+                        position is None
+                        and pending < 0
+                        and not busy
+                        and not closing
+                        and (sides[i] or paired(i))
+                        and (reenter or not exited)
+                    ):
+                        pending = i
+                        send("submit", i)
+                    elif (
+                        slip
+                        and next_open
+                        and position is None
+                        and pending < 0
+                        and busy
+                        and not closing
+                        and (sides[i] or paired(i))
+                        and (reenter or not exited)
+                    ):
+                        # R15b: a busy bar's fresh entry is refused, never silently discarded.
+                        fail(ERR_BUSY_ENTRY_DROPPED)
+                    if (
+                        next_open
+                        and exit_now
+                        and position is not None
+                        and reenter
+                        and sides[i]
+                        and pending < 0
+                    ):
+                        pending = i
+                        send("submit", i)
             while not error:
                 ready = next(
                     (
