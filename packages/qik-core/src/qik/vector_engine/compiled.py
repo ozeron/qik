@@ -58,7 +58,7 @@ from .straddle import PAIR_FIELDS
 from .types import Bar, Decision
 from .types import Position as AuthorPosition
 
-RULES_WIDTH = 27
+RULES_WIDTH = 28
 
 _legacy_warning_sites: set[tuple[str, int]] = set()
 
@@ -119,9 +119,9 @@ def _run(
     a2s, a5s = np.empty((k, width), np.int8), np.empty((k, width), np.int8)
     a3s, a4s, a6s = np.empty((k, width)), np.empty((k, width)), np.empty((k, width))
     sides_all, exits_all = np.zeros((k, n), np.int8), np.zeros((k, n), np.bool_)
-    levels_all = np.full((k, 23, n), np.nan)
+    levels_all = np.full((k, 26, n), np.nan)
     bools_all = np.zeros((k, 3, n), np.bool_)
-    decisions_all = np.full((k, 28, n), np.nan)
+    decisions_all = np.full((k, 31, n), np.nan)
     for column in nb.prange(k):  # ty: ignore[not-iterable]  (Numba ships prange as a class)
         j = np.int64(column)
         sides, exits, levels = sides_all[j], exits_all[j], levels_all[j]
@@ -132,7 +132,7 @@ def _run(
             force_open[:] = masks[j, 1]
         view = np.full(14, np.nan)
         view[K.V_LAST_EXIT_I] = -1
-        decision = np.empty(28)
+        decision = np.empty(31)
         account = np.array([0.0, initial_cash, 0.0])
         core = K.CoreContext(
             step,
@@ -230,7 +230,11 @@ def _run(
                 arm_stop=arm_stop,
                 day_cancel=day_cancel,
                 expiry_days=expiry_days,
-                straddle=levels[11:],
+                straddle=levels[11:23],
+                from_open=levels[23],
+                stop_fracs=levels[24],
+                target_fracs=levels[25],
+                next_bar=bool(rules[27]),
             )
         else:
             result = K._compiled_column(
@@ -364,6 +368,9 @@ def _run_arrays(
                 "target_update",
                 "breakeven_after_points",
                 "breakeven_offset_points",
+                "entry_from_open",
+                "stop_fraction",
+                "target_fraction",
             }
         )
     )
@@ -442,6 +449,7 @@ def _run_arrays(
             rules.entry_bar_decision == "completed_close",
             rules.arm_stop == "next_bar",
             rules.day_order_expiry == "cancel",
+            rules.order_lifetime == "next_bar",
         ],
         float,
     )
@@ -522,7 +530,7 @@ def _run_arrays(
             decisions[j, 1].astype(bool),
             **{
                 name: decisions[j, q].astype(bool)
-                if name in ("flatten", "exit_long", "exit_short")
+                if name in ("flatten", "exit_long", "exit_short", "entry_from_open")
                 else decisions[j, q]
                 for q, name in enumerate(SIGNAL_FIELDS)
                 if q >= 2 and name in fields
@@ -532,7 +540,9 @@ def _run_arrays(
             if name in fields or q < 2:
                 continue
             active = (
-                decisions[j, q].any() if q in (12, 13, 14) else np.isfinite(decisions[j, q]).any()
+                decisions[j, q].any()
+                if q in (12, 13, 14, 28)
+                else np.isfinite(decisions[j, q]).any()
             )
             if active:
                 raise ValueError(f"core emitted undeclared field {name}")
@@ -627,7 +637,7 @@ _ABSENT_PAIR = (np.nan,) * 12
 
 
 def _decision_pair(decision: tuple[float, ...]) -> tuple[float, ...]:
-    return tuple(decision[16:]) if len(decision) > 16 else _ABSENT_PAIR
+    return tuple(decision[16:28]) if len(decision) > 16 else _ABSENT_PAIR
 
 
 @overload(_decision_pair)
@@ -635,7 +645,7 @@ def _decision_pair_type(decision):
     if isinstance(decision, nb.types.BaseTuple) and len(decision) > 16:
 
         def with_pair(decision):
-            return decision[16:]
+            return decision[16:28]
 
         return with_pair
 
@@ -643,6 +653,31 @@ def _decision_pair_type(decision):
         return _ABSENT_PAIR
 
     return without_pair
+
+
+_ABSENT_TAIL = (0.0, np.nan, np.nan)
+
+
+def _decision_tail(decision: tuple[float, ...]) -> tuple[float, ...]:
+    """Open-relative flag and fill fractions; legacy 15/16/28-field records lack them."""
+    if len(decision) <= 28:
+        return _ABSENT_TAIL
+    return (1.0 if decision[28] else 0.0, float(decision[29]), float(decision[30]))
+
+
+@overload(_decision_tail)
+def _decision_tail_type(decision):
+    if isinstance(decision, nb.types.BaseTuple) and len(decision) > 28:
+
+        def with_tail(decision):
+            return (1.0 if decision[28] else 0.0, float(decision[29]), float(decision[30]))
+
+        return with_tail
+
+    def without_tail(decision):
+        return _ABSENT_TAIL
+
+    return without_tail
 
 
 @nb.njit(cache=False)
@@ -684,6 +719,9 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     pair = _decision_pair(decision)
     for q in range(12):
         out[16 + q] = pair[q]
+    tail = _decision_tail(decision)
+    for q in range(3):
+        out[28 + q] = tail[q]
 
 
 def _run_jitclass(
@@ -704,7 +742,7 @@ def _run_jitclass(
 
     CoreClass is a jitclass (or a plain class with NUMBA_DISABLE_JIT=1). Constructors
     receive grid parameters and immutable feature arrays as named arguments. step
-    returns a numeric NamedTuple in Decision/SIGNAL_FIELDS order; legacy 15/16-field
+    returns a numeric NamedTuple in Decision/SIGNAL_FIELDS order; legacy 15/16/28-field
     records remain accepted by the adapter.
     """
     axes = {} if grid is None else grid

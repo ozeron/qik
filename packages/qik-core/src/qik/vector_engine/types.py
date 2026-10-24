@@ -79,6 +79,9 @@ class Decision(NamedTuple):
     target_short: float = math.nan
     stop_points_short: float = math.nan
     target_points_short: float = math.nan
+    entry_from_open: bool = False
+    stop_fraction: float = math.nan
+    target_fraction: float = math.nan
 
 
 @infer_getattr
@@ -124,8 +127,17 @@ def _enter(
     target_points: float = math.nan,
     limit: float = math.nan,
     entry_stop: float = math.nan,
+    entry_stop_offset: float = math.nan,
+    stop_fraction: float = math.nan,
+    target_fraction: float = math.nan,
 ) -> Decision:
     """Request an entry with optional protection and working-entry prices."""
+    # One trigger field travels; the flag says it is an offset from the next open.
+    # Both prices travel as +inf, which every array validation refuses by name.
+    from_open = not math.isnan(entry_stop_offset)
+    trigger = entry_stop_offset if from_open else entry_stop
+    if from_open and not math.isnan(entry_stop):
+        trigger = math.inf
     # Arithmetic promotes IntEnum before casting; Numba cannot int(enum) directly.
     return Decision(
         int(side + 0),
@@ -135,7 +147,7 @@ def _enter(
         float(limit),
         float(stop_points),
         float(target_points),
-        float(entry_stop),
+        float(trigger),
         math.nan,
         math.nan,
         math.nan,
@@ -156,6 +168,9 @@ def _enter(
         math.nan,
         math.nan,
         math.nan,
+        from_open,
+        float(stop_fraction),
+        float(target_fraction),
     )
 
 
@@ -168,9 +183,30 @@ def enter(
     target_points: float = math.nan,
     limit: float = math.nan,
     entry_stop: float = math.nan,
+    entry_stop_offset: float = math.nan,
+    stop_fraction: float = math.nan,
+    target_fraction: float = math.nan,
 ) -> Decision:
-    """Request an entry with optional protection and working-entry prices."""
-    return _enter(side, stop, target, stop_points, target_points, limit, entry_stop)
+    """Request an entry with optional protection and working-entry prices.
+
+    ``entry_stop_offset`` is a signed distance from the next bar's open, resolved by the
+    engine at that open (``entry_from_open``). ``stop_fraction`` / ``target_fraction``
+    place protection at ``fill * (1 -/+ side * fraction)`` from the actual fill.
+    """
+    if not math.isnan(entry_stop) and not math.isnan(entry_stop_offset):
+        raise ValueError("entry_stop and entry_stop_offset are mutually exclusive")
+    return _enter(
+        side,
+        stop,
+        target,
+        stop_points,
+        target_points,
+        limit,
+        entry_stop,
+        entry_stop_offset,
+        stop_fraction,
+        target_fraction,
+    )
 
 
 @overload(enter)
@@ -182,6 +218,9 @@ def _overload_enter(
     target_points=math.nan,
     limit=math.nan,
     entry_stop=math.nan,
+    entry_stop_offset=math.nan,
+    stop_fraction=math.nan,
+    target_fraction=math.nan,
 ):
     # Numba's dispatcher cannot fold keyword-only defaults. Keep the public
     # Python signature strict and lower compiled calls to a positional helper.
@@ -193,8 +232,22 @@ def _overload_enter(
         target_points=math.nan,
         limit=math.nan,
         entry_stop=math.nan,
+        entry_stop_offset=math.nan,
+        stop_fraction=math.nan,
+        target_fraction=math.nan,
     ):
-        return _enter(side, stop, target, stop_points, target_points, limit, entry_stop)
+        return _enter(
+            side,
+            stop,
+            target,
+            stop_points,
+            target_points,
+            limit,
+            entry_stop,
+            entry_stop_offset,
+            stop_fraction,
+            target_fraction,
+        )
 
     return impl
 
@@ -238,6 +291,9 @@ def enter_limit_ioc(
         math.nan,
         math.nan,
         math.nan,
+        False,
+        math.nan,
+        math.nan,
     )
 
 
@@ -271,6 +327,9 @@ def exit() -> Decision:
         math.nan,
         math.nan,
         math.nan,
+        math.nan,
+        math.nan,
+        False,
         math.nan,
         math.nan,
     )
@@ -308,6 +367,9 @@ def trail(level: float) -> Decision:
         math.nan,
         math.nan,
         math.nan,
+        False,
+        math.nan,
+        math.nan,
     )
 
 
@@ -343,6 +405,9 @@ def move_target(level: float) -> Decision:
         math.nan,
         math.nan,
         math.nan,
+        False,
+        math.nan,
+        math.nan,
     )
 
 
@@ -376,6 +441,9 @@ def flatten() -> Decision:
         math.nan,
         math.nan,
         math.nan,
+        math.nan,
+        math.nan,
+        False,
         math.nan,
         math.nan,
     )
@@ -414,8 +482,13 @@ def enter_straddle(
     target_short: float = math.nan,
     stop_points_short: float = math.nan,
     target_points_short: float = math.nan,
+    entry_from_open: bool = False,
 ) -> Decision:
-    """Submit mutually exclusive long/short legs from this completed close."""
+    """Submit mutually exclusive long/short legs from this completed close.
+
+    ``entry_from_open=True`` makes both stop triggers signed offsets from the next
+    bar's open (long above, short below), resolved by the engine at that open.
+    """
     return Decision(
         0,
         False,
@@ -445,4 +518,7 @@ def enter_straddle(
         float(target_short),
         float(stop_points_short),
         float(target_points_short),
+        bool(entry_from_open),
+        math.nan,
+        math.nan,
     )

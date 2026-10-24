@@ -79,6 +79,9 @@ class Decision:
     target_short: float = math.nan
     stop_points_short: float = math.nan
     target_points_short: float = math.nan
+    entry_from_open: bool = False
+    stop_fraction: float = math.nan
+    target_fraction: float = math.nan
 
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):
@@ -92,7 +95,7 @@ class Core(Protocol):
 _LEVELS = tuple(
     name
     for name in SIGNAL_FIELDS
-    if name not in ("entry_side", "exit", "exit_long", "exit_short", "flatten")
+    if name not in ("entry_side", "exit", "exit_long", "exit_short", "flatten", "entry_from_open")
 )
 
 
@@ -108,6 +111,7 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
     exit_ = np.zeros(n, np.bool_)
     exits = {name: np.zeros(n, np.bool_) for name in ("exit_long", "exit_short", "flatten")}
     levels = {name: np.full(n, np.nan) for name in _LEVELS}
+    from_open = np.zeros(n, np.bool_)
     vol = bars.volume if bars.volume is not None else np.full(n, np.nan)
     for i in range(n):
         ts = bars.index[i] if bars.index is not None else None
@@ -124,7 +128,10 @@ def signals_from_core(make: Callable[[], Core], bars: Bars) -> Signals:
             arr[i] = getattr(d, name)
         for name, arr in levels.items():
             arr[i] = getattr(d, name)
+        from_open[i] = d.entry_from_open
     used = {name: (arr if not np.isnan(arr).all() else None) for name, arr in levels.items()}
+    if from_open.any():
+        used["entry_from_open"] = from_open
     return Signals(side, exit_, **exits, **used)
 
 

@@ -200,6 +200,11 @@ class Rules:
     ``entry_bar_decision="completed_close"`` lets a next-open market entry that
     closes intrabar schedule a fresh entry at this close for the following open.
     ``reenter_on_exit_bar`` still gates that entry; resting-entry callbacks keep A15.
+
+    ``order_lifetime="next_bar"`` makes a pending stop entry (or stop pair) submitted at
+    a close valid for exactly the next bar, across a date or session boundary, then
+    expire before that bar's close decision (GTD next bar). The default ``"day"``
+    keeps DAY orders and their new-date refusal (or ``day_order_expiry``).
     """
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
@@ -232,6 +237,7 @@ class Rules:
     stop_entry_in_market: Literal["error", "skip"] = "error"
     arm_stop: Literal["refuse", "next_bar"] = "refuse"
     day_order_expiry: Literal["refuse", "cancel"] = "refuse"
+    order_lifetime: Literal["day", "next_bar"] = field(default="day", kw_only=True)
 
     def __post_init__(self) -> None:
         if (
@@ -283,6 +289,7 @@ class Rules:
             ("stop_entry_in_market", ("error", "skip")),
             ("arm_stop", ("refuse", "next_bar")),
             ("day_order_expiry", ("refuse", "cancel")),
+            ("order_lifetime", ("day", "next_bar")),
         ):
             if getattr(self, name) not in choices:
                 raise ValueError(f"{name} must be one of {choices}")
@@ -290,6 +297,15 @@ class Rules:
             raise ValueError("latency_bars must be the integer 0 or 1")
         if self.amend_timing == "close_submit" and self.latency_bars:
             raise ValueError("close_submit requires latency_bars=0")
+        if self.order_lifetime == "next_bar":
+            if self.latency_bars:
+                raise ValueError("order_lifetime=next_bar requires latency_bars=0: unproved")
+            if self.day_order_expiry == "cancel":
+                raise ValueError(
+                    "order_lifetime=next_bar and day_order_expiry=cancel are two lifetimes"
+                )
+            if self.fill_model is FillModel.ONE_TICK:
+                raise ValueError("order_lifetime=next_bar ONE_TICK execution is unproved")
         if not isinstance(self.fill_model, FillModel):
             raise ValueError("fill_model must be a FillModel enum")
         if next_open and (
@@ -423,6 +439,11 @@ class Signals:
     ``entry_stop`` is a DAY stop-market entry (A18). ``stop_update`` / ``target_update`` amend
     existing legs at this close (A19); NaN keeps the level. ``breakeven_after_points`` and
     ``breakeven_offset_points`` are fixed at entry and request a one-shot stop amendment (A19b).
+
+    ``entry_from_open[i]`` makes this entry's stop triggers (``entry_stop``, or a pair's
+    ``entry_stop_long`` / ``entry_stop_short``) signed offsets from the next bar's open,
+    resolved by the engine at that open. ``stop_fraction`` / ``target_fraction`` place
+    protection at ``fill * (1 - side * f)`` / ``fill * (1 + side * f)`` from the actual fill.
     """
 
     entry_side: np.ndarray
@@ -453,6 +474,9 @@ class Signals:
     target_short: np.ndarray | None = None
     stop_points_short: np.ndarray | None = None
     target_points_short: np.ndarray | None = None
+    entry_from_open: np.ndarray | None = None
+    stop_fraction: np.ndarray | None = None
+    target_fraction: np.ndarray | None = None
 
 
 SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
@@ -623,8 +647,25 @@ def _simulate(
     )
     slot_arrays = tuple(opt(getattr(signals, name), name) for name in slot_names)
     trigger, sup, tup, after, offset = slot_arrays
+    from_open = exit_mask(signals.entry_from_open, "entry_from_open")
+    from_open_rows = from_open & ((side != 0) | pair_rows)
+    from_open_used = signals.entry_from_open is not None and bool(from_open_rows.any())
+    if from_open_used:
+        trigger, pair_arrays = _resolve_from_open(
+            bars, rules, from_open_rows, trigger, limit, ioc, pair_arrays, side
+        )
+        slot_arrays = (trigger, *slot_arrays[1:])
     slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
-    slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used) or pair_used
+    stop_frac = opt(signals.stop_fraction, "stop_fraction")
+    target_frac = opt(signals.target_fraction, "target_fraction")
+    frac_used = bool(np.isfinite(stop_frac).any() or np.isfinite(target_frac).any())
+    slots = (
+        rules.target_order == "mit"
+        or rules.protection == "oto"
+        or any(slot_used)
+        or pair_used
+        or frac_used
+    )
     levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc, *pair_arrays)
     next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
     exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
@@ -656,6 +697,11 @@ def _simulate(
                 rules.day_order_expiry == "cancel",
             )
         entries = entries | pair_rows
+    if frac_used:
+        _check_fractions(rules, instrument, entries, pair_rows, stop, target, limit, stop_pts,
+                         target_pts, stop_frac, target_frac)  # fmt: skip
+    if rules.order_lifetime == "next_bar" and np.isfinite(limit).any():
+        raise ValueError("order_lifetime=next_bar with entry_limit / chase is unproved")
     if (
         slot_used[0]
         and limit is not nan
@@ -683,7 +729,9 @@ def _simulate(
             raise ValueError(f"{name} must be positive or NaN")
     if slot_used[4] and np.any(entries & np.isfinite(offset) & np.isnan(after)):
         raise ValueError("breakeven_offset_points needs breakeven_after_points at the entry")
-    if slot_used[3] and np.any(entries & np.isfinite(after) & np.isnan(stop) & np.isnan(stop_pts)):
+    if slot_used[3] and np.any(
+        entries & np.isfinite(after) & np.isnan(stop) & np.isnan(stop_pts) & np.isnan(stop_frac)
+    ):
         raise ValueError("breakeven_after_points needs an entry stop")
     if slots and rules.protection == "oto":
         if np.isfinite(limit).any():
@@ -864,6 +912,10 @@ def _simulate(
         force_open=t(force_open.T) if force_open is not None and force_open.any() else None,
         entry_limit_ioc=t(ioc.T) if signals.entry_limit_ioc is not None else None,
         straddle=pair_data,
+        entry_from_open=t(from_open.T) if from_open_used else None,
+        stop_fraction=t(stop_frac.T) if frac_used else None,
+        target_fraction=t(target_frac.T) if frac_used else None,
+        next_bar=rules.order_lifetime == "next_bar",
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         combine=(rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
@@ -1002,6 +1054,9 @@ def _simulate(
         pair_used
         or ioc_used
         or rules.day_order_expiry == "cancel"
+        or rules.order_lifetime == "next_bar"
+        or from_open_used
+        or frac_used
         or (
             slots
             and (
@@ -1014,6 +1069,93 @@ def _simulate(
         )
     )
     return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, research_only)
+
+
+def _resolve_from_open(
+    bars: Bars,
+    rules: Rules,
+    rows: np.ndarray,
+    trigger: np.ndarray,
+    limit: np.ndarray,
+    ioc: np.ndarray,
+    pair_arrays: tuple[np.ndarray, ...],
+    side: np.ndarray,
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """Return triggers resolved as ``open[i + 1] + offset``; refuse what is unproved.
+
+    The engine applies this at the activation open; the strategy only ever sees an offset.
+    Rounding happens afterwards, with every other trigger.
+    """
+    n = len(bars)
+    if rules.latency_bars:
+        raise ValueError("entry_from_open requires latency_bars=0: unproved")
+    if rules.fill_model is FillModel.ONE_TICK:
+        raise ValueError("entry_from_open ONE_TICK execution is unproved")
+    if rules.protection == "oto":
+        raise ValueError("entry_from_open OTO composition is unproved; use callback protection")
+    long_stop, short_stop = pair_arrays[0], pair_arrays[6]
+    singles = rows & (side != 0)
+    pairs = rows & (side == 0)
+    if np.any(rows & np.isinf(trigger)):
+        raise ValueError("entry_stop and entry_stop_offset are mutually exclusive")
+    bad = singles & (np.isnan(trigger) | np.isfinite(limit) | np.isfinite(ioc))
+    bad |= pairs & (np.isfinite(pair_arrays[1]) | np.isfinite(pair_arrays[7]))
+    bad |= pairs & np.isnan(long_stop) & np.isnan(short_stop)
+    if bad.any():
+        i, j = (int(x) for x in np.argwhere(bad)[0])
+        raise ValueError(
+            f"bar {i}, config {j}: entry_from_open applies to stop triggers only "
+            "(no market, limit or IOC entries or legs)"
+        )
+    if rows[n - 1].any():
+        raise ValueError(
+            f"bar {n - 1}: entry_from_open at the last bar has no next open to resolve against"
+        )
+    nxt = np.r_[bars.open[1:], np.nan][:, None]
+    trigger = np.where(singles, nxt + trigger, trigger)
+    resolved = list(pair_arrays)
+    for q in (0, 6):
+        resolved[q] = np.where(pairs, nxt + pair_arrays[q], pair_arrays[q])
+    return trigger, tuple(resolved)
+
+
+def _check_fractions(
+    rules: Rules,
+    instrument: Instrument | None,
+    entries: np.ndarray,
+    pair_rows: np.ndarray,
+    stop: np.ndarray,
+    target: np.ndarray,
+    limit: np.ndarray,
+    stop_pts: np.ndarray,
+    target_pts: np.ndarray,
+    stop_frac: np.ndarray,
+    target_frac: np.ndarray,
+) -> None:
+    """Fill-relative fractional protection: refuse every unproved composition."""
+    for frac, level, pts, leg in (
+        (stop_frac, stop, stop_pts, "stop"),
+        (target_frac, target, target_pts, "target"),
+    ):
+        rows = entries & np.isfinite(frac)
+        if np.any(rows & ~((frac > 0) & (frac < 1))):
+            raise ValueError(f"{leg}_fraction must be in (0, 1) or NaN")
+        if np.any(rows & (np.isfinite(level) | np.isfinite(pts))):
+            raise ValueError(f"{leg}_fraction excludes {leg} and {leg}_points on one entry")
+    rows = entries & (np.isfinite(stop_frac) | np.isfinite(target_frac))
+    if np.any(rows & pair_rows):
+        raise ValueError("stop_fraction / target_fraction with a straddle is unproved")
+    if np.any(rows & np.isfinite(limit)):
+        raise ValueError("stop_fraction / target_fraction with entry_limit is unproved")
+    if rules.protection == "oto":
+        raise ValueError("stop_fraction / target_fraction OTO composition is unproved")
+    if rules.fill_model is FillModel.ONE_TICK:
+        raise ValueError("stop_fraction / target_fraction ONE_TICK execution is unproved")
+    if instrument is not None and rules.tick_round is TickRound.NONE:
+        raise ValueError(
+            "stop_fraction / target_fraction need Rules(tick_round=...) with an instrument: "
+            "a fraction of the fill is off the tick grid"
+        )
 
 
 def _limit_entry_checks(

@@ -1820,6 +1820,7 @@ def run_columns(
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
     target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None,
+    entry_from_open=None, stop_fraction=None, target_fraction=None, next_bar=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1854,6 +1855,10 @@ def run_columns(
             raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     if straddle is not None and entry_trigger is None:
         raise ValueError("straddle requires the slots scheduler")
+    if entry_trigger is None and (
+        entry_from_open is not None or stop_fraction is not None or target_fraction is not None
+    ):
+        raise ValueError("entry_from_open and fractional protection require the slots scheduler")
     slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
@@ -1868,6 +1873,9 @@ def run_columns(
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
         pair_column = _straddle_column(straddle, j)
+        rel_column = None if entry_from_open is None else entry_from_open[j]
+        sf_column = None if stop_fraction is None else stop_fraction[j]
+        tf_column = None if target_fraction is None else target_fraction[j]
         ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
@@ -1939,6 +1947,10 @@ def run_columns(
                 day_cancel=day_cancel,
                 expiry_days=expiry_days,
                 straddle=pair_column,
+                from_open=rel_column,
+                stop_fracs=sf_column,
+                target_fracs=tf_column,
+                next_bar=next_bar,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
@@ -1967,6 +1979,9 @@ def run_columns(
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
         pair_column = _straddle_column(straddle, j)
+        rel_column = None if entry_from_open is None else entry_from_open[j]
+        sf_column = None if stop_fraction is None else stop_fraction[j]
+        tf_column = None if target_fraction is None else target_fraction[j]
         ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
@@ -2039,6 +2054,10 @@ def run_columns(
                     day_cancel=day_cancel,
                     expiry_days=expiry_days,
                     straddle=pair_column,
+                    from_open=rel_column,
+                    stop_fracs=sf_column,
+                    target_fracs=tf_column,
+                    next_bar=next_bar,
                 )
             else:
                 _column(
@@ -2116,6 +2135,10 @@ def _slots_column(
     day_cancel=False,
     expiry_days=None,
     straddle=None,
+    from_open=None,
+    stop_fracs=None,
+    target_fracs=None,
+    next_bar=False,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     if straddle is not None and np.isfinite(straddle).any():
@@ -2188,6 +2211,10 @@ def _slots_column(
         day_cancel,
         expiry_days,
         straddle,
+        from_open,
+        stop_fracs,
+        target_fracs,
+        next_bar,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2263,6 +2290,10 @@ def _slots_column_advance(state, i, inputs, core=None):
         day_cancel,
         expiry_days,
         straddle,
+        from_open,
+        stop_fracs,
+        target_fracs,
+        next_bar,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2310,6 +2341,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         pending >= 0
         and days[i]
         and not day_cancel
+        and not (next_bar and i == pending + 1)
         and (
             _pair_rests(straddle, pending)
             or not np.isnan(triggers[pending])
@@ -2376,6 +2408,25 @@ def _slots_column_advance(state, i, inputs, core=None):
                 and (lo[i] <= stop if pos > 0 else h[i] >= stop)
             )
             high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
+            if (
+                pending >= 0
+                and resting
+                and i == pending + 1
+                and bool(_optional_at(from_open, pending, False))
+                and _open_in_market(triggers, straddle, sides, pending, o[i])
+            ):
+                # The trigger is submitted at this open: at or through it is in the market.
+                if stop_skip and not _pair_at(straddle, pending):
+                    pending, resting = -1, False
+                else:
+                    return (
+                        SlotsState(
+                            queue, pos, ei, gen, pending, ep, stop, target, risk_stop, live,
+                            resting, chasing, closing, be_done, cnt, error,
+                        ),
+                        ERR_STOP_ENTRY_IN_MARKET,
+                        i,
+                    )  # fmt: skip
             for m in range(4):
                 pt = (
                     o[i]
@@ -2425,6 +2476,8 @@ def _slots_column_advance(state, i, inputs, core=None):
                             tick_round,
                             combine=combine,
                             fill=px,
+                            stop_frac=_optional_at(stop_fracs, d, np.nan),
+                            target_frac=_optional_at(target_fracs, d, np.nan),
                         )
                         pos, ei, ep, gen, risk_stop = s, i, px, d, stop
                         be_done = False
@@ -2504,6 +2557,18 @@ def _slots_column_advance(state, i, inputs, core=None):
                         )
                         cnt += 1
                         pos, exited, live = 0, True, False
+            if (
+                next_bar
+                and pending >= 0
+                and resting
+                and i > pending
+                and (not np.isnan(triggers[pending]) or _pair_rests(straddle, pending))
+            ):
+                # GTD next bar: an unfilled stop expires before this close's decision.
+                for q in range(len(queue) - 1, -1, -1):
+                    if queue[q][2] == pending:
+                        queue.pop(q)
+                pending, resting, busy = -1, False, False
             if error:
                 return (
                     SlotsState(
@@ -2555,6 +2620,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                     out_st,
                     _pair_level(straddle, pending, 0, i, latency),
                     _pair_level(straddle, pending, 6, i, latency),
+                    o[i + 1] if i + 1 < len(o) else np.nan,
                 )
                 long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
                 close_mask, open_flatten = core.force_close[i], core.force_open[i]
@@ -2784,7 +2850,11 @@ def _slots_column_advance(state, i, inputs, core=None):
                 pending = i
                 if _pair_at(straddle, i) or not np.isnan(_optional_at(ioc_limits, i, np.nan)):
                     due = i + latency + 1
-                    if due >= len(c) or (not cross_session and np.any(days[i + 1 : due + 1])):
+                    if due >= len(c) or (
+                        not cross_session
+                        and not (next_bar and _stop_pair(straddle, i))
+                        and np.any(days[i + 1 : due + 1])
+                    ):
                         error = ERR_NEXT_OPEN_SESSION_END
                 queue.append(
                     (
@@ -2800,8 +2870,15 @@ def _slots_column_advance(state, i, inputs, core=None):
                 pending = i
                 queue.append((i + 1, _SLOT_SUBMIT, i, 0.0))
         if not error and not latency and (next_open or exit_next_open):
-            for due, _, _, _ in queue:
-                if due > i and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
+            for due, kind, d, _ in queue:
+                if due > i and (
+                    i + 1 == len(c)
+                    or (
+                        days[i + 1]
+                        and not cross_session
+                        and not _lifetime_crosses(next_bar, kind, d, triggers, straddle)
+                    )
+                ):
                     error = ERR_NEXT_OPEN_SESSION_END
         while len(queue) and error == 0:
             ready = -1
@@ -2830,17 +2907,25 @@ def _slots_column_advance(state, i, inputs, core=None):
             if kind == _SLOT_SUBMIT and pending == d:
                 if straddle is not None and _pair_at(straddle, d):
                     due = d + latency + 1
-                    if due >= len(c) or (not cross_session and np.any(days[d + 1 : due + 1])):
+                    if due >= len(c) or (
+                        not cross_session
+                        and not (next_bar and _stop_pair(straddle, d))
+                        and np.any(days[d + 1 : due + 1])
+                    ):
                         error = ERR_NEXT_OPEN_SESSION_END
                         continue
-                    if not (phase == 0 and next_open) and (
-                        (
-                            not np.isnan(straddle[0, d])
-                            and (pin if pinned == -1 else ci) >= straddle[0, d]
-                        )
-                        or (
-                            not np.isnan(straddle[6, d])
-                            and (pin if pinned == 1 else ci) <= straddle[6, d]
+                    if (
+                        not (phase == 0 and next_open)
+                        and not bool(_optional_at(from_open, d, False))
+                        and (
+                            (
+                                not np.isnan(straddle[0, d])
+                                and (pin if pinned == -1 else ci) >= straddle[0, d]
+                            )
+                            or (
+                                not np.isnan(straddle[6, d])
+                                and (pin if pinned == 1 else ci) <= straddle[6, d]
+                            )
                         )
                     ):
                         error = ERR_STOP_ENTRY_IN_MARKET
@@ -2856,7 +2941,11 @@ def _slots_column_advance(state, i, inputs, core=None):
                     continue
                 q = pin if pinned == -s else ci
                 if not np.isnan(triggers[d]):
-                    if not (phase == 0 and next_open) and _in_market(-s, triggers[d], q, True):
+                    if (
+                        not (phase == 0 and next_open)
+                        and not bool(_optional_at(from_open, d, False))
+                        and _in_market(-s, triggers[d], q, True)
+                    ):
                         if stop_skip:
                             pending, resting = -1, False
                         else:
@@ -2915,6 +3004,8 @@ def _slots_column_advance(state, i, inputs, core=None):
                     tick_round,
                     combine=combine,
                     fill=px,
+                    stop_frac=_optional_at(stop_fracs, d, np.nan),
+                    target_frac=_optional_at(target_fracs, d, np.nan),
                 )
                 risk_stop, be_done = stop, False
                 pending, resting, chasing, live = -1, False, False, False
@@ -3029,8 +3120,15 @@ def _slots_column_advance(state, i, inputs, core=None):
                         closing = False
                     pos, exited, live = 0, True, False
         if not error and not latency and (next_open or exit_next_open):
-            for due, _, _, _ in queue:
-                if due > i and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
+            for due, kind, d, _ in queue:
+                if due > i and (
+                    i + 1 == len(c)
+                    or (
+                        days[i + 1]
+                        and not cross_session
+                        and not _lifetime_crosses(next_bar, kind, d, triggers, straddle)
+                    )
+                ):
                     error = ERR_NEXT_OPEN_SESSION_END
     if error:
         return (
@@ -3116,8 +3214,13 @@ def _core_decision(
     out_st,
     work_long=np.nan,
     work_short=np.nan,
+    next_px=np.nan,
 ):
-    """Observe settled fills, call a core, and publish its close decision (no matching here)."""
+    """Observe settled fills, call a core, and publish its close decision (no matching here).
+
+    ``next_px`` (the following bar's open) resolves open-relative triggers after the core
+    returned; the core never sees it, and the position view publishes it only later.
+    """
     seen = int(core.account[0])
     if core.account[2]:
         return
@@ -3157,12 +3260,12 @@ def _core_decision(
     view[12], view[13] = work_long, work_short
     d = core.decision
     d[:] = np.nan
-    d[0], d[1], d[12], d[13], d[14] = 0, 0, 0, 0, 0
+    d[0], d[1], d[12], d[13], d[14], d[28] = 0, 0, 0, 0, 0, 0
     core.step(core.state, core.params, i, core.feats, o, h, lo, c, core.volume[i], view, d)
     core.decisions[:, i] = d
     if d[0] != -1 and d[0] != 0 and d[0] != 1:
         raise ValueError("compiled core: side must be -1, 0, 1")
-    for col in (1, 12, 13, 14):
+    for col in (1, 12, 13, 14, 28):
         if d[col] != 0 and d[col] != 1:
             raise ValueError("compiled core: boolean decision must be 0 or 1")
     core.sides[i], core.exits[i] = int(d[0]), bool(d[1])
@@ -3171,7 +3274,11 @@ def _core_decision(
     core.levels[10, i] = d[15]
     # Carry these refusals out of prange like sizing refusals; raising inside
     # a compiled callback can otherwise leave uninitialized result buffers.
-    if np.isfinite(d[16:]).any():
+    pair = d[16:28].copy()
+    if d[28]:
+        pair[0] += next_px
+        pair[6] += next_px
+    if np.isfinite(d[16:28]).any():
         if core.pair_rules & 16:
             core.account[2] = 3
             return
@@ -3182,7 +3289,7 @@ def _core_decision(
             core.account[2] = 5
             return
     if validate_pair(
-        d[16:],
+        pair,
         d[2:12],
         d[0],
         bool(d[1] or d[12] or d[13] or d[14] or not np.isnan(d[15])),
@@ -3195,16 +3302,18 @@ def _core_decision(
         if core.levels.shape[0] < 23:
             raise ValueError("straddle requires the slots scheduler")
     for col in range(12):
-        core.levels[11 + col, i] = d[16 + col]
+        core.levels[11 + col, i] = pair[col]
     for offset, direction in ((0, 1), (6, -1)):
         core.levels[11 + offset, i] = _round_price(
-            d[16 + offset], core.tick, core.rounding, direction
+            pair[offset], core.tick, core.rounding, direction
         )
         core.levels[12 + offset, i] = _round_price(
-            d[17 + offset], core.tick, core.rounding, -direction
+            pair[1 + offset], core.tick, core.rounding, -direction
         )
     core.levels[2, i] = _round_price(d[4], core.tick, core.rounding, -d[0])
-    core.levels[5, i] = _round_price(d[7], core.tick, core.rounding, d[0])
+    trigger = d[7] + next_px if d[28] else d[7]
+    core.levels[5, i] = _round_price(trigger, core.tick, core.rounding, d[0])
+    core.levels[23, i], core.levels[24, i], core.levels[25, i] = d[28], d[29], d[30]
     core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])
     # Match simulate's boundary transformation on the current decision, without future signals.
     if core.boundary == 1 and core.ends[i] and core.exit_next_open:
@@ -3252,6 +3361,32 @@ def _pair_level(pair, i, offset, bar, latency):
     if not np.isnan(pair[offset, i]):
         return pair[offset, i]
     return pair[offset + 1, i] if bar < i + latency + 1 else np.nan
+
+
+@nb.njit(cache=True)
+def _stop_pair(pair, i):
+    """A pair whose legs are all resting stops (no IOC leg attempts at an open)."""
+    return _pair_rests(pair, i) and np.isnan(pair[1, i]) and np.isnan(pair[7, i])
+
+
+@nb.njit(cache=True)
+def _lifetime_crosses(next_bar, kind, d, triggers, pair):
+    """order_lifetime=next_bar: a stop submission may reach the next session's bar."""
+    return (
+        next_bar
+        and (kind == _SLOT_SUBMIT or kind == _SLOT_REPLACE)
+        and (not np.isnan(triggers[d]) or _stop_pair(pair, d))
+    )
+
+
+@nb.njit(cache=True)
+def _open_in_market(triggers, pair, sides, d, opening):
+    """An open-relative trigger at or through its own activation open."""
+    if _pair_at(pair, d):
+        return (not np.isnan(pair[0, d]) and opening >= pair[0, d]) or (
+            not np.isnan(pair[6, d]) and opening <= pair[6, d]
+        )
+    return _in_market(-sides[d], triggers[d], opening, True)
 
 
 @nb.njit(cache=True)

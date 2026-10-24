@@ -111,13 +111,20 @@ def levels(
     rounding: int = 0,
     combine: int = 0,
     fill: float = np.nan,
+    stop_frac: float = np.nan,
+    target_frac: float = np.nan,
 ) -> tuple[float, float]:
     """Resolve protection; combined legs use the actual fill, then round once.
 
     Bits 1/2 opt stops/targets into the nearer directional threshold. A level beyond
     the fill remains marketable and is handled by the scheduler's existing checks.
-    Missing legs retain their original anchor semantics.
+    Missing legs retain their original anchor semantics. A fraction is a level at
+    ``fill * (1 -/+ side * fraction)`` from the actual fill, whatever the anchor.
     """
+    if not np.isnan(stop_frac):
+        stop = fill * (1.0 - side * stop_frac)
+    if not np.isnan(target_frac):
+        target = fill * (1.0 + side * target_frac)
     if combine & 1 and not np.isnan(stop) and not np.isnan(stop_points):
         relative = fill - side * stop_points
         stop = max(stop, relative) if side > 0 else min(stop, relative)

@@ -150,8 +150,17 @@ def _levels(
     rounding: int = 0,
     combine: int = 0,
     fill: float = math.nan,
+    stop_frac: float = math.nan,
+    target_frac: float = math.nan,
 ) -> tuple[float, float]:
-    """Absolute stop and target: given levels as they are, point offsets from ``anchor``."""
+    """Absolute stop and target: given levels as they are, point offsets from ``anchor``.
+
+    A fraction prices the leg off the actual fill: long stop below, long target above.
+    """
+    if stop_frac == stop_frac:
+        stop = fill * (1.0 - side * stop_frac)
+    if target_frac == target_frac:
+        target = fill * (1.0 + side * target_frac)
 
     if combine & 1 and not math.isnan(stop) and not math.isnan(stop_pts):
         candidate = fill - side * stop_pts
@@ -261,6 +270,10 @@ def simulate_column_reference(
     day_cancel: bool = False,
     expiry_days: np.ndarray | None = None,
     straddle: np.ndarray | None = None,
+    entry_from_open: np.ndarray | None = None,
+    stop_fraction: np.ndarray | None = None,
+    target_fraction: np.ndarray | None = None,
+    next_bar: bool = False,
 ) -> RefColumn:
     if straddle is not None and np.isfinite(straddle).any():
         if arm_stop:
@@ -282,9 +295,12 @@ def simulate_column_reference(
                 ]
             )
         if stop_entry is not None:
+            # Offsets are rounded only once the open resolves them.
             stop_entry = np.array(
                 [
-                    _round_level(float(v), tick, tick_round, int(side_sig[i]))
+                    v
+                    if entry_from_open is not None and entry_from_open[i]
+                    else _round_level(float(v), tick, tick_round, int(side_sig[i]))
                     for i, v in enumerate(stop_entry)
                 ]
             )
@@ -292,9 +308,10 @@ def simulate_column_reference(
         straddle = straddle.copy()
         for offset, direction in ((0, 1), (6, -1)):
             for i in range(len(c)):
-                straddle[offset, i] = _round_level(
-                    float(straddle[offset, i]), tick, tick_round, direction
-                )
+                if entry_from_open is None or not entry_from_open[i]:
+                    straddle[offset, i] = _round_level(
+                        float(straddle[offset, i]), tick, tick_round, direction
+                    )
                 straddle[offset + 1, i] = _round_level(
                     float(straddle[offset + 1, i]), tick, tick_round, -direction
                 )
@@ -302,7 +319,18 @@ def simulate_column_reference(
         straddle is not None
         or oto
         or mit
-        or any(a is not None for a in (stop_entry, stop_update, target_update, be_after, be_offset))
+        or any(
+            a is not None
+            for a in (
+                stop_entry,
+                stop_update,
+                target_update,
+                be_after,
+                be_offset,
+                stop_fraction,
+                target_fraction,
+            )
+        )
     )
     if one_tick and next_open and (slots or latency_bars):
         raise ValueError("R15 covers the next-open scalar path only")
@@ -357,6 +385,10 @@ def simulate_column_reference(
             day_cancel=day_cancel,
             expiry_days=expiry_days,
             straddle=straddle,
+            entry_from_open=entry_from_open,
+            stop_fraction=stop_fraction,
+            target_fraction=target_fraction,
+            next_bar=next_bar,
         )
     if latency_bars or (one_tick and not next_open):
         return _simulate_venue_reference(
@@ -1019,8 +1051,19 @@ def _simulate_slots_reference(
     day_cancel: bool,
     expiry_days: np.ndarray | None,
     straddle: np.ndarray | None = None,
+    entry_from_open: np.ndarray | None = None,
+    stop_fraction: np.ndarray | None = None,
+    target_fraction: np.ndarray | None = None,
+    next_bar: bool = False,
 ) -> RefColumn:
     nan = np.full(len(c), np.nan)
+    relative = np.zeros(len(c), bool) if entry_from_open is None else entry_from_open
+    stop_fracs = nan if stop_fraction is None else stop_fraction
+    target_fracs = nan if target_fraction is None else target_fraction
+    if relative.any():
+        # Offsets become prices at the activation open; keep the caller's arrays intact.
+        stop_entry = None if stop_entry is None else stop_entry.copy()
+        straddle = None if straddle is None else straddle.copy()
     limits, sp, tp, triggers, su, tu, ba, bo = [
         nan if a is None else a
         for a in (
@@ -1050,6 +1093,37 @@ def _simulate_slots_reference(
 
     def paired(d: int) -> bool:
         return straddle is not None and not np.isnan(straddle[:, d]).all()
+
+    def stop_only_pair(d: int) -> bool:
+        assert straddle is not None
+        legs = straddle[:, d]
+        return rests(d) and math.isnan(legs[1]) and math.isnan(legs[7])
+
+    def may_cross(kind: str, d: int) -> bool:
+        # GTD next bar: a stop (or stop-only pair) reaches the next session's first bar.
+        if not next_bar or kind not in ("submit", "replace"):
+            return False
+        return not math.isnan(triggers[d]) or (paired(d) and stop_only_pair(d))
+
+    def submit_at_open(d: int, opening: float) -> bool:
+        """The open-relative instruction becomes a resting stop at this opening price.
+
+        Returns False when that stop would be at or through the opening price.
+        """
+        if paired(d):
+            assert straddle is not None
+            for offset, direction in ((0, 1), (6, -1)):
+                if not math.isnan(straddle[offset, d]):
+                    straddle[offset, d] = _round_level(
+                        opening + straddle[offset, d], round_tick, tick_round, direction
+                    )
+            return not (
+                through(1, float(straddle[0, d]), True, opening)
+                or through(-1, float(straddle[6, d]), True, opening)
+            )
+        s = int(sides[d])
+        triggers[d] = _round_level(opening + triggers[d], round_tick, tick_round, s)
+        return not through(s, float(triggers[d]), True, opening)
 
     def rests(d: int) -> bool:
         # Only a DAY stop leg rests across a session; IOC legs attempt once.
@@ -1085,7 +1159,7 @@ def _simulate_slots_reference(
         if paired(d) and kind in ("submit", "replace"):
             delay += int(next_open)
             if i + latency + 1 >= len(c) or (
-                not cross_session and any(days[i + 1 : i + latency + 2])
+                not cross_session and not may_cross(kind, d) and any(days[i + 1 : i + latency + 2])
             ):
                 fail(ERR_NEXT_OPEN_SESSION_END)
             queue.append((i + delay, kind, d, value))
@@ -1105,7 +1179,11 @@ def _simulate_slots_reference(
             due = i + delay
             if due >= len(c) or (not cross_session and any(days[i + 1 : due + 1])):
                 fail(ERR_NEXT_OPEN_SESSION_END)
-        if delay and not latency and (i + 1 == len(c) or (days[i + 1] and not cross_session)):
+        if (
+            delay
+            and not latency
+            and (i + 1 == len(c) or (days[i + 1] and not cross_session and not may_cross(kind, d)))
+        ):
             fail(ERR_NEXT_OPEN_SESSION_END)
         queue.append((i + delay, kind, d, value))
 
@@ -1175,6 +1253,8 @@ def _simulate_slots_reference(
             rounding=tick_round,
             combine=combine,
             fill=price,
+            stop_frac=float(stop_fracs[d]),
+            target_frac=float(target_fracs[d]),
         )
         position = _SlotPosition(d, s, i, price, st, tg, st)
         last_entry, last_price, last_stop = i, price, st
@@ -1208,6 +1288,7 @@ def _simulate_slots_reference(
             pending >= 0
             and days[i]
             and not day_cancel
+            and not (next_bar and i == pending + 1)
             and (
                 rests(pending)
                 or not math.isnan(triggers[pending])
@@ -1239,6 +1320,26 @@ def _simulate_slots_reference(
                 ):
                     book.update(price)
                     entered = False
+                    if (
+                        label == "O"
+                        and pending >= 0
+                        and resting
+                        and relative[pending]
+                        and i == pending + 1
+                        and not submit_at_open(pending, price)
+                    ):
+                        if stop_skip and not paired(pending):
+                            pending, resting = -1, False
+                        else:
+                            return RefColumn(
+                                trades,
+                                ERR_STOP_ENTRY_IN_MARKET,
+                                i,
+                                0 if position is None else position.side,
+                                last_entry,
+                                last_price,
+                                last_stop,
+                            )
                     if pending >= 0 and resting:
                         d = pending
                         s = entry_side(d, label, price)
@@ -1277,6 +1378,16 @@ def _simulate_slots_reference(
                             if not mit and not slip and label in ("H", "L"):
                                 book.pin(p.side, px)
                             close(px, REASON_TARGET)
+                if (
+                    next_bar
+                    and pending >= 0
+                    and resting
+                    and i > pending
+                    and (not math.isnan(triggers[pending]) or rests(pending))
+                ):
+                    # The next-bar order lived through its one bar unfilled: it expires now.
+                    queue[:] = [cmd for cmd in queue if cmd[2] != pending]
+                    pending, resting, busy = -1, False, False
                 if int(force_close[i]) & 8:
                     if position is not None or pending >= 0:
                         return RefColumn(
@@ -1454,9 +1565,13 @@ def _simulate_slots_reference(
                     kind = "submit"
                 if kind == "submit" and pending == d:
                     if straddle is not None and paired(d):
-                        if not (phase == 0 and next_open) and (
-                            (not math.isnan(straddle[0, d]) and quote(1) >= straddle[0, d])
-                            or (not math.isnan(straddle[6, d]) and quote(-1) <= straddle[6, d])
+                        if (
+                            not (phase == 0 and next_open)
+                            and not relative[d]
+                            and (
+                                (not math.isnan(straddle[0, d]) and quote(1) >= straddle[0, d])
+                                or (not math.isnan(straddle[6, d]) and quote(-1) <= straddle[6, d])
+                            )
                         ):
                             fail(ERR_STOP_ENTRY_IN_MARKET)
                         else:
@@ -1473,8 +1588,10 @@ def _simulate_slots_reference(
                         else:
                             pending, resting, chasing, closing = -1, False, False, False
                     elif not math.isnan(triggers[d]):
-                        if not (phase == 0 and next_open) and through(
-                            s, float(triggers[d]), True, quote(s)
+                        if (
+                            not (phase == 0 and next_open)
+                            and not relative[d]
+                            and through(s, float(triggers[d]), True, quote(s))
                         ):
                             if stop_skip:
                                 pending, resting = -1, False

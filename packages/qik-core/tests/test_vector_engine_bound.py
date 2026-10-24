@@ -51,7 +51,7 @@ def bound_runner(tmp_path_factory):
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
 @pytest.mark.parametrize(
-    "rules_width", [RULES_WIDTH - 5, RULES_WIDTH - 2, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1]
+    "rules_width", [22, 25, 26, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1]
 )
 def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     module = bound_runner

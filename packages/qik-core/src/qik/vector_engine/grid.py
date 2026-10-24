@@ -76,9 +76,9 @@ def stack(params: pd.DataFrame, build: Callable[..., Signals]) -> Signals:
     lv = {
         name: levels(name)
         for name in SIGNAL_FIELDS[2:]
-        if name not in ("exit_long", "exit_short", "flatten")
+        if name not in ("exit_long", "exit_short", "flatten", "entry_from_open")
     }
-    for name in ("exit_long", "exit_short", "flatten"):
+    for name in ("exit_long", "exit_short", "flatten", "entry_from_open"):
         if any(getattr(sig, name) is not None for sig in built):
             lv[name] = np.column_stack(
                 [
