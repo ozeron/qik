@@ -228,7 +228,8 @@ def test_stateless_replay_dense():
             )
 
 
-NumericDecision = namedtuple("NumericDecision", ("side", *SIGNAL_FIELDS[1:]))
+# The legacy 16-value record (through IOC); the adapter fills absent paired fields.
+NumericDecision = namedtuple("NumericDecision", ("side", *SIGNAL_FIELDS[1:16]))
 
 
 @jitclass([("signals", nb.float64[:, ::1])])
