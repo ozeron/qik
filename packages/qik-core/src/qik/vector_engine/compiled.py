@@ -1117,8 +1117,8 @@ def run(
             def step(self, bar: Any) -> LegacyDecision:
                 decision = self.instance.step(bar)
                 if isinstance(decision, tuple):
-                    if len(decision) not in (15, 16, len(Decision._fields)):
-                        raise ValueError("Decision ABI requires 15, 16 or 28 fields")
+                    if len(decision) not in (15, 16, 28, len(Decision._fields)):
+                        raise ValueError("Decision ABI requires 15, 16, 28 or 31 fields")
                     return LegacyDecision(*decision)
                 return decision
 

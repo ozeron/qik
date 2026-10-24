@@ -648,6 +648,8 @@ def _simulate(
     slot_arrays = tuple(opt(getattr(signals, name), name) for name in slot_names)
     trigger, sup, tup, after, offset = slot_arrays
     from_open = exit_mask(signals.entry_from_open, "entry_from_open")
+    if from_open.shape[1] != k:
+        raise ValueError("all signal arrays must have the same number of configs")
     from_open_rows = from_open & ((side != 0) | pair_rows)
     from_open_used = signals.entry_from_open is not None and bool(from_open_rows.any())
     if from_open_used:
@@ -667,15 +669,18 @@ def _simulate(
         or frac_used
     )
     levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc, *pair_arrays)
+    validation_levels = (*levels, stop_frac, target_frac)
     next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
     exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
         raise ValueError("NEXT_OPEN does not support entry_limit / limit-then-market entries")
-    if not all(a.shape[1] == k for a in (exit_, exit_long, exit_short, flatten, *levels)):
+    if not all(
+        a.shape[1] == k for a in (exit_, exit_long, exit_short, flatten, *validation_levels)
+    ):
         raise ValueError("all signal arrays must have the same number of configs")
     if not np.isin(side, (-1, 0, 1)).all():
         raise ValueError("entry_side must be -1, 0 or +1")
-    if any(np.isinf(a).any() for a in levels if a is not nan):
+    if any(np.isinf(a).any() for a in validation_levels if a is not nan):
         raise ValueError("levels must be finite or NaN")
     entries = side != 0
     if pair_used:

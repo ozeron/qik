@@ -50,9 +50,7 @@ def bound_runner(tmp_path_factory):
 
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
-@pytest.mark.parametrize(
-    "rules_width", [22, 25, 26, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1]
-)
+@pytest.mark.parametrize("rules_width", [22, 25, 26, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1])
 def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     module = bound_runner
     x = np.array([100.0, 101.0, 102.0, 100.0])
@@ -86,6 +84,7 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         return
     raw = module.run(*args)
     decisions = raw[-1]
+    assert decisions.shape == (2, 31, len(x))
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
     batch = K.run_columns(
         x,

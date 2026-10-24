@@ -41,6 +41,7 @@ _15 = (
 )
 _16 = (*_15, np.nan)
 _28 = (*_16, *(np.nan for _ in range(12)))
+_31 = (*_28, False, np.nan, np.nan)
 _EXIT15 = (0, True, *_15[2:])
 _EXIT16 = (*_EXIT15, np.nan)
 _EXIT28 = (*_EXIT16, *(np.nan for _ in range(12)))
@@ -56,10 +57,12 @@ def constructor_probe(i):
         return Decision(*_16)
     if i == 28:
         return Decision(*_28)
+    if i == 31:
+        return Decision(*_31)
     return Decision(side=1)
 
 
-@pytest.mark.parametrize("width", [0, 1, 15, 16, 28])
+@pytest.mark.parametrize("width", [0, 1, 15, 16, 28, 31])
 def test_defaulted_constructor_mixed_returns(width):
     expected = HOLD if width == 0 else Decision(side=1)
     actual = constructor_probe(width)
@@ -68,7 +71,7 @@ def test_defaulted_constructor_mixed_returns(width):
     assert np.asarray(actual, float).tobytes() == np.asarray(expected, float).tobytes()
 
 
-@pytest.mark.parametrize("values", [_15, _16, _28], ids=["15", "16", "28"])
+@pytest.mark.parametrize("values", [_15, _16, _28, _31], ids=["15", "16", "28", "31"])
 def test_jitclass_adapter_historical_tuple_width(values):
     @jitclass([])
     class OldCore:
@@ -78,7 +81,7 @@ def test_jitclass_adapter_historical_tuple_width(values):
         def step(self, bar, pos):
             return values
 
-    out = np.full(28, -999.0)
+    out = np.full(len(Decision._fields), -999.0)
     view = np.full(14, np.nan)
     view[[0, 2, 6, 8]] = 0
     _jitclass_step(
@@ -145,7 +148,7 @@ def test_mixed_record_python_equals_jit():
     assert len(compiled.trades) == 1
 
 
-@pytest.mark.parametrize("values", [_15, _16, _28], ids=["15", "16", "28"])
+@pytest.mark.parametrize("values", [_15, _16, _28, _31], ids=["15", "16", "28", "31"])
 def test_legacy_core_tuple_shims(values):
     class OldCore:
         def step(self, bar):
@@ -161,7 +164,7 @@ def test_legacy_core_tuple_shims(values):
     assert len(actual.trades) == 1
 
 
-@pytest.mark.parametrize("width", [14, 17, 27, 29])
+@pytest.mark.parametrize("width", [14, 17, 27, 29, 30, 32])
 def test_legacy_core_refuses_unknown_tuple_width(width):
     class BadCore:
         def step(self, bar):
