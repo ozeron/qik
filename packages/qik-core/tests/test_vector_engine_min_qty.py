@@ -1,7 +1,7 @@
 """Opt-in minimum risk quantity and compiled refusal diagnostics."""
 
 from collections.abc import Callable
-from typing import cast
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -23,21 +23,25 @@ from qik.vector_engine import (
     Params,
     Position,
     Profile,
+    Result,
     Rules,
+    Signals,
     Sizing,
     State,
     TickRound,
     enter,
     exit,
     run,
+    simulate,
     strategy,
 )
 from qik.vector_engine.account import quantity
 from qik.vector_engine.reference import quantity_reference
 
 QuantityFunction = Callable[[int, float, float, float, float, float, float, bool], float]
-python_quantity = cast(QuantityFunction, getattr(quantity, "py_func"))
-jit_quantity = cast(QuantityFunction, quantity)
+# A plain function under NUMBA_DISABLE_JIT.
+python_quantity: QuantityFunction = getattr(quantity, "py_func", quantity)
+jit_quantity: QuantityFunction = quantity
 
 
 class EmptyState(State):
@@ -107,6 +111,44 @@ def test_rounding_boundary(lot: float, offset: float) -> None:
         assert fn(1, budget, 0.0, 1000.0, 20.0, lot, lot, True) == expected
 
 
+def test_batch_clamp_matches_floor_to_one_projects() -> None:
+    # P025 qty_for_stop and P051 _qty_for_risk: max(1, min(max_qty, floor(risk / (stop * pv)))).
+    n = 2000
+    rng = np.random.default_rng(11)
+    c = (16000 + np.cumsum(rng.integers(-3, 4, n))) * 0.25
+    o = np.r_[c[0], c[:-1]]
+    bars = Bars(
+        o,
+        np.maximum(o, c) + 1,
+        np.minimum(o, c) - 1,
+        c,
+        index=pd.date_range("2020-01-02 14:30", periods=n, freq="5min", tz="UTC"),
+        volume=np.full(n, 1e6),
+    )
+    side = np.where(rng.random(n) < 0.05, rng.choice([-1, 1], n), 0).astype(np.int8)
+    stop = bars.close - side * rng.integers(2, 120, n) * 0.25
+    signals = Signals(side, np.zeros(n, bool), stop, bars.close + side * 8 * 0.25)
+    instrument = Instrument(tick=0.25, point_value=20)
+
+    def sized(policy: Literal["refuse", "clamp"]) -> Result:
+        return simulate(
+            bars,
+            signals,
+            instrument=instrument,
+            costs=Costs(),
+            sizing=Sizing(risk_usd=300, max_contracts=4, min_qty_policy=policy),
+        )
+
+    with pytest.raises(ValueError, match="0 contracts"):
+        sized("refuse")
+    clamped = sized("clamp")
+    for frame in (clamped.trades, clamped.open_positions):
+        risk = (frame.entry_px - frame.stop).abs() * 20
+        expected = np.maximum(1, np.minimum(4, np.floor(300 / risk)))
+        assert frame.contracts.tolist() == expected.tolist()
+    assert (clamped.trades.contracts == 1).any() and (clamped.trades.contracts == 4).any()
+
+
 def test_policy_validation() -> None:
     assert Sizing(risk_usd=500).min_qty_policy == "refuse"
     with pytest.raises(ValueError, match="min_qty_policy"):
@@ -157,7 +199,7 @@ def test_python_jit_refusal_and_clamp(distance: float, phase: str) -> None:
             execute(Sizing(risk_usd=1), jit)
         errors.append(str(exc.value))
         results.append(execute(Sizing(risk_usd=1, min_qty_policy="clamp"), jit))
-    assert errors == [f"compiled core: {phase} sizing refused"] * 2
+    assert errors == [f"compiled core: {phase} sizing refused for config 0"] * 2
 
     pd.testing.assert_frame_equal(results[0][0].trades, results[1][0].trades, check_exact=True)
     assert results[0][0].trades.contracts.tolist() == [1]

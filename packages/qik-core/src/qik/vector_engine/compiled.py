@@ -466,7 +466,7 @@ def _run_arrays(
             _raise_kernel_error(int(meta[j, 0]), bar, j, price, next_open=next_open)
         if cnt < 0:
             phase = "entry" if cnt == -1 else "open"
-            raise ValueError(f"compiled core: {phase} sizing refused")
+            raise ValueError(f"compiled core: {phase} sizing refused for config {j}")
         # Validation and accounting use the existing API; the matcher is not run again.
         sig = Signals(
             decisions[j, 0].astype(np.int8),
