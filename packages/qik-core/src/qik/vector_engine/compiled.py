@@ -104,6 +104,8 @@ def _run(
     expiry_days=None,
     pair_declared=False,
 ):
+    if len(rules) != 27:
+        raise ValueError("compiled Rules ABI requires exactly 27 values")
     if pair_declared and not slots:
         raise ValueError("straddle requires the slots scheduler")
     k, n = len(params_grid), len(c)
@@ -155,7 +157,11 @@ def _run(
             int(rules[13]),
             decisions_all[j],
             bool(rules[6]),
-            int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]),
+            int(rules[22])
+            + 4 * int(rules[16])
+            + 8 * int(rules[8])
+            + 16 * int(rules[25])
+            + 32 * int(rules[26]),
         )
         a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
         slip = rules[9] if rules[8] else 0.0
@@ -491,6 +497,12 @@ def _run_arrays(
     sides, exits, levels, booleans, decisions = tail[7:]
     results = []
     for j, cnt in enumerate(counts):
+        if cnt == -3:
+            raise ValueError("straddle arm_stop=next_bar composition is unproved")
+        if cnt == -4:
+            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
+        if cnt == -5:
+            raise ValueError("straddle ONE_TICK execution is unproved")
         # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
         # refusal first, retaining complete terminal captures for causality checks.
         if meta[j, 0] and (_capture_signals is None or np.isnan(decisions[j, 0]).any()):

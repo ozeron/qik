@@ -49,16 +49,17 @@ def bound_runner(tmp_path_factory):
 
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
-def test_bound_record_matches_batch(bound_runner, mode: str):
+@pytest.mark.parametrize("rules_width", [22, 25, 26, 27, 28])
+def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     module = bound_runner
     x = np.array([100.0, 101.0, 102.0, 100.0])
     states = np.zeros(2, dtype=[("calls", "i8")]).view(np.recarray)
     params = np.array([[2.0], [3.0]])
-    rules = np.zeros(27)
+    rules = np.zeros(rules_width)
     rules[0] = 1
     rules[7] = int(mode == "venue")
     days = np.zeros(len(x), bool)
-    raw = module.run(
+    args = (
         states,
         params,
         np.zeros((len(x), 1)),
@@ -74,6 +75,11 @@ def test_bound_record_matches_batch(bound_runner, mode: str):
         1000.0,
         mode == "slots",
     )
+    if rules_width != 27:
+        with pytest.raises(ValueError, match="compiled Rules ABI requires exactly 27 values"):
+            module.run(*args)
+        return
+    raw = module.run(*args)
     decisions = raw[-1]
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
     batch = K.run_columns(

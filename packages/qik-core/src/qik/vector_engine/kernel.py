@@ -1847,6 +1847,11 @@ def run_columns(
                     entry_trigger[j, i] = _round_price(
                         entry_trigger[j, i], tick, tick_round, side_sig[j, i]
                     )
+    if straddle is not None and np.isfinite(straddle).any():
+        if arm_stop:
+            raise ValueError("straddle arm_stop=next_bar composition is unproved")
+        if day_cancel:
+            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     if straddle is not None and entry_trigger is None:
         raise ValueError("straddle requires the slots scheduler")
     slot_slip = tick if one_tick else 0.0
@@ -2113,6 +2118,11 @@ def _slots_column(
     straddle=None,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
+    if straddle is not None and np.isfinite(straddle).any():
+        if arm_stop:
+            raise ValueError("straddle arm_stop=next_bar composition is unproved")
+        if day_cancel:
+            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     queue = [(0, 0, 0, 0.0)]
     queue.pop()
     state = SlotsState(
@@ -3159,6 +3169,18 @@ def _core_decision(
     for col in range(10):
         core.levels[col, i] = d[col + 2]
     core.levels[10, i] = d[15]
+    # Carry these refusals out of prange like sizing refusals; raising inside
+    # a compiled callback can otherwise leave uninitialized result buffers.
+    if np.isfinite(d[16:]).any():
+        if core.pair_rules & 16:
+            core.account[2] = 3
+            return
+        if core.pair_rules & 32:
+            core.account[2] = 4
+            return
+        if core.pair_rules & 8:
+            core.account[2] = 5
+            return
     if validate_pair(
         d[16:],
         d[2:12],
@@ -3167,6 +3189,8 @@ def _core_decision(
         core.pair_rules & 3,
         bool(core.pair_rules & 4),
         bool(core.pair_rules & 8),
+        bool(core.pair_rules & 16),
+        bool(core.pair_rules & 32),
     ):
         if core.levels.shape[0] < 23:
             raise ValueError("straddle requires the slots scheduler")

@@ -19,6 +19,8 @@ def validate_pair(
     combine: int,
     oto: bool,
     one_tick: bool,
+    arm_stop: bool = False,
+    day_cancel: bool = False,
 ) -> bool:
     """Validate before an order can be sent, including from a compiled strategy."""
     if np.isnan(pair).all():
@@ -38,6 +40,10 @@ def validate_pair(
             raise ValueError("straddle target level and points need target_combine=tighter")
     if not np.isnan(pair[0]) and not np.isnan(pair[6]) and pair[6] >= pair[0]:
         raise ValueError("straddle stop triggers must be ordered short < long")
+    if arm_stop:
+        raise ValueError("straddle arm_stop=next_bar composition is unproved")
+    if day_cancel:
+        raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     if oto:
         raise ValueError("straddle OTO composition is unproved; use callback protection")
     if one_tick:

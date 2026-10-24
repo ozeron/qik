@@ -262,6 +262,11 @@ def simulate_column_reference(
     expiry_days: np.ndarray | None = None,
     straddle: np.ndarray | None = None,
 ) -> RefColumn:
+    if straddle is not None and np.isfinite(straddle).any():
+        if arm_stop:
+            raise ValueError("straddle arm_stop=next_bar composition is unproved")
+        if day_cancel:
+            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     exit_next_open = next_open if exit_next_open is None else exit_next_open
     long_exits = np.zeros(len(c), bool) if exit_long is None else exit_long
     short_exits = np.zeros(len(c), bool) if exit_short is None else exit_short

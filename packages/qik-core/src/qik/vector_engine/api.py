@@ -652,6 +652,8 @@ def _simulate(
                 (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
                 rules.protection == "oto",
                 rules.fill_model is FillModel.ONE_TICK,
+                rules.arm_stop == "next_bar",
+                rules.day_order_expiry == "cancel",
             )
         entries = entries | pair_rows
     if (
