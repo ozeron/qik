@@ -266,6 +266,13 @@ def test_p111_daily_reissue_and_custom_sessions() -> None:
         run(lifecycle_step, replace(b, index=None), **kw)
 
 
+def test_day_expiry_is_research_only() -> None:
+    b = tape(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="America/New_York"))
+    sig = Signals(np.array([1, 0, 0]), np.zeros(3, bool), stop=np.array([95.0, np.nan, np.nan]))
+    assert simulate(b, sig).deployable
+    assert not simulate(b, sig, rules=Rules(day_order_expiry="cancel")).deployable
+
+
 @pytest.mark.parametrize("protect", ["error", "flatten"])
 def test_marketable_first_stop_uses_protection_policy(protect: str) -> None:
     b = tape(pd.date_range("2023-01-03 10:00", periods=4, freq="min", tz="America/New_York"))

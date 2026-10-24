@@ -942,14 +942,19 @@ def _simulate(
         compliance = Compliance.REPRO_TRADINGVIEW
     else:
         compliance = _ReproCompliance(f"repro:{rules.author_platform}")
-    research_only = ioc_used or (
-        slots
-        and (
-            rules.protection == "oto"
-            or rules.adaptive_high_low_ordering
-            or not rules.reenter_on_exit_bar
-            or bool(np.any(entries & np.isnan(stop) & np.isnan(stop_pts)))
-            or (sizing is not None and sizing.contracts is None)
+    # V2 leaves a DAY limit resting across the NY date (A15): civil-date expiry is research-only.
+    research_only = (
+        ioc_used
+        or rules.day_order_expiry == "cancel"
+        or (
+            slots
+            and (
+                rules.protection == "oto"
+                or rules.adaptive_high_low_ordering
+                or not rules.reenter_on_exit_bar
+                or bool(np.any(entries & np.isnan(stop) & np.isnan(stop_pts)))
+                or (sizing is not None and sizing.contracts is None)
+            )
         )
     )
     return Result(trades, open_positions, n, k, bars.index, initial_cash, compliance, research_only)
@@ -979,10 +984,7 @@ def _day_order_dates(bars: Bars) -> np.ndarray:
     """DAY expiry follows NY civil dates, independently of custom session labels."""
     if bars.index is None or bars.index.tz is None:
         raise ValueError("day_order_expiry='cancel' needs timezone-aware Bars.index")
-    dates = pd.Series(bars.index.tz_convert("America/New_York")).dt.date.to_numpy()
-    result = np.zeros(len(bars), bool)
-    result[1:] = dates[1:] != dates[:-1]
-    return result
+    return _new_york_date_starts(pd.DatetimeIndex(bars.index))
 
 
 def _new_york_days(bars: Bars, rule: str) -> np.ndarray:
@@ -996,8 +998,13 @@ def _new_york_days(bars: Bars, rule: str) -> np.ndarray:
     stamps = pd.DatetimeIndex(bars.index)
     if stamps.tz is None:
         raise ValueError(f"Bars.index must be timezone-aware for {rule}")
+    return _new_york_date_starts(stamps)
+
+
+def _new_york_date_starts(stamps: pd.DatetimeIndex) -> np.ndarray:
+    """True where a bar's America/New_York civil date differs from the previous bar's."""
     days = pd.Series(stamps.tz_convert("America/New_York")).dt.date.to_numpy()
-    new_day = np.zeros(len(bars), np.bool_)
+    new_day = np.zeros(len(stamps), np.bool_)
     new_day[1:] = days[1:] != days[:-1]
     return new_day
 

@@ -44,6 +44,7 @@ from .api import (
     Sizing,
     TargetGap,
     TickRound,
+    _day_order_dates,
     _new_york_days,
     _raise_kernel_error,
     _simulate,
@@ -449,8 +450,6 @@ def _run_arrays(
             sizing.min_qty_policy == "clamp" if sizing else False,
         ]
     )
-    from .api import _day_order_dates
-
     runner: Any = _run if _bound_runner is None else _bound_runner
     callback_args = (step,) if _bound_runner is None else ()
     raw = runner(
