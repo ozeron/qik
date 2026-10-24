@@ -28,6 +28,7 @@ from .protection import (
     _round_price,
     levels,
 )
+from .straddle import validate_pair
 
 REASON_SIGNAL = 1  # market exit at the decision close (R1: the next open)
 REASON_STOP = 2  # resting stop-market hit during a bar, filled at the stop level
@@ -43,6 +44,7 @@ ERR_MIT_IN_MARKET = 8
 ERR_AMEND_REJECTED = 9
 ERR_AMEND_NO_ORDER = 10
 ERR_STOP_REPLACE_LATENCY = 11
+ERR_STRADDLE_SIDE_CANCEL = 12
 
 _SLOT_SUBMIT = 1
 _SLOT_PROTECT = 2
@@ -1816,7 +1818,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1844,6 +1846,8 @@ def run_columns(
                     entry_trigger[j, i] = _round_price(
                         entry_trigger[j, i], tick, tick_round, side_sig[j, i]
                     )
+    if straddle is not None and entry_trigger is None:
+        raise ValueError("straddle requires the slots scheduler")
     slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
@@ -1857,6 +1861,7 @@ def run_columns(
     s0 = np.empty(0, np.int8)
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
+        pair_column = _straddle_column(straddle, j)
         ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
@@ -1927,6 +1932,7 @@ def run_columns(
                 arm_stop=arm_stop,
                 day_cancel=day_cancel,
                 expiry_days=expiry_days,
+                straddle=pair_column,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
@@ -1954,6 +1960,7 @@ def run_columns(
     reason = np.empty(total, np.int8)
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
+        pair_column = _straddle_column(straddle, j)
         ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
         long_column = None if exit_long is None else exit_long[j]
         short_column = None if exit_short is None else exit_short[j]
@@ -2025,6 +2032,7 @@ def run_columns(
                     arm_stop=arm_stop,
                     day_cancel=day_cancel,
                     expiry_days=expiry_days,
+                    straddle=pair_column,
                 )
             else:
                 _column(
@@ -2101,6 +2109,7 @@ def _slots_column(
     arm_stop=False,
     day_cancel=False,
     expiry_days=None,
+    straddle=None,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
@@ -2167,6 +2176,7 @@ def _slots_column(
         arm_stop,
         day_cancel,
         expiry_days,
+        straddle,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2241,6 +2251,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         arm_stop,
         day_cancel,
         expiry_days,
+        straddle,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2288,7 +2299,11 @@ def _slots_column_advance(state, i, inputs, core=None):
         pending >= 0
         and days[i]
         and not day_cancel
-        and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
+        and (
+            _pair_at(straddle, pending)
+            or not np.isnan(triggers[pending])
+            or not np.isnan(limits[pending])
+        )
     ):
         return (
             SlotsState(
@@ -2360,9 +2375,26 @@ def _slots_column_advance(state, i, inputs, core=None):
                 entered = False
                 if pending >= 0 and resting:
                     d, s = pending, sides[pending]
+                    paired = _pair_at(straddle, d)
                     stop_order = not np.isnan(triggers[d])
                     level = triggers[d] if stop_order else limits[d]
-                    match = _in_market(-s, level, pt if stop_order else pt + s * slip, stop_order)
+                    if straddle is not None and paired:
+                        s = 0
+                        for offset, direction in ((0, 1), (6, -1)):
+                            trigger, cap = straddle[offset, d], straddle[offset + 1, d]
+                            if (not np.isnan(trigger) and direction * (pt - trigger) >= 0) or (
+                                m == 0
+                                and i == d + latency + 1
+                                and not np.isnan(cap)
+                                and direction * (pt - cap) <= 0
+                            ):
+                                s = direction
+                                stop_order = not np.isnan(trigger)
+                                level = trigger if stop_order else pt
+                                break
+                    match = s != 0 and _in_market(
+                        -s, level, pt if stop_order else pt + s * slip, stop_order
+                    )
                     if match:
                         px = pt + s * slip if slip else (pt if stop_order and m == 0 else level)
                         anchor = _anchor(
@@ -2371,13 +2403,18 @@ def _slots_column_advance(state, i, inputs, core=None):
                             px,
                             limits[d] if not np.isnan(limits[d]) else px,
                         )
+                        leg_stop, leg_target, leg_sp, leg_tp = stops[d], targets[d], sp[d], tp[d]
+                        if straddle is not None and paired:
+                            offset = 0 if s > 0 else 6
+                            leg_stop, leg_target = straddle[offset + 2, d], straddle[offset + 3, d]
+                            leg_sp, leg_tp = straddle[offset + 4, d], straddle[offset + 5, d]
                         stop, target = levels(
                             s,
                             anchor,
-                            stops[d],
-                            targets[d],
-                            sp[d],
-                            tp[d],
+                            leg_stop,
+                            leg_target,
+                            leg_sp,
+                            leg_tp,
                             round_tick,
                             tick_round,
                             combine=combine,
@@ -2424,6 +2461,14 @@ def _slots_column_advance(state, i, inputs, core=None):
                                     0.0,
                                 )
                             )
+                    elif (
+                        straddle is not None
+                        and paired
+                        and m == 0
+                        and np.isnan(straddle[0, d])
+                        and np.isnan(straddle[6, d])
+                    ):
+                        pending, resting = -1, False
                 if pos and live and not entered:
                     reason, px = 0, 0.0
                     if _in_market(pos, stop, pt, True):
@@ -2510,6 +2555,8 @@ def _slots_column_advance(state, i, inputs, core=None):
                     out_xp,
                     out_why,
                     out_st,
+                    _pair_level(straddle, pending, 0, i, latency),
+                    _pair_level(straddle, pending, 6, i, latency),
                 )
                 long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
                 close_mask, open_flatten = core.force_close[i], core.force_open[i]
@@ -2578,6 +2625,33 @@ def _slots_column_advance(state, i, inputs, core=None):
                 short_exit_i,
                 pos if pos else (sides[pending] if pending >= 0 else 0),
             )
+            if (
+                pending >= 0
+                and _pair_at(straddle, pending)
+                and (long_exit_i or short_exit_i or close_mask & 6)
+            ):
+                return (
+                    SlotsState(
+                        queue,
+                        pos,
+                        ei,
+                        gen,
+                        pending,
+                        ep,
+                        stop,
+                        target,
+                        risk_stop,
+                        live,
+                        resting,
+                        chasing,
+                        closing,
+                        be_done,
+                        cnt,
+                        error,
+                    ),
+                    ERR_STRADDLE_SIDE_CANCEL,
+                    i,
+                )
             if pos == 0 and pending < 0:
                 closing = False
             if (
@@ -2665,8 +2739,8 @@ def _slots_column_advance(state, i, inputs, core=None):
             if (
                 pos == 0
                 and pending >= 0
-                and not np.isnan(triggers[pending])
-                and sides[i]
+                and (_pair_at(straddle, pending) or not np.isnan(triggers[pending]))
+                and (sides[i] or _pair_at(straddle, i))
                 and not exit_now
             ):
                 if latency:
@@ -2706,11 +2780,11 @@ def _slots_column_advance(state, i, inputs, core=None):
                 and pending < 0
                 and not busy
                 and not closing
-                and sides[i]
+                and (sides[i] or _pair_at(straddle, i))
                 and (reenter or not exited)
             ):
                 pending = i
-                if not np.isnan(_optional_at(ioc_limits, i, np.nan)):
+                if _pair_at(straddle, i) or not np.isnan(_optional_at(ioc_limits, i, np.nan)):
                     due = i + latency + 1
                     if due >= len(c) or (not cross_session and np.any(days[i + 1 : due + 1])):
                         error = ERR_NEXT_OPEN_SESSION_END
@@ -2755,6 +2829,25 @@ def _slots_column_advance(state, i, inputs, core=None):
                     continue
                 pending, kind = d, _SLOT_SUBMIT
             if kind == _SLOT_SUBMIT and pending == d:
+                if straddle is not None and _pair_at(straddle, d):
+                    due = d + latency + 1
+                    if due >= len(c) or (not cross_session and np.any(days[d + 1 : due + 1])):
+                        error = ERR_NEXT_OPEN_SESSION_END
+                        continue
+                    if not (phase == 0 and next_open) and (
+                        (
+                            not np.isnan(straddle[0, d])
+                            and (pin if pinned == -1 else ci) >= straddle[0, d]
+                        )
+                        or (
+                            not np.isnan(straddle[6, d])
+                            and (pin if pinned == 1 else ci) <= straddle[6, d]
+                        )
+                    ):
+                        error = ERR_STOP_ENTRY_IN_MARKET
+                    else:
+                        resting = True
+                    continue
                 s = sides[d]
                 cap = _optional_at(ioc_limits, d, np.nan)
                 if not np.isnan(cap) and s * (ci - cap) > 0:
@@ -2971,7 +3064,7 @@ V_LAST_EXIT_I, V_LAST_EXIT_PX, V_LAST_EXIT_REASON, V_EQUITY = range(8, 12)
 CoreContext = namedtuple(
     "CoreContext",
     "step state params feats volume position_view decision sides exits levels long_exits short_exits "
-    "force_close force_open days ends economic account flatten_mode boundary tick rounding decisions exit_next_open",
+    "force_close force_open days ends economic account flatten_mode boundary tick rounding decisions exit_next_open pair_rules",
 )
 
 
@@ -2999,6 +3092,8 @@ def _core_decision(
     out_xp,
     out_why,
     out_st,
+    work_long=np.nan,
+    work_short=np.nan,
 ):
     """Observe settled fills, call a core, and publish its close decision (no matching here)."""
     seen = int(core.account[0])
@@ -3037,6 +3132,7 @@ def _core_decision(
         view[V_QTY] = qty
     view[V_WORK_SIDE], view[V_WORK_LEVEL] = work_side, work_level
     view[V_EQUITY] = core.account[1]
+    view[12], view[13] = work_long, work_short
     d = core.decision
     d[:] = np.nan
     d[0], d[1], d[12], d[13], d[14] = 0, 0, 0, 0, 0
@@ -3051,6 +3147,26 @@ def _core_decision(
     for col in range(10):
         core.levels[col, i] = d[col + 2]
     core.levels[10, i] = d[15]
+    if validate_pair(
+        d[16:],
+        d[2:12],
+        d[0],
+        bool(d[1] or d[12] or d[13] or d[14] or not np.isnan(d[15])),
+        core.pair_rules & 3,
+        bool(core.pair_rules & 4),
+        bool(core.pair_rules & 8),
+    ):
+        if core.levels.shape[0] < 23:
+            raise ValueError("straddle requires the slots scheduler")
+    for col in range(12):
+        core.levels[11 + col, i] = d[16 + col]
+    for offset, direction in ((0, 1), (6, -1)):
+        core.levels[11 + offset, i] = _round_price(
+            d[16 + offset], core.tick, core.rounding, direction
+        )
+        core.levels[12 + offset, i] = _round_price(
+            d[17 + offset], core.tick, core.rounding, -direction
+        )
     core.levels[2, i] = _round_price(d[4], core.tick, core.rounding, -d[0])
     core.levels[5, i] = _round_price(d[7], core.tick, core.rounding, d[0])
     core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])
@@ -3068,6 +3184,27 @@ def _core_decision(
             core.force_close[i] |= 1 if core.boundary == 1 else 8
         else:
             core.force_open[i + 1] = True
+
+
+@nb.njit(cache=True, inline="never")
+def _straddle_column(pair, j):
+    if pair is None:
+        return np.empty((12, 0))
+    return pair[j]
+
+
+@nb.njit(cache=True)
+def _pair_at(pair, i):
+    return pair is not None and i >= 0 and pair.shape[1] > i and not np.isnan(pair[:, i]).all()
+
+
+@nb.njit(cache=True)
+def _pair_level(pair, i, offset, bar, latency):
+    if pair is None or i < 0 or pair.shape[1] <= i:
+        return np.nan
+    if not np.isnan(pair[offset, i]):
+        return pair[offset, i]
+    return pair[offset + 1, i] if bar < i + latency + 1 else np.nan
 
 
 @nb.njit(cache=True)

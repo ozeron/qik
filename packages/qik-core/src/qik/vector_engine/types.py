@@ -36,6 +36,8 @@ class Position(NamedTuple):
     last_exit_px: float
     last_exit_reason: int
     equity: float
+    working_long: float = math.nan
+    working_short: float = math.nan
 
 
 class Decision(NamedTuple):
@@ -57,6 +59,18 @@ class Decision(NamedTuple):
     exit_long: bool = False
     exit_short: bool = False
     entry_limit_ioc: float = math.nan
+    entry_stop_long: float = math.nan
+    entry_limit_ioc_long: float = math.nan
+    stop_long: float = math.nan
+    target_long: float = math.nan
+    stop_points_long: float = math.nan
+    target_points_long: float = math.nan
+    entry_stop_short: float = math.nan
+    entry_limit_ioc_short: float = math.nan
+    stop_short: float = math.nan
+    target_short: float = math.nan
+    stop_points_short: float = math.nan
+    target_points_short: float = math.nan
 
 
 HOLD = Decision()
@@ -90,6 +104,18 @@ def _enter(
         False,
         False,
         False,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
         math.nan,
     )
 
@@ -161,6 +187,18 @@ def enter_limit_ioc(
         False,
         False,
         float(limit),
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
     )
 
 
@@ -183,6 +221,18 @@ def exit() -> Decision:
         False,
         False,
         False,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
         math.nan,
     )
 
@@ -207,6 +257,18 @@ def trail(level: float) -> Decision:
         False,
         False,
         math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
     )
 
 
@@ -229,6 +291,18 @@ def move_target(level: float) -> Decision:
         False,
         False,
         False,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
         math.nan,
     )
 
@@ -253,6 +327,18 @@ def flatten() -> Decision:
         False,
         False,
         math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
     )
 
 
@@ -273,3 +359,51 @@ class ExitReason(IntEnum):
     TARGET = 3
     STOP_GAP = 4
     PROTECT_FAIL = 5
+
+
+@register_jitable
+def enter_straddle(
+    entry_stop_long: float = math.nan,
+    entry_limit_ioc_long: float = math.nan,
+    stop_long: float = math.nan,
+    target_long: float = math.nan,
+    stop_points_long: float = math.nan,
+    target_points_long: float = math.nan,
+    entry_stop_short: float = math.nan,
+    entry_limit_ioc_short: float = math.nan,
+    stop_short: float = math.nan,
+    target_short: float = math.nan,
+    stop_points_short: float = math.nan,
+    target_points_short: float = math.nan,
+) -> Decision:
+    """Submit mutually exclusive long/short legs from this completed close."""
+    return Decision(
+        0,
+        False,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        math.nan,
+        False,
+        False,
+        False,
+        math.nan,
+        float(entry_stop_long),
+        float(entry_limit_ioc_long),
+        float(stop_long),
+        float(target_long),
+        float(stop_points_long),
+        float(target_points_long),
+        float(entry_stop_short),
+        float(entry_limit_ioc_short),
+        float(stop_short),
+        float(target_short),
+        float(stop_points_short),
+        float(target_points_short),
+    )

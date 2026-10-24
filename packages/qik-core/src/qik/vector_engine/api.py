@@ -30,6 +30,7 @@ from . import kernel as K
 from . import sizing as S
 from ._checks import is_int
 from .sizing import Sizing
+from .straddle import PAIR_FIELDS, validate_pair
 
 __all__ = [
     "SIGNAL_FIELDS",
@@ -440,6 +441,18 @@ class Signals:
     exit_long: np.ndarray | None = None
     exit_short: np.ndarray | None = None
     entry_limit_ioc: np.ndarray | None = None
+    entry_stop_long: np.ndarray | None = None
+    entry_limit_ioc_long: np.ndarray | None = None
+    stop_long: np.ndarray | None = None
+    target_long: np.ndarray | None = None
+    stop_points_long: np.ndarray | None = None
+    target_points_long: np.ndarray | None = None
+    entry_stop_short: np.ndarray | None = None
+    entry_limit_ioc_short: np.ndarray | None = None
+    stop_short: np.ndarray | None = None
+    target_short: np.ndarray | None = None
+    stop_points_short: np.ndarray | None = None
+    target_points_short: np.ndarray | None = None
 
 
 SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
@@ -593,6 +606,12 @@ def _simulate(
     limit = opt(signals.entry_limit, "entry_limit")
     ioc = opt(signals.entry_limit_ioc, "entry_limit_ioc")
     ioc_used = bool(np.isfinite(ioc).any())
+    pair_arrays = tuple(opt(getattr(signals, name), name) for name in PAIR_FIELDS)
+    pair_rows = np.zeros((n, k), bool)
+    for a in pair_arrays:
+        if a is not nan:
+            pair_rows |= ~np.isnan(a)
+    pair_used = bool(pair_rows.any())
     stop_pts = opt(signals.stop_points, "stop_points")
     target_pts = opt(signals.target_points, "target_points")
     slot_names = (
@@ -605,8 +624,8 @@ def _simulate(
     slot_arrays = tuple(opt(getattr(signals, name), name) for name in slot_names)
     trigger, sup, tup, after, offset = slot_arrays
     slot_used = tuple(a is not nan and bool(np.isfinite(a).any()) for a in slot_arrays)
-    slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used)
-    levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc)
+    slots = rules.target_order == "mit" or rules.protection == "oto" or any(slot_used) or pair_used
+    levels = (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc, *pair_arrays)
     next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
     exit_next_open = rules.effective_exit_fill is FillTiming.NEXT_OPEN
     if next_open and np.isfinite(limit).any():
@@ -618,6 +637,23 @@ def _simulate(
     if any(np.isinf(a).any() for a in levels if a is not nan):
         raise ValueError("levels must be finite or NaN")
     entries = side != 0
+    if pair_used:
+        for i, j in np.argwhere(pair_rows):
+            validate_pair(
+                np.array([a[i, j] for a in pair_arrays]),
+                np.array(
+                    [
+                        a[i, j]
+                        for a in (stop, target, limit, stop_pts, target_pts, *slot_arrays, ioc)
+                    ]
+                ),
+                float(side[i, j]),
+                bool(exit_[i, j] or exit_long[i, j] or exit_short[i, j] or flatten[i, j]),
+                (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
+                rules.protection == "oto",
+                rules.fill_model is FillModel.ONE_TICK,
+            )
+        entries = entries | pair_rows
     if (
         slot_used[0]
         and limit is not nan
@@ -714,6 +750,7 @@ def _simulate(
                 "target_points",
                 *slot_names,
                 "entry_limit_ioc",
+                *PAIR_FIELDS,
             ),
             strict=True,
         ):
@@ -727,7 +764,7 @@ def _simulate(
         new_day = _limit_entry_checks(bars, entries, limit, stop, stop_pts)
     elif next_open or exit_next_open or ioc_used:
         new_day = _new_york_days(bars, "NEXT_OPEN")
-    elif slot_used[0]:
+    elif slot_used[0] or pair_used:
         new_day = _new_york_days(bars, "stop entries")
     if ioc_used:
         new_day = _new_york_days(bars, "entry_limit_ioc")
@@ -782,6 +819,21 @@ def _simulate(
     if slots:
         absent = t(nan.T)
         slot_data = tuple(absent if a is nan else t(a.T) for a in slot_arrays)
+    pair_data = None
+    if pair_used:
+        pair_data = np.ascontiguousarray(np.stack(pair_arrays, axis=1).transpose(2, 1, 0))
+        if instrument is not None and rules.tick_round is not TickRound.NONE:
+            rounding = tuple(TickRound).index(rules.tick_round)
+            round_price = getattr(K._round_price, "py_func", K._round_price)
+            for j in range(k):
+                for i in np.flatnonzero(pair_rows[:, j]):
+                    for offset, direction in ((0, 1), (6, -1)):
+                        pair_data[j, offset, i] = round_price(
+                            pair_data[j, offset, i], instrument.tick, rounding, direction
+                        )
+                        pair_data[j, offset + 1, i] = round_price(
+                            pair_data[j, offset + 1, i], instrument.tick, rounding, -direction
+                        )
     run_columns = K.run_columns if _run_columns is None else _run_columns
     out = run_columns(
         bars.open, bars.high, bars.low, bars.close,
@@ -809,6 +861,7 @@ def _simulate(
         force_close=t(force_close.T) if force_close is not None and force_close.any() else None,
         force_open=t(force_open.T) if force_open is not None and force_open.any() else None,
         entry_limit_ioc=t(ioc.T) if signals.entry_limit_ioc is not None else None,
+        straddle=pair_data,
         cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
         adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
         combine=(rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
@@ -944,7 +997,8 @@ def _simulate(
         compliance = _ReproCompliance(f"repro:{rules.author_platform}")
     # V2 leaves a DAY limit resting across the NY date (A15): civil-date expiry is research-only.
     research_only = (
-        ioc_used
+        pair_used
+        or ioc_used
         or rules.day_order_expiry == "cancel"
         or (
             slots
@@ -1010,6 +1064,7 @@ def _new_york_date_starts(stamps: pd.DatetimeIndex) -> np.ndarray:
 
 
 _KERNEL_ERRORS = {
+    K.ERR_STRADDLE_SIDE_CANCEL: "straddle side-specific cancellation at bar {bar}, config {j} is unproved; use exit",
     K.ERR_STOP_REPLACE_LATENCY: "stop entry replacement at bar {bar}, config {j} with latency is not pinned: cancel the old entry and wait before replacing it",
     K.ERR_STOP_ENTRY_IN_MARKET: "stop entry at bar {bar}, config {j} is in the market at submission",
     K.ERR_MIT_IN_MARKET: "MIT target at bar {bar}, config {j} is touched at submission",

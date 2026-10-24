@@ -54,6 +54,7 @@ from .api import (
 )
 from .core import Core
 from .schema import Features, Params, Scalar, State, StrategySpec
+from .straddle import PAIR_FIELDS
 from .types import Bar, Decision
 from .types import Position as AuthorPosition
 
@@ -101,7 +102,10 @@ def _run(
     masks=None,
     session_days=None,
     expiry_days=None,
+    pair_declared=False,
 ):
+    if pair_declared and not slots:
+        raise ValueError("straddle requires the slots scheduler")
     k, n = len(params_grid), len(c)
     # A bar can close existing protection and a new same-bar bracket: at most two trades.
     width = 2 * n
@@ -111,9 +115,9 @@ def _run(
     a2s, a5s = np.empty((k, width), np.int8), np.empty((k, width), np.int8)
     a3s, a4s, a6s = np.empty((k, width)), np.empty((k, width)), np.empty((k, width))
     sides_all, exits_all = np.zeros((k, n), np.int8), np.zeros((k, n), np.bool_)
-    levels_all = np.full((k, 11, n), np.nan)
+    levels_all = np.full((k, 23, n), np.nan)
     bools_all = np.zeros((k, 3, n), np.bool_)
-    decisions_all = np.full((k, 16, n), np.nan)
+    decisions_all = np.full((k, 28, n), np.nan)
     for column in nb.prange(k):  # ty: ignore[not-iterable]  (Numba ships prange as a class)
         j = np.int64(column)
         sides, exits, levels = sides_all[j], exits_all[j], levels_all[j]
@@ -122,9 +126,9 @@ def _run(
         if masks is not None:
             force_close[:] = masks[j, 0]
             force_open[:] = masks[j, 1]
-        view = np.full(12, np.nan)
+        view = np.full(14, np.nan)
         view[K.V_LAST_EXIT_I] = -1
-        decision = np.empty(16)
+        decision = np.empty(28)
         account = np.array([0.0, initial_cash, 0.0])
         core = K.CoreContext(
             step,
@@ -151,6 +155,7 @@ def _run(
             int(rules[13]),
             decisions_all[j],
             bool(rules[6]),
+            int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]),
         )
         a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
         slip = rules[9] if rules[8] else 0.0
@@ -217,6 +222,7 @@ def _run(
                 arm_stop=arm_stop,
                 day_cancel=day_cancel,
                 expiry_days=expiry_days,
+                straddle=levels[11:],
             )
         else:
             result = K._compiled_column(
@@ -338,7 +344,8 @@ def _run_arrays(
         raise ValueError("run needs 1D state, nonempty 2D params, 2D features")
     if _bound_runner is None and len(features) != len(bars):
         raise ValueError("features must have one row per bar")
-    slots = (
+    pair_declared = bool(fields & set(PAIR_FIELDS))
+    slots = pair_declared or (
         rules.target_order == "mit"
         or rules.protection == "oto"
         or bool(
@@ -360,6 +367,7 @@ def _run_arrays(
         raise ValueError(ONE_TICK_SLOTS)
     dates_needed = (
         bool(fields & {"entry_limit", "entry_stop", "entry_limit_ioc"})
+        or pair_declared
         or ("flatten" in fields and rules.flatten is Flatten.NEXT_OPEN)
         or (
             rules.effective_entry_fill is FillTiming.NEXT_OPEN
@@ -472,6 +480,7 @@ def _run_arrays(
         None,
         session_days,
         _day_order_dates(bars) if rules.day_order_expiry == "cancel" else None,
+        pair_declared,
     )
     if _bound_runner is not None:
         if _final_states is not None:
@@ -571,6 +580,8 @@ class Position(NamedTuple):
     last_exit_px: float
     last_exit_reason: int
     equity: float
+    working_long: float = np.nan
+    working_short: float = np.nan
 
 
 def _decision_ioc(decision: Any) -> float:
@@ -597,6 +608,28 @@ def _decision_ioc_type(decision: Any) -> Callable[[Any], float] | None:
     return without_ioc
 
 
+_ABSENT_PAIR = (np.nan,) * 12
+
+
+def _decision_pair(decision: tuple[float, ...]) -> tuple[float, ...]:
+    return tuple(decision[16:]) if len(decision) > 16 else _ABSENT_PAIR
+
+
+@overload(_decision_pair)
+def _decision_pair_type(decision):
+    if isinstance(decision, nb.types.BaseTuple) and len(decision) > 16:
+
+        def with_pair(decision):
+            return decision[16:]
+
+        return with_pair
+
+    def without_pair(decision):
+        return _ABSENT_PAIR
+
+    return without_pair
+
+
 @nb.njit(cache=False)
 def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     bar = CompiledBar(i, int(feats[i, 0]), o, h, lo, c, v)
@@ -613,6 +646,8 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
         view[9],
         -1 if np.isnan(view[10]) else int(view[10]),
         view[11],
+        view[12],
+        view[13],
     )
     decision = instance.step(bar, pos)
     out[0] = decision[0]
@@ -631,6 +666,9 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     out[13] = decision[13]
     out[14] = decision[14]
     out[15] = _decision_ioc(decision)
+    pair = _decision_pair(decision)
+    for q in range(12):
+        out[16 + q] = pair[q]
 
 
 def _run_jitclass(
@@ -651,7 +689,8 @@ def _run_jitclass(
 
     CoreClass is a jitclass (or a plain class with NUMBA_DISABLE_JIT=1). Constructors
     receive grid parameters and immutable feature arrays as named arguments. step
-    returns a 16-field numeric NamedTuple in Decision/SIGNAL_FIELDS order.
+    returns a numeric NamedTuple in Decision/SIGNAL_FIELDS order; legacy 15/16-field
+    records remain accepted by the adapter.
     """
     axes = {} if grid is None else grid
     supplied = {} if features is None else features

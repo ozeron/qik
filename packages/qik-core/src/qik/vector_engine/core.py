@@ -67,6 +67,18 @@ class Decision:
     exit_long: bool = False
     exit_short: bool = False
     entry_limit_ioc: float = math.nan
+    entry_stop_long: float = math.nan
+    entry_limit_ioc_long: float = math.nan
+    stop_long: float = math.nan
+    target_long: float = math.nan
+    stop_points_long: float = math.nan
+    target_points_long: float = math.nan
+    entry_stop_short: float = math.nan
+    entry_limit_ioc_short: float = math.nan
+    stop_short: float = math.nan
+    target_short: float = math.nan
+    stop_points_short: float = math.nan
+    target_points_short: float = math.nan
 
     def __post_init__(self) -> None:
         if self.side not in (-1, 0, 1):
@@ -148,7 +160,14 @@ def _decision_rows(sig: Signals) -> np.ndarray:
         a = getattr(sig, name)
         if a is not None:
             any_ = any_ | np.asarray(a, dtype=bool)
-    for name in ("stop_update", "target_update"):
+    for name in (
+        "stop_update",
+        "target_update",
+        "entry_stop_long",
+        "entry_stop_short",
+        "entry_limit_ioc_long",
+        "entry_limit_ioc_short",
+    ):
         a = getattr(sig, name)
         if a is not None:
             any_ = any_ | np.isfinite(a)
