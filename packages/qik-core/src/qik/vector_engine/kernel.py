@@ -356,6 +356,8 @@ def _venue_column_advance(state, i, inputs, core=None):
                 target_pts[d],
                 round_tick,
                 tick_round,
+                combine=combine,
+                fill=ep,
             )
             pending, resting, chasing, rejected_stop = -1, False, False, False
             protection = 0 if closing else 1

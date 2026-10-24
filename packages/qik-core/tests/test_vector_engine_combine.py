@@ -232,3 +232,73 @@ def test_nautilus_oto_combined_admission_and_marketable_stop():
     # The chosen level cannot silently be clipped to the fill or ignored.
     with pytest.raises(ValueError, match="stop|protection"):
         simulate(tape(), signals(), rules=rules)
+
+
+@pytest.mark.parametrize("side", [-1, 1])
+@pytest.mark.parametrize("slots,latency", [(False, 0), (False, 1), (True, 0), (True, 1)])
+@pytest.mark.parametrize("leg", ["stop", "target"])
+@pytest.mark.parametrize("level_tighter", [False, True])
+def test_ioc_fill_combines_from_actual_open(side, slots, latency, leg, level_tighter):
+    # IOC cap 100 accepts the 99 open (long; short mirrors around 100). Points are 3 from
+    # the fill; the level is either 1 from the fill (tighter) or 10 from it (looser).
+    sign = 1 if leg == "target" else -1
+    level_px = 99 + sign * (1 if level_tighter else 10)
+    resolved_px = 99 + sign * (1 if level_tighter else 3)
+    o = np.array([100.0, 99, 99, 99, 99, 99])
+    h, lo = o + 0.25, o - 0.25
+    touch = 3 + latency  # only the resolved leg, never the other candidate, is touched
+    if leg == "stop":
+        lo[touch] = resolved_px - 0.5
+    else:
+        h[touch] = resolved_px + 0.5
+    if side < 0:
+        o, h, lo = 200 - o, 200 - lo, 200 - h
+        level_px, resolved_px = 200 - level_px, 200 - resolved_px
+    index = pd.date_range("2023-01-03 10:00", periods=6, freq="min", tz="America/New_York")
+    bars = Bars(o, h, lo, o.copy(), index=index)
+    nan6 = np.full(6, math.nan)
+
+    def first(x):
+        a = nan6.copy()
+        a[0] = x
+        return a
+
+    fields = {leg: first(level_px), f"{leg}_points": first(3.0)}
+    if leg == "target":
+        fields["stop"] = first(100 - side * 20)
+    cap = first(100.0)
+    sides = np.array([side, 0, 0, 0, 0, 0], dtype=np.int8)
+    sig = Signals(sides, np.zeros(6, bool), entry_limit_ioc=cap, **fields)
+    rules = Rules(
+        target_order="mit" if slots else "limit",
+        latency_bars=latency,
+        **{f"{leg}_combine": "tighter"},
+    )
+    actual = simulate(bars, sig, rules=rules)
+    expected = simulate(
+        bars, replace(sig, **{leg: first(resolved_px), f"{leg}_points": None}), rules=rules
+    )
+    pd.testing.assert_frame_equal(actual.trades, expected.trades, check_exact=True)
+    assert len(actual.trades) == 1
+    assert actual.trades.iloc[0].exit_i == touch
+    assert actual.trades.iloc[0].exit_px == resolved_px
+    ref = R.simulate_column_reference(
+        o,
+        bars.high,
+        bars.low,
+        bars.close,
+        sides,
+        np.zeros(6, bool),
+        fields.get("stop", nan6),
+        fields.get("target", nan6),
+        stop_pts=fields.get("stop_points", nan6),
+        target_pts=fields.get("target_points", nan6),
+        entry_limit_ioc=cap,
+        mit=slots,
+        latency_bars=latency,
+        combine=1 if leg == "stop" else 2,
+    )
+    assert ref.err == 0
+    assert [(t.entry_i, t.exit_i, t.entry_px, t.exit_px) for t in ref.trades] == [
+        (a.entry_i, a.exit_i, a.entry_px, a.exit_px) for a in actual.trades.itertuples()
+    ]
