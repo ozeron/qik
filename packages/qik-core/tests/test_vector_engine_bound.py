@@ -11,6 +11,7 @@ import pytest
 
 from qik.vector_engine import kernel as K
 from qik.vector_engine.bound import write_bound_module
+from qik.vector_engine.compiled import RULES_WIDTH
 
 
 @nb.njit(cache=True)
@@ -49,7 +50,9 @@ def bound_runner(tmp_path_factory):
 
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
-@pytest.mark.parametrize("rules_width", [22, 25, 26, 27, 28])
+@pytest.mark.parametrize(
+    "rules_width", [RULES_WIDTH - 5, RULES_WIDTH - 2, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1]
+)
 def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     module = bound_runner
     x = np.array([100.0, 101.0, 102.0, 100.0])
@@ -75,8 +78,10 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         1000.0,
         mode == "slots",
     )
-    if rules_width != 27:
-        with pytest.raises(ValueError, match="compiled Rules ABI requires exactly 27 values"):
+    if rules_width != RULES_WIDTH:
+        with pytest.raises(
+            ValueError, match=f"compiled Rules ABI requires exactly {RULES_WIDTH} values"
+        ):
             module.run(*args)
         return
     raw = module.run(*args)

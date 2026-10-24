@@ -17,7 +17,7 @@ from test_vector_engine import _case, _dense_case
 from qik.vector_engine import Bars, Rules, Signals, run, simulate
 from qik.vector_engine import kernel as K
 from qik.vector_engine.api import SIGNAL_FIELDS
-from qik.vector_engine.compiled import _jitclass_step, _run
+from qik.vector_engine.compiled import RULES_WIDTH, _jitclass_step, _run
 
 _BATCH = K.run_columns
 
@@ -94,6 +94,7 @@ def compare(*args, **kwargs):
         ],
         float,
     )
+    assert len(rc) == RULES_WIDTH
     masks = np.zeros((k, 2, n), np.int8)
     for q, name in enumerate(("force_close", "force_open")):
         if d[name] is not None:

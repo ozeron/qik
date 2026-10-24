@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from enum import IntEnum
 from typing import NamedTuple
 
+import numba as nb
+from numba.core.typing.templates import (
+    AbstractTemplate,
+    AttributeTemplate,
+    infer_getattr,
+    signature,
+)
 from numba.extending import overload, register_jitable
 
 
@@ -71,6 +79,37 @@ class Decision(NamedTuple):
     target_short: float = math.nan
     stop_points_short: float = math.nan
     target_points_short: float = math.nan
+
+
+@infer_getattr
+class _DecisionConstructor(AttributeTemplate):
+    # Numba's namedtuple typer binds arguments without applying defaults. A
+    # partial constructor then has a shorter type than HOLD, even though Python
+    # constructs the full record. Specialize only our constructor, before the
+    # strategy's return types are unified; padding in the adapter is too late.
+    key = nb.types.NamedTupleClass
+
+    def resolve___call__(self, classty):
+        if classty.instance_class is not Decision:
+            return None
+        return nb.types.Function(_DecisionCall)
+
+
+class _DecisionCall(AbstractTemplate):
+    key = nb.types.NamedTupleClass
+
+    def generic(self, args, kwargs):
+        pysig = inspect.signature(Decision)
+        bound = pysig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        fields = tuple(
+            value if isinstance(value, nb.types.Type) else nb.typeof(value) for value in bound.args
+        )
+        # Keep the full Python signature as well as the full return type:
+        # lowering must materialize omitted defaults, including keyword gaps.
+        return signature(nb.types.BaseTuple.from_types(fields, Decision), *fields).replace(
+            pysig=pysig
+        )
 
 
 HOLD = Decision()

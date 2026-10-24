@@ -158,7 +158,7 @@ def write_bound_module(
         f"# Engine and strategy source: {fingerprint}\n"
         f"from {strategy_module} import {strategy_name} as _strategy\n"
         f"from qik.vector_engine.kernel import ({imports})\n"
-        "from qik.vector_engine.compiled import CompiledBar, Position, _decision_ioc, _decision_pair\n"
+        "from qik.vector_engine.compiled import RULES_WIDTH, CompiledBar, Position, _decision_ioc, _decision_pair\n"
         "_no_callback = None\n"
         "@nb.njit(cache=True)\ndef _bound_initial_state(states, cores, j):\n    return states[j]\n"
     )

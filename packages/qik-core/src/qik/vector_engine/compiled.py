@@ -58,6 +58,8 @@ from .straddle import PAIR_FIELDS
 from .types import Bar, Decision
 from .types import Position as AuthorPosition
 
+RULES_WIDTH = 27
+
 _legacy_warning_sites: set[tuple[str, int]] = set()
 
 
@@ -104,8 +106,8 @@ def _run(
     expiry_days=None,
     pair_declared=False,
 ):
-    if len(rules) != 27:
-        raise ValueError("compiled Rules ABI requires exactly 27 values")
+    if len(rules) != RULES_WIDTH:
+        raise ValueError(f"compiled Rules ABI requires exactly {RULES_WIDTH} values")
     if pair_declared and not slots:
         raise ValueError("straddle requires the slots scheduler")
     k, n = len(params_grid), len(c)
@@ -443,6 +445,7 @@ def _run_arrays(
         ],
         float,
     )
+    assert len(rc) == RULES_WIDTH, "compiled Rules builder/reader width mismatch"
     pv = instrument.point_value if instrument else 1.0
     from .account import fixed_cost
 
@@ -1075,7 +1078,11 @@ def run(
 
             def step(self, bar: Any) -> LegacyDecision:
                 decision = self.instance.step(bar)
-                return LegacyDecision(*decision) if isinstance(decision, Decision) else decision
+                if isinstance(decision, tuple):
+                    if len(decision) not in (15, 16, len(Decision._fields)):
+                        raise ValueError("Decision ABI requires 15, 16 or 28 fields")
+                    return LegacyDecision(*decision)
+                return decision
 
         def make(config=config):
             return LegacyView(cast(Callable[..., Core], step)(**config))
