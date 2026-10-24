@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import NoReturn
 
 import numpy as np
 
-from .api import Bars, Costs, Instrument, Result, Rules, Sizing
+from .api import Bars, Costs, Instrument, Result, Rules, Signals, Sizing, _simulate
 from .compiled import NAUTILUS, run
 from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, strategy
 from .types import Bar, Decision, Position
@@ -146,6 +147,51 @@ def replay_features(decisions: Sequence[Decision]) -> ReplayFeatures:
     )
 
 
+class _Validated(Exception):
+    """Raised in place of matching once the array path's input checks pass."""
+
+
+def _validate_like_simulate(
+    features: ReplayFeatures,
+    bars: Bars,
+    signal_fields: Sequence[str],
+    *,
+    rules: Rules,
+    instrument: Instrument | None,
+    costs: Costs | None,
+    sizing: Sizing[int] | Sizing[float] | None,
+    initial_cash: float | None,
+) -> None:
+    """Raise the array path's first input refusal before typed matching.
+
+    Typed ``run`` matches first and applies these shared checks per column afterwards,
+    so a column with two refusals would otherwise report the matcher's one.
+    """
+    declared = set(signal_fields)
+    signals = Signals(
+        features.side.astype(np.int8),
+        features.exit,
+        **{name: getattr(features, name) for name in Decision._fields[2:] if name in declared},
+    )
+
+    def matched(*args: object, **kwargs: object) -> NoReturn:
+        raise _Validated
+
+    try:
+        _simulate(
+            bars,
+            signals,
+            rules=rules,
+            instrument=instrument,
+            costs=costs,
+            sizing=sizing,
+            initial_cash=initial_cash,
+            _run_columns=matched,
+        )
+    except _Validated:
+        return
+
+
 def replay_decisions(
     decisions: Sequence[Decision],
     bars: Bars,
@@ -164,11 +210,24 @@ def replay_decisions(
     Preserve the original declaration mask, including explicitly all-NaN fields.
     Replay does not infer masks, transform terminal decisions, or consult Position.
     Empty final state is intentional; source-core state is not reconstructed.
+    Input refusals keep the array path's order (validated before matching).
     """
+    features = replay_features(decisions)
+    if len(decisions) == len(bars):
+        _validate_like_simulate(
+            features,
+            bars,
+            signal_fields,
+            rules=rules,
+            instrument=instrument,
+            costs=costs,
+            sizing=sizing,
+            initial_cash=initial_cash,
+        )
     return run(
         replay_step,
         bars,
-        features=replay_features(decisions),
+        features=features,
         signal_fields=signal_fields,
         rules=rules,
         instrument=instrument,
