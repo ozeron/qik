@@ -229,6 +229,8 @@ class Rules:
     stop_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
     target_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
     stop_entry_in_market: Literal["error", "skip"] = "error"
+    arm_stop: Literal["refuse", "next_bar"] = "refuse"
+    day_order_expiry: Literal["refuse", "cancel"] = "refuse"
 
     def __post_init__(self) -> None:
         if (
@@ -278,6 +280,8 @@ class Rules:
             ("entry_bar_decision", ("legacy", "completed_close")),
             ("stop_update_mode", ("any", "ratchet")),
             ("stop_entry_in_market", ("error", "skip")),
+            ("arm_stop", ("refuse", "next_bar")),
+            ("day_order_expiry", ("refuse", "cancel")),
         ):
             if getattr(self, name) not in choices:
                 raise ValueError(f"{name} must be one of {choices}")
@@ -794,6 +798,9 @@ def _simulate(
         amend_close=rules.amend_timing == "close_submit",
         completed_close=rules.entry_bar_decision == "completed_close",
         stop_skip=rules.stop_entry_in_market == "skip",
+        arm_stop=rules.arm_stop == "next_bar",
+        day_cancel=rules.day_order_expiry == "cancel",
+        expiry_days=_day_order_dates(bars) if rules.day_order_expiry == "cancel" else None,
         exit_next_open=exit_next_open,
         target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,
         tick_round=tuple(TickRound).index(rules.tick_round),
@@ -966,6 +973,16 @@ def _limit_entry_checks(
             f"without one (not even the target), so the engine cannot know what it holds"
         )
     return _new_york_days(bars, "limit entries")
+
+
+def _day_order_dates(bars: Bars) -> np.ndarray:
+    """DAY expiry follows NY civil dates, independently of custom session labels."""
+    if bars.index is None or bars.index.tz is None:
+        raise ValueError("day_order_expiry='cancel' needs timezone-aware Bars.index")
+    dates = pd.Series(bars.index.tz_convert("America/New_York")).dt.date.to_numpy()
+    result = np.zeros(len(bars), bool)
+    result[1:] = dates[1:] != dates[:-1]
+    return result
 
 
 def _new_york_days(bars: Bars, rule: str) -> np.ndarray:

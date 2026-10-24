@@ -99,6 +99,7 @@ def _run(
     cores=None,
     masks=None,
     session_days=None,
+    expiry_days=None,
 ):
     k, n = len(params_grid), len(c)
     # A bar can close existing protection and a new same-bar bracket: at most two trades.
@@ -152,6 +153,9 @@ def _run(
         )
         a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
         slip = rules[9] if rules[8] else 0.0
+        combine = int(rules[22]) if len(rules) > 22 else 0
+        arm_stop = bool(rules[25])
+        day_cancel = bool(rules[26])
         if slots:
             result = K._compiled_slots_column(
                 o,
@@ -209,6 +213,9 @@ def _run(
                 combine=int(rules[22]),
                 amend_close=bool(rules[23]),
                 completed_close=bool(rules[24]),
+                arm_stop=arm_stop,
+                day_cancel=day_cancel,
+                expiry_days=expiry_days,
             )
         else:
             result = K._compiled_column(
@@ -255,7 +262,10 @@ def _run(
                 0,
                 core,
                 levels[10],
-                combine=int(rules[22]),
+                combine,
+                arm_stop,
+                day_cancel,
+                expiry_days,
             )
         # Negative counts carry sizing refusals out of prange without exceptions.
         counts[j] = -int(account[2]) if account[2] else result[0]
@@ -413,6 +423,8 @@ def _run_arrays(
             (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
             rules.amend_timing == "close_submit",
             rules.entry_bar_decision == "completed_close",
+            rules.arm_stop == "next_bar",
+            rules.day_order_expiry == "cancel",
         ],
         float,
     )
@@ -437,6 +449,8 @@ def _run_arrays(
             sizing.min_qty_policy == "clamp" if sizing else False,
         ]
     )
+    from .api import _day_order_dates
+
     runner: Any = _run if _bound_runner is None else _bound_runner
     callback_args = (step,) if _bound_runner is None else ()
     raw = runner(
@@ -458,6 +472,7 @@ def _run_arrays(
         _cores,
         None,
         session_days,
+        _day_order_dates(bars) if rules.day_order_expiry == "cancel" else None,
     )
     if _bound_runner is not None:
         if _final_states is not None:

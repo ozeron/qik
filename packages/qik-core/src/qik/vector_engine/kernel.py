@@ -53,6 +53,8 @@ _SLOT_CLOSE = 6
 _SLOT_PROTECT_FAIL = 7
 _SLOT_AMEND_STOP = 8
 _SLOT_AMEND_TARGET = 9
+_SLOT_ARM_STOP = 10
+_SLOT_ARM_TARGET = 11
 
 
 @nb.njit(cache=True, nogil=True)
@@ -150,6 +152,9 @@ def _venue_column(
     core=None,
     ioc_limits=None,
     combine=0,
+    arm_stop=False,
+    day_cancel=False,
+    expiry_days=None,
 ):
     """A16/A17 venue settlement, with a bounded-by-flight-time FIFO command list.
 
@@ -202,6 +207,9 @@ def _venue_column(
         base,
         ioc_limits,
         combine,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     )
     for i in range(len(c)):
         state, err, eb = _venue_column_advance(state, i, inputs, core)
@@ -258,6 +266,9 @@ def _venue_column_advance(state, i, inputs, core=None):
         base,
         ioc_limits,
         combine,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -290,7 +301,17 @@ def _venue_column_advance(state, i, inputs, core=None):
     )
     exited = False
     busy = pending >= 0
-    if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i]:
+    if (
+        pending >= 0
+        and not np.isnan(entry_limit[pending])
+        and _optional_at(expiry_days, i, new_day[i])
+        and day_cancel
+    ):
+        for q in range(len(commands) - 1, -1, -1):
+            if commands[q][2] == pending:
+                commands.pop(q)
+        pending, resting, chasing, closing, busy = -1, False, False, False, False
+    if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i] and not day_cancel:
         return (
             VenueState(
                 commands,
@@ -807,6 +828,9 @@ def _column(
     core=None,
     ioc_limits=None,
     combine=0,
+    arm_stop=False,
+    day_cancel=False,
+    expiry_days=None,
 ):
     """Simulate one column.
 
@@ -857,7 +881,10 @@ def _column(
             base,
             core,
             ioc_limits,
-            combine=combine,
+            combine,
+            arm_stop,
+            day_cancel,
+            expiry_days,
         )
     n = o.shape[0]
     # Flat position, no working limit or next-open market commands.
@@ -909,6 +936,9 @@ def _column(
         base,
         ioc_limits,
         combine,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     )
     for i in range(n):
         state, err, eb = _column_advance(state, i, inputs, core)
@@ -969,6 +999,9 @@ def _column_advance(state, i, inputs, core=None):
         base,
         ioc_limits,
         combine,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -1000,7 +1033,9 @@ def _column_advance(state, i, inputs, core=None):
     close_mask = _optional_at(force_close, i, 0)
     open_flatten = _optional_at(force_open, i, False)
     exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
-    if pend != 0 and new_day[i]:
+    if pend != 0 and _optional_at(expiry_days, i, new_day[i]) and day_cancel:
+        pend, p_chase = 0, -1
+    if pend != 0 and new_day[i] and not day_cancel:
         # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
         return (
             ColumnState(
@@ -1781,7 +1816,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1889,14 +1924,16 @@ def run_columns(
                 combine=combine,
                 amend_close=amend_close,
                 completed_close=completed_close,
+                arm_stop=arm_stop,
+                day_cancel=day_cancel,
+                expiry_days=expiry_days,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
             adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, True,
-            e0, e0, s0, f0, f0, s0, f0, 0, ioc_limits=ioc_column,
-            combine=combine,
+            e0, e0, s0, f0, f0, s0, f0, 0, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
         )  # fmt: skip
         counts[j] = cnt
         errs[j] = err
@@ -1985,6 +2022,9 @@ def run_columns(
                     combine=combine,
                     amend_close=amend_close,
                     completed_close=completed_close,
+                    arm_stop=arm_stop,
+                    day_cancel=day_cancel,
+                    expiry_days=expiry_days,
                 )
             else:
                 _column(
@@ -1993,8 +2033,7 @@ def run_columns(
                 adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, False,
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
-                stop, offsets[j], ioc_limits=ioc_column,
-                combine=combine,
+                stop, offsets[j], ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
             )  # fmt: skip
     return (
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
@@ -2059,6 +2098,9 @@ def _slots_column(
     combine=0,
     amend_close=False,
     completed_close=False,
+    arm_stop=False,
+    day_cancel=False,
+    expiry_days=None,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
@@ -2122,6 +2164,9 @@ def _slots_column(
         combine,
         amend_close,
         completed_close,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2193,6 +2238,9 @@ def _slots_column_advance(state, i, inputs, core=None):
         combine,
         amend_close,
         completed_close,
+        arm_stop,
+        day_cancel,
+        expiry_days,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2228,7 +2276,18 @@ def _slots_column_advance(state, i, inputs, core=None):
     pinned, pin, prev = 0, np.nan, o[i]
     if (
         pending >= 0
+        and _optional_at(expiry_days, i, days[i])
+        and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
+        and day_cancel
+    ):
+        for q in range(len(queue) - 1, -1, -1):
+            if queue[q][2] == pending:
+                queue.pop(q)
+        pending, resting, chasing, closing, busy = -1, False, False, False, False
+    if (
+        pending >= 0
         and days[i]
+        and not day_cancel
         and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
     ):
         return (
@@ -2563,10 +2622,15 @@ def _slots_column_advance(state, i, inputs, core=None):
                 if not np.isnan(update):
                     update = _round_price(update, round_tick, tick_round, -pos)
                     bound = stop
+                    has_stop = not np.isnan(stop)
                     for _, kind, d, value in queue:
-                        if kind == _SLOT_AMEND_STOP and d == gen and pos * (value - bound) > 0:
-                            bound = value
-                    if np.isnan(stop):
+                        if (kind == _SLOT_AMEND_STOP or kind == _SLOT_ARM_STOP) and d == gen:
+                            has_stop = True
+                            if np.isnan(bound) or pos * (value - bound) > 0:
+                                bound = value
+                    if not has_stop and arm_stop:
+                        queue.append((i + latency, _SLOT_ARM_STOP, gen, update))
+                    elif not has_stop:
                         error = ERR_AMEND_NO_ORDER
                     elif not ratchet or pos * (update - bound) > 0:
                         queue.append(
@@ -2578,7 +2642,16 @@ def _slots_column_advance(state, i, inputs, core=None):
                             )
                         )
                 if not np.isnan(tu[i]):
-                    if np.isnan(target):
+                    if np.isnan(target) and arm_stop and np.isnan(stop) and not np.isnan(update):
+                        queue.append(
+                            (
+                                i + latency,
+                                _SLOT_ARM_TARGET,
+                                gen,
+                                _round_price(tu[i], round_tick, tick_round, pos),
+                            )
+                        )
+                    elif np.isnan(target):
                         error = ERR_AMEND_NO_ORDER
                     else:
                         queue.append(
@@ -2790,6 +2863,21 @@ def _slots_column_advance(state, i, inputs, core=None):
                             reason = REASON_TARGET
                 elif kind == _SLOT_CLOSE or kind == _SLOT_PROTECT_FAIL:
                     reason = REASON_SIGNAL if kind == _SLOT_CLOSE else REASON_PROTECT_FAIL
+                elif kind == _SLOT_ARM_STOP:
+                    if _in_market(pos, value, q, True):
+                        if not protect_flatten:
+                            error = ERR_PROTECT_REJECTED
+                        else:
+                            queue.append((i + latency, _SLOT_PROTECT_FAIL, gen, 0.0))
+                    else:
+                        stop, live = value, True
+                elif kind == _SLOT_ARM_TARGET and not np.isnan(stop):
+                    if mit and _in_market(pos, value, q, False):
+                        error = ERR_MIT_IN_MARKET
+                    else:
+                        target = value
+                        if _in_market(pos, value, q, False):
+                            reason = REASON_TARGET
                 elif kind == _SLOT_AMEND_STOP or kind == _SLOT_AMEND_TARGET:
                     is_stop = kind == _SLOT_AMEND_STOP
                     invalid = _in_market(pos, value, q, is_stop)

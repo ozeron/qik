@@ -31,7 +31,9 @@ def replay(state, params, i, feats, o, h, lo, c, v, view, out):
 def compare(*args, **kwargs):
     class_core = kwargs.pop("_class_core", False)
     batch = _BATCH(*args, **kwargs)
-    sig = inspect.signature(_BATCH.py_func).bind(*args, **kwargs)
+    sig = inspect.signature(_BATCH if nb.config.DISABLE_JIT else _BATCH.py_func).bind(
+        *args, **kwargs
+    )
     sig.apply_defaults()
     d = sig.arguments
     k, n = d["side_sig"].shape
@@ -82,10 +84,13 @@ def compare(*args, **kwargs):
             0,
             0,
             # Numba does not bounds-check: the replay vector must cover every
-            # index _run reads (combine, amend_close, completed_close).
-            0,
-            0,
-            0,
+            # index _run reads (combine, amend_close, completed_close,
+            # arm_stop, day_cancel).
+            d["combine"],
+            d["amend_close"],
+            d["completed_close"],
+            d["arm_stop"],
+            d["day_cancel"],
         ],
         float,
     )
@@ -118,6 +123,7 @@ def compare(*args, **kwargs):
         d["entry_trigger"] is not None,
         cores,
         masks,
+        expiry_days=d["expiry_days"],
     )
     counts, meta, *arrays = raw
     np.testing.assert_array_equal(meta[:, 0], batch[2])
@@ -595,3 +601,44 @@ def test_sequential_cash_is_opt_in_and_default_is_batch_exact():
     )[1:]
     pd.testing.assert_frame_equal(sequential.trades, expected, check_exact=True)
     assert not np.array_equal(default.trades.equity_usd, sequential.trades.equity_usd)
+
+
+@pytest.mark.parametrize("amend_close", [False, True])
+@pytest.mark.parametrize("completed_close", [False, True])
+@pytest.mark.parametrize("day_cancel", [False, True])
+def test_replay_combined_lifecycle_rules(amend_close, completed_close, day_cancel):
+    o = np.array([100.0, 106.0, 102.0, 106.0])
+    h = np.array([107.0, 108.0, 108.0, 109.0])
+    lo = np.array([99.0, 99.0, 101.0, 105.0])
+    c = np.array([106.0, 107.0, 106.0, 108.0])
+    nan = np.full((1, 4), np.nan)
+    compare(
+        o,
+        h,
+        lo,
+        c,
+        np.array([[1, 0, 0, 0]], np.int8),
+        np.zeros((1, 4), bool),
+        nan,
+        nan,
+        nan,
+        nan,
+        nan,
+        np.zeros(4, bool),
+        1,
+        False,
+        True,
+        False,
+        False,
+        next_open=True,
+        entry_trigger=nan,
+        stop_updates=np.array([[np.nan, 103.0, np.nan, np.nan]]),
+        target_updates=nan,
+        be_after=nan,
+        be_offset=nan,
+        amend_close=amend_close,
+        completed_close=completed_close,
+        arm_stop=True,
+        day_cancel=day_cancel,
+        expiry_days=np.array([False, False, True, False]),
+    )

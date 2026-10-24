@@ -256,6 +256,9 @@ def simulate_column_reference(
     combine: int = 0,
     amend_close: bool = False,
     completed_close: bool = False,
+    arm_stop: bool = False,
+    day_cancel: bool = False,
+    expiry_days: np.ndarray | None = None,
 ) -> RefColumn:
     exit_next_open = next_open if exit_next_open is None else exit_next_open
     long_exits = np.zeros(len(c), bool) if exit_long is None else exit_long
@@ -332,6 +335,9 @@ def simulate_column_reference(
             combine=combine,
             amend_close=amend_close,
             completed_close=completed_close,
+            arm_stop=arm_stop,
+            day_cancel=day_cancel,
+            expiry_days=expiry_days,
         )
     if latency_bars or (one_tick and not next_open):
         return _simulate_venue_reference(
@@ -363,6 +369,8 @@ def simulate_column_reference(
             force_open=force_open,
             cross_session=cross_session,
             latency_bars=latency_bars,
+            day_cancel=day_cancel,
+            expiry_days=expiry_days,
             tick=tick if one_tick else 0.0,
             combine=combine,
         )
@@ -397,7 +405,13 @@ def simulate_column_reference(
             short_exits[i],
             pos if pos else (pending.side if pending is not None else 0),
         )
-        if pending is not None and bool(starts_day[i]):
+        if (
+            pending is not None
+            and day_cancel
+            and bool(starts_day[i] if expiry_days is None else expiry_days[i])
+        ):
+            pending = None
+        if pending is not None and bool(starts_day[i]) and not day_cancel:
             # V2 drops a staged chase on a new calendar day and the DAY limit keeps resting; the
             # engine does not model that, so the input is refused (A15).
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
@@ -660,6 +674,8 @@ def _simulate_venue_reference(
     protect_flatten: bool,
     new_day: np.ndarray | None,
     latency_bars: int,
+    day_cancel: bool,
+    expiry_days: np.ndarray | None,
     tick: float,
     combine: int = 0,
 ) -> RefColumn:
@@ -737,7 +753,15 @@ def _simulate_venue_reference(
         exited = False
         busy = pending >= 0
         ci = float(c[i])
-        if pending >= 0 and not math.isnan(limits[pending]) and days[i]:
+        if (
+            pending >= 0
+            and not math.isnan(limits[pending])
+            and day_cancel
+            and bool(days[i] if expiry_days is None else expiry_days[i])
+        ):
+            commands[:] = [cmd for cmd in commands if cmd.entry != pending]
+            pending, resting, chasing, closing, busy = -1, False, False, False, False
+        if pending >= 0 and not math.isnan(limits[pending]) and days[i] and not day_cancel:
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
         if force_open[i]:
             close(float(o[i]) - pos * tick, REASON_SIGNAL)
@@ -971,6 +995,9 @@ def _simulate_slots_reference(
     combine: int = 0,
     amend_close: bool = False,
     completed_close: bool = False,
+    arm_stop: bool,
+    day_cancel: bool,
+    expiry_days: np.ndarray | None,
 ) -> RefColumn:
     nan = np.full(len(c), np.nan)
     limits, sp, tp, triggers, su, tu, ba, bo = [
@@ -1109,7 +1136,16 @@ def _simulate_slots_reference(
         book = _Book()
         if (
             pending >= 0
+            and bool(days[i] if expiry_days is None else expiry_days[i])
+            and (not math.isnan(triggers[pending]) or not math.isnan(limits[pending]))
+            and day_cancel
+        ):
+            queue[:] = [cmd for cmd in queue if cmd[2] != pending]
+            pending, resting, chasing, closing, busy = -1, False, False, False, False
+        if (
+            pending >= 0
             and days[i]
+            and not day_cancel
             and (not math.isnan(triggers[pending]) or not math.isnan(limits[pending]))
         ):
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, 0, last_entry, last_price, last_stop)
@@ -1234,15 +1270,31 @@ def _simulate_slots_reference(
                     if not math.isnan(update):
                         update = _round_level(update, round_tick, tick_round, -p.side)
                         bound = p.stop
+                        has_stop = not math.isnan(p.stop)
                         for _, kind, d, value in queue:
-                            if kind == "stop" and d == p.decision and p.side * (value - bound) > 0:
-                                bound = value
-                        if math.isnan(p.stop):
+                            if kind in ("stop", "arm_stop") and d == p.decision:
+                                has_stop = True
+                                if math.isnan(bound) or p.side * (value - bound) > 0:
+                                    bound = value
+                        if not has_stop and arm_stop:
+                            send("arm_stop", p.decision, update)
+                        elif not has_stop:
                             fail(ERR_AMEND_NO_ORDER)
                         elif not ratchet or p.side * (update - bound) > 0:
                             send("stop", p.decision, update)
                     if not math.isnan(tu[i]):
-                        if math.isnan(p.target):
+                        if (
+                            math.isnan(p.target)
+                            and arm_stop
+                            and math.isnan(p.stop)
+                            and not math.isnan(update)
+                        ):
+                            send(
+                                "arm_target",
+                                p.decision,
+                                _round_level(float(tu[i]), round_tick, tick_round, p.side),
+                            )
+                        elif math.isnan(p.target):
                             fail(ERR_AMEND_NO_ORDER)
                         else:
                             send(
@@ -1357,6 +1409,21 @@ def _simulate_slots_reference(
                             q - p.side * slip,
                             REASON_SIGNAL if kind == "close" else REASON_PROTECT_FAIL,
                         )
+                    elif kind == "arm_stop":
+                        if through(-p.side, value, True, q):
+                            if protect_flatten:
+                                send("close_fail", d)
+                            else:
+                                fail(ERR_PROTECT_REJECTED)
+                        else:
+                            p.stop, p.live = value, True
+                    elif kind == "arm_target" and not math.isnan(p.stop):
+                        if mit and through(-p.side, value, False, q):
+                            fail(ERR_MIT_IN_MARKET)
+                        else:
+                            p.target = value
+                            if through(-p.side, value, False, q):
+                                close(q - p.side * slip, REASON_TARGET)
                     elif kind in ("stop", "target"):
                         is_stop = kind == "stop"
                         invalid = through(-p.side, value, is_stop, q)
