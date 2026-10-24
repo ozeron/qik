@@ -9,6 +9,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ._testing_replay import (  # noqa: F401 -- public testing helpers
+    SIGNAL_FIELDS,
+    ReplayFeatures,
+    ReplayParams,
+    ReplayState,
+    captured_decisions,
+    declared_signal_fields,
+    prefix_bars,
+    replay_decisions,
+    replay_features,
+    replay_step,
+    signal_rows,
+)
 from .api import Bars
 from .core import BarView, Core, Decision
 from .types import Decision as RecordDecision
@@ -246,7 +259,6 @@ def assert_causal(step: Callable[..., Any], bars: Bars, n: int, **kw: Any) -> No
     from collections.abc import Mapping
 
     from .compiled import _record_run
-    from .core import _prefix, _rows
 
     if not 0 < n <= len(bars):
         raise ValueError("n must lie in 1..len(bars)")
@@ -260,7 +272,7 @@ def assert_causal(step: Callable[..., Any], bars: Bars, n: int, **kw: Any) -> No
             raise ValueError("grid axes must be nonempty")
         axes = [{name: [row[name].item()] for name in (params.dtype.names or ())} for row in params]
     captures = []
-    for tape in (bars, _prefix(bars, n)):
+    for tape in (bars, prefix_bars(bars, n)):
         if callable(features):
             values = features(tape)
         elif isinstance(features, Mapping):
@@ -291,5 +303,5 @@ def assert_causal(step: Callable[..., Any], bars: Bars, n: int, **kw: Any) -> No
             signals.extend(captured)
         captures.append(signals)
     for full, prefix in zip(*captures, strict=True):
-        for a, b in zip(_rows(full, n), _rows(prefix, n), strict=True):
+        for a, b in zip(signal_rows(full, n), signal_rows(prefix, n), strict=True):
             np.testing.assert_array_equal(a, b, err_msg="strategy is not prefix-causal")

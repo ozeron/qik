@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 
 from qik.vector_engine import kernel
-from qik.vector_engine.core import SIGNAL_FIELDS
 from qik.vector_engine.schema import (
     BoolArray,
     Features,
@@ -23,6 +22,7 @@ from qik.vector_engine.schema import (
     State,
     strategy,
 )
+from qik.vector_engine.testing import SIGNAL_FIELDS
 from qik.vector_engine.types import (
     HOLD,
     Bar,
