@@ -1046,19 +1046,32 @@ def _simulate_slots_reference(
     def paired(d: int) -> bool:
         return straddle is not None and not np.isnan(straddle[:, d]).all()
 
+    def rests(d: int) -> bool:
+        # Only a DAY stop leg rests across a session; IOC legs attempt once.
+        return (
+            straddle is not None
+            and paired(d)
+            and not (math.isnan(straddle[0, d]) and math.isnan(straddle[6, d]))
+        )
+
     def entry_side(d: int, label: str, price: float) -> int:
         if straddle is None or not paired(d):
             return int(sides[d])
         for offset, direction in ((0, 1), (6, -1)):
-            stop_level, cap = straddle[offset : offset + 2, d]
+            stop_level = straddle[offset, d]
             if not math.isnan(stop_level) and direction * (price - stop_level) >= 0:
                 return direction
-            if (
-                label == "O"
-                and i == d + latency + 1
-                and not math.isnan(cap)
-                and direction * (price - cap) <= 0
-            ):
+        return 0
+
+    def ioc_winner(d: int, price: float) -> int:
+        # One opening price, stable long-then-short priority; a gapped stop leg wins later
+        # in the path, an eligible IOC leg fills now with single-IOC protection timing.
+        assert straddle is not None
+        for offset, direction in ((0, 1), (6, -1)):
+            stop_level, cap = straddle[offset : offset + 2, d]
+            if not math.isnan(stop_level) and direction * (price - stop_level) >= 0:
+                return 0
+            if not math.isnan(cap) and direction * (price - cap) <= 0:
                 return direction
         return 0
 
@@ -1191,7 +1204,7 @@ def _simulate_slots_reference(
             and days[i]
             and not day_cancel
             and (
-                paired(pending)
+                rests(pending)
                 or not math.isnan(triggers[pending])
                 or not math.isnan(limits[pending])
             )
@@ -1203,7 +1216,9 @@ def _simulate_slots_reference(
             queue.clear()
             pending, resting, chasing, closing = -1, False, False, False
         for phase in range(2):
-            if phase == 0 and not (next_open or exit_next_open or entry_limit_ioc is not None):
+            if phase == 0 and not (
+                next_open or exit_next_open or entry_limit_ioc is not None or straddle is not None
+            ):
                 continue
             settlement = float(o[i] if phase == 0 else c[i])
             if phase == 1:
@@ -1240,14 +1255,6 @@ def _simulate_slots_reference(
                             winner = s
                             fill(d, px, price)
                             entered = True
-                        elif (
-                            straddle is not None
-                            and paired(d)
-                            and label == "O"
-                            and math.isnan(straddle[0, d])
-                            and math.isnan(straddle[6, d])
-                        ):
-                            pending, resting = -1, False
                     p = position
                     if p is not None and p.live and not entered:
                         out = -p.side
@@ -1425,6 +1432,7 @@ def _simulate_slots_reference(
                             phase == 1
                             or next_open
                             or exit_next_open
+                            or cmd[1] == "pair_ioc"
                             or (cmd[1] == "submit" and not math.isnan(float(caps[cmd[2]])))
                             or (cmd[1] == "protect" and position is not None and position.bar == i)
                         )
@@ -1448,6 +1456,8 @@ def _simulate_slots_reference(
                             fail(ERR_STOP_ENTRY_IN_MARKET)
                         else:
                             resting = True
+                            if not (math.isnan(straddle[1, d]) and math.isnan(straddle[7, d])):
+                                queue.append((d + latency + 1, "pair_ioc", d, math.nan))
                         continue
                     s = int(sides[d])
                     if not math.isnan(float(caps[d])):
@@ -1475,6 +1485,16 @@ def _simulate_slots_reference(
                             busy = False
                     else:
                         resting = True
+                elif kind == "pair_ioc":
+                    if pending == d and resting and position is None and phase == 0:
+                        assert straddle is not None
+                        winner = ioc_winner(d, settlement)
+                        if winner:
+                            fill(d, settlement + winner * slip, quote(-winner))
+                            if completed_close:
+                                busy = False
+                        elif math.isnan(straddle[0, d]) and math.isnan(straddle[6, d]):
+                            pending, resting = -1, False
                 elif kind == "cancel" and pending == d:
                     pending, resting = -1, False
                     if chasing:

@@ -57,6 +57,7 @@ _SLOT_AMEND_STOP = 8
 _SLOT_AMEND_TARGET = 9
 _SLOT_ARM_STOP = 10
 _SLOT_ARM_TARGET = 11
+_SLOT_PAIR_IOC = 12  # paired IOC attempts at scheduled open
 
 
 @nb.njit(cache=True, nogil=True)
@@ -2300,7 +2301,7 @@ def _slots_column_advance(state, i, inputs, core=None):
         and days[i]
         and not day_cancel
         and (
-            _pair_at(straddle, pending)
+            _pair_rests(straddle, pending)
             or not np.isnan(triggers[pending])
             or not np.isnan(limits[pending])
         )
@@ -2351,7 +2352,9 @@ def _slots_column_advance(state, i, inputs, core=None):
         queue.clear()
         pos, pending, live, resting, chasing, closing = 0, -1, False, False, False, False
     for phase in range(2):
-        if phase == 0 and not (next_open or exit_next_open or ioc_limits is not None):
+        if phase == 0 and not (
+            next_open or exit_next_open or ioc_limits is not None or _has_pairs(straddle)
+        ):
             continue
         ci = o[i] if phase == 0 else c[i]
         if phase == 1:
@@ -2381,16 +2384,9 @@ def _slots_column_advance(state, i, inputs, core=None):
                     if straddle is not None and paired:
                         s = 0
                         for offset, direction in ((0, 1), (6, -1)):
-                            trigger, cap = straddle[offset, d], straddle[offset + 1, d]
-                            if (not np.isnan(trigger) and direction * (pt - trigger) >= 0) or (
-                                m == 0
-                                and i == d + latency + 1
-                                and not np.isnan(cap)
-                                and direction * (pt - cap) <= 0
-                            ):
-                                s = direction
-                                stop_order = not np.isnan(trigger)
-                                level = trigger if stop_order else pt
+                            trigger = straddle[offset, d]
+                            if not np.isnan(trigger) and direction * (pt - trigger) >= 0:
+                                s, stop_order, level = direction, True, trigger
                                 break
                     match = s != 0 and _in_market(
                         -s, level, pt if stop_order else pt + s * slip, stop_order
@@ -2461,14 +2457,6 @@ def _slots_column_advance(state, i, inputs, core=None):
                                     0.0,
                                 )
                             )
-                    elif (
-                        straddle is not None
-                        and paired
-                        and m == 0
-                        and np.isnan(straddle[0, d])
-                        and np.isnan(straddle[6, d])
-                    ):
-                        pending, resting = -1, False
                 if pos and live and not entered:
                     reason, px = 0, 0.0
                     if _in_market(pos, stop, pt, True):
@@ -2809,8 +2797,9 @@ def _slots_column_advance(state, i, inputs, core=None):
             ready = -1
             for q in range(len(queue)):
                 due, cmd_kind, cmd_d, _ = queue[q]
-                ioc_command = cmd_kind == _SLOT_SUBMIT and not np.isnan(
-                    _optional_at(ioc_limits, cmd_d, np.nan)
+                ioc_command = cmd_kind == _SLOT_PAIR_IOC or (
+                    cmd_kind == _SLOT_SUBMIT
+                    and not np.isnan(_optional_at(ioc_limits, cmd_d, np.nan))
                 )
                 if due <= i and (
                     phase == 1
@@ -2847,6 +2836,8 @@ def _slots_column_advance(state, i, inputs, core=None):
                         error = ERR_STOP_ENTRY_IN_MARKET
                     else:
                         resting = True
+                        if not (np.isnan(straddle[1, d]) and np.isnan(straddle[7, d])):
+                            queue.append((d + latency + 1, _SLOT_PAIR_IOC, d, 0.0))
                     continue
                 s = sides[d]
                 cap = _optional_at(ioc_limits, d, np.nan)
@@ -2870,6 +2861,22 @@ def _slots_column_advance(state, i, inputs, core=None):
                 anchor = _anchor(
                     bracket_anchor, c[d], px, limits[d] if not np.isnan(limits[d]) else px
                 )
+            elif kind == _SLOT_PAIR_IOC:
+                # Stable long-then-short priority at one opening price. A stop leg gapped
+                # at this open wins in the path at m == 0; an eligible IOC fills here.
+                s, px, anchor = 0, 0.0, 0.0
+                if pending == d and resting and pos == 0 and phase == 0:
+                    for offset, direction in ((0, 1), (6, -1)):
+                        trigger, cap = straddle[offset, d], straddle[offset + 1, d]
+                        if not np.isnan(trigger) and direction * (ci - trigger) >= 0:
+                            break
+                        if not np.isnan(cap) and direction * (ci - cap) <= 0:
+                            s = direction
+                            break
+                    px = ci + s * slip
+                    anchor = _anchor(bracket_anchor, c[d], px, px)
+                    if s == 0 and np.isnan(straddle[0, d]) and np.isnan(straddle[6, d]):
+                        pending, resting = -1, False
             elif kind == _SLOT_CHASE and pending == d:
                 s = sides[d]
                 px = ci + s * slip
@@ -2882,13 +2889,18 @@ def _slots_column_advance(state, i, inputs, core=None):
                 if completed_close and phase == 0 and np.isnan(limits[d]) and np.isnan(triggers[d]):
                     busy = False
                 pos, ei, ep, gen = s, i, px, d
+                leg_stop, leg_target, leg_sp, leg_tp = stops[d], targets[d], sp[d], tp[d]
+                if _pair_at(straddle, d):
+                    offset = 0 if s > 0 else 6
+                    leg_stop, leg_target = straddle[offset + 2, d], straddle[offset + 3, d]
+                    leg_sp, leg_tp = straddle[offset + 4, d], straddle[offset + 5, d]
                 stop, target = levels(
                     s,
                     anchor,
-                    stops[d],
-                    targets[d],
-                    sp[d],
-                    tp[d],
+                    leg_stop,
+                    leg_target,
+                    leg_sp,
+                    leg_tp,
                     round_tick,
                     tick_round,
                     combine=combine,
@@ -3196,6 +3208,17 @@ def _straddle_column(pair, j):
 @nb.njit(cache=True)
 def _pair_at(pair, i):
     return pair is not None and i >= 0 and pair.shape[1] > i and not np.isnan(pair[:, i]).all()
+
+
+@nb.njit(cache=True)
+def _has_pairs(pair):
+    return pair is not None and pair.shape[1] > 0
+
+
+@nb.njit(cache=True)
+def _pair_rests(pair, i):
+    """A DAY stop leg rests; an IOC-only pair attempts once and never crosses a session."""
+    return _pair_at(pair, i) and not (np.isnan(pair[0, i]) and np.isnan(pair[6, i]))
 
 
 @nb.njit(cache=True)
