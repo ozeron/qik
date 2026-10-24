@@ -44,6 +44,7 @@ from .api import (
     TargetGap,
     TickRound,
     _new_york_days,
+    _raise_kernel_error,
     _simulate,
 )
 from .api import (
@@ -390,7 +391,13 @@ def _run_arrays(
             rules.stop_update_mode == "ratchet",
             rules.stop_entry_in_market == "skip",
             tuple(Flatten).index(rules.flatten),
-            tuple(SessionBoundary).index(rules.session_boundary),
+            # CoreContext's stable ABI is REFUSE=0, LAST_BAR_CLOSE=1,
+            # NEXT_OBSERVED=2, unlike the public enum's declaration order.
+            {
+                SessionBoundary.REFUSE: 0,
+                SessionBoundary.LAST_BAR_CLOSE: 1,
+                SessionBoundary.NEXT_OBSERVED: 2,
+            }[rules.session_boundary],
         ],
         float,
     )
@@ -445,6 +452,13 @@ def _run_arrays(
     sides, exits, levels, booleans, decisions = tail[7:]
     results = []
     for j, cnt in enumerate(counts):
+        # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
+        # refusal first, retaining complete terminal captures for causality checks.
+        if meta[j, 0] and (_capture_signals is None or np.isnan(decisions[j, 0]).any()):
+            bar = int(meta[j, 1])
+            next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
+            price = float(bars.open[bar] if next_open else bars.close[bar])
+            _raise_kernel_error(int(meta[j, 0]), bar, j, price, next_open=next_open)
         # Validation and accounting use the existing API; the matcher is not run again.
         sig = Signals(
             decisions[j, 0].astype(np.int8),
