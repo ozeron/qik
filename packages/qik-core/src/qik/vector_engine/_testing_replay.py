@@ -13,6 +13,9 @@ from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, st
 from .types import Bar, Decision, Position
 
 SIGNAL_FIELDS = ("entry_side", *Decision._fields[1:])
+_BOOL_FIELDS = tuple(
+    i for i, name in enumerate(Decision._fields) if isinstance(Decision._field_defaults[name], bool)
+)
 
 
 class ReplayState(State):
@@ -54,6 +57,9 @@ class ReplayFeatures(Features):
     target_short: FloatArray
     stop_points_short: FloatArray
     target_points_short: FloatArray
+    entry_from_open: BoolArray
+    stop_fraction: FloatArray
+    target_fraction: FloatArray
 
 
 @strategy(state=ReplayState, params=ReplayParams, features=ReplayFeatures)
@@ -90,31 +96,45 @@ def replay_step(
         features.target_short[bar.i],
         features.stop_points_short[bar.i],
         features.target_points_short[bar.i],
+        features.entry_from_open[bar.i],
+        features.stop_fraction[bar.i],
+        features.target_fraction[bar.i],
     )
 
 
-def replay_features(decisions: Sequence[Decision]) -> ReplayFeatures:
+LEGACY_WIDTHS = (15, 16, 28, len(Decision._fields))
+
+
+def replay_features(
+    decisions: Sequence[Decision] | Sequence[tuple[float | bool, ...]],
+) -> ReplayFeatures:
     """Copy a column into arrays backed by immutable bytes (including NaN payloads).
 
+    Rows are numeric Decisions or recorded tuples of a historical width (15, 16, 28
+    or 31 fields); shorter rows take the Decision defaults for the trailing fields.
     No field discovery from finite values: declaration masks belong to the caller
     and are passed explicitly as ``signal_fields`` to ``replay_decisions``.
     """
-    if not all(isinstance(row, Decision) for row in decisions):
-        raise TypeError("replay requires 28-field numeric Decisions")
-    if any(row.side not in (-1, 0, 1) for row in decisions):
+    if not all(isinstance(row, tuple) and len(row) in LEGACY_WIDTHS for row in decisions):
+        raise TypeError("replay requires numeric Decisions of 15, 16, 28 or 31 fields")
+    rows = [
+        row if isinstance(row, Decision) else Decision._make((*row, *Decision()[len(row) :]))
+        for row in decisions
+    ]
+    if any(row.side not in (-1, 0, 1) for row in rows):
         raise ValueError("replay side must be -1, 0 or +1")
 
     def floats(name: str) -> FloatArray:
-        values = np.asarray([getattr(row, name) for row in decisions], dtype=np.float64)
+        values = np.asarray([getattr(row, name) for row in rows], dtype=np.float64)
         if np.isinf(values).any():
             raise ValueError("levels must be finite or NaN")
         return np.frombuffer(values.tobytes(), dtype=np.float64)
 
     def flags(name: str) -> BoolArray:
-        values = np.asarray([getattr(row, name) for row in decisions], dtype=np.bool_)
+        values = np.asarray([getattr(row, name) for row in rows], dtype=np.bool_)
         return np.frombuffer(values.tobytes(), dtype=np.bool_)
 
-    side = np.asarray([row.side for row in decisions], dtype=np.int64)
+    side = np.asarray([row.side for row in rows], dtype=np.int64)
     return ReplayFeatures(
         side=np.frombuffer(side.tobytes(), dtype=np.int64),
         exit=flags("exit"),
@@ -144,6 +164,9 @@ def replay_features(decisions: Sequence[Decision]) -> ReplayFeatures:
         target_short=floats("target_short"),
         stop_points_short=floats("stop_points_short"),
         target_points_short=floats("target_points_short"),
+        entry_from_open=flags("entry_from_open"),
+        stop_fraction=floats("stop_fraction"),
+        target_fraction=floats("target_fraction"),
     )
 
 
@@ -193,7 +216,7 @@ def _validate_like_simulate(
 
 
 def replay_decisions(
-    decisions: Sequence[Decision],
+    decisions: Sequence[Decision] | Sequence[tuple[float | bool, ...]],
     bars: Bars,
     *,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
@@ -282,7 +305,7 @@ def captured_decisions(capture: object) -> tuple[Decision, ...]:
         if values[0] not in (-1, 0, 1):
             raise ValueError("capture side must be -1, 0 or +1")
         values[0] = int(values[0])
-        for i in (1, 12, 13, 14):
+        for i in _BOOL_FIELDS:
             values[i] = False if np.isnan(values[i]) else bool(values[i])
         decisions.append(Decision(*values))
     return tuple(decisions)
