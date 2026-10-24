@@ -813,7 +813,8 @@ def _column(
     Returns ``(n_trades, err, err_bar, final_side, final_entry_i, final_entry_px, final_stop)``.
     """
 
-    if latency_bars or one_tick:
+    # R13: ONE_TICK with next-open entries stays on this scheduler, adding the tick per fill.
+    if latency_bars or (one_tick and not next_open):
         venue_slip = tick if one_tick else 0.0
         venue = _venue_driver(core)
         return venue(
@@ -988,6 +989,7 @@ def _column_advance(state, i, inputs, core=None):
         market_exit,
     ) = state
     n = len(o)
+    slip = tick if one_tick else 0.0  # R13: one adverse tick on each market and stop fill
     exited = False
     busy = False  # a working entry resolved on this bar: the sleeve could not act (A15)
     stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
@@ -1030,7 +1032,7 @@ def _column_advance(state, i, inputs, core=None):
                 i,
                 pos,
                 entry_px,
-                o[i],
+                o[i] - pos * slip,
                 REASON_SIGNAL,
                 stop,
                 out_entry_i,
@@ -1050,7 +1052,7 @@ def _column_advance(state, i, inputs, core=None):
             out_exit_i[k] = i
             out_side[k] = pos
             out_entry_px[k] = entry_px
-            out_exit_px[k] = o[i]
+            out_exit_px[k] = o[i] - pos * slip
             out_reason[k] = REASON_SIGNAL
             out_stop[k] = stop
         cnt += 1
@@ -1064,9 +1066,10 @@ def _column_advance(state, i, inputs, core=None):
     if market_entry >= 0:
         d = market_entry
         s = side_sig[d]
+        fill = o[i] + s * slip
         st, tg = levels(
             s,
-            _anchor(bracket_anchor, c[d], o[i], o[i]),
+            _anchor(bracket_anchor, c[d], fill, fill),
             entry_stop[d],
             entry_target[d],
             stop_pts[d],
@@ -1074,7 +1077,7 @@ def _column_advance(state, i, inputs, core=None):
             round_tick,
             tick_round,
             combine=combine,
-            fill=o[i],
+            fill=fill,
         )
         # Newly placed protection is validated at the actual entry open. A4's resting-stop
         # gap rule cannot be applied retroactively across this entry fill (R1).
@@ -1124,7 +1127,7 @@ def _column_advance(state, i, inputs, core=None):
             )
         pos = s
         entry_i = i
-        entry_px = o[i]
+        entry_px = fill
         stop = st
         target = tg
         market_entry = -1
@@ -1264,12 +1267,12 @@ def _column_advance(state, i, inputs, core=None):
         # fills at its own price (Nautilus quirk A5).
         if pos > 0:
             if not np.isnan(stop) and o[i] <= stop:
-                reason, px = REASON_STOP_GAP, o[i]
+                reason, px = REASON_STOP_GAP, o[i] - slip
             elif not adverse_hit and not np.isnan(target) and o[i] >= target:
                 reason, px = REASON_TARGET, (o[i] if target_gap else target)
         else:
             if not np.isnan(stop) and o[i] >= stop:
-                reason, px = REASON_STOP_GAP, o[i]
+                reason, px = REASON_STOP_GAP, o[i] + slip
             elif not adverse_hit and not np.isnan(target) and o[i] <= target:
                 reason, px = REASON_TARGET, (o[i] if target_gap else target)
         if reason == 0:
@@ -1284,11 +1287,11 @@ def _column_advance(state, i, inputs, core=None):
                             reason, px = REASON_TARGET, target
                     else:
                         if not np.isnan(stop) and h[i] >= stop:
-                            reason, px = REASON_STOP, stop
+                            reason, px = REASON_STOP, stop + slip
                 else:
                     if pos > 0:
                         if not np.isnan(stop) and lo[i] <= stop:
-                            reason, px = REASON_STOP, stop
+                            reason, px = REASON_STOP, stop - slip
                     else:
                         if not adverse_hit and not np.isnan(target) and lo[i] <= target:
                             reason, px = REASON_TARGET, target
@@ -1393,7 +1396,7 @@ def _column_advance(state, i, inputs, core=None):
                 i,
                 pos,
                 entry_px,
-                ci,
+                ci - pos * slip,
                 REASON_SIGNAL,
                 stop,
                 out_entry_i,
@@ -1481,7 +1484,7 @@ def _column_advance(state, i, inputs, core=None):
             i,
             pos,
             entry_px,
-            ci,
+            ci - pos * slip,
             REASON_SIGNAL,
             stop,
             out_entry_i,

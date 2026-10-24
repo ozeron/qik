@@ -64,6 +64,12 @@ REASON_NAMES = {
 }
 
 
+ONE_TICK_SLOTS = (
+    "ONE_TICK with next-open entries does not support order slots "
+    "(entry_stop, amendments, breakeven, MIT or OTO): unproved"
+)
+
+
 class Profile(StrEnum):
     NAUTILUS = "nautilus"
     TRADINGVIEW = "tradingview"
@@ -176,7 +182,9 @@ class Rules:
     NEXT_OPEN is available under Profile.TRADINGVIEW or Profile.REPRO for author reproduction;
     it requires timezone-aware Bars.index and excludes limit-then-market entries.
     ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
-    changes venue liquidity and needs Instrument.tick. Neither combines with NEXT_OPEN.
+    changes venue liquidity and needs Instrument.tick. Latency never combines with NEXT_OPEN;
+    ONE_TICK does only with next-open entries (R13): each market, stop and flatten fill moves
+    one tick against the position and protection measures from that slipped entry.
 
     ``stop_combine="tighter"`` permits a level plus points on the same entry: long
     max(level, fill - points), short min(level, fill + points). ``target_combine``
@@ -279,7 +287,13 @@ class Rules:
             raise ValueError("close_submit requires latency_bars=0")
         if not isinstance(self.fill_model, FillModel):
             raise ValueError("fill_model must be a FillModel enum")
-        if next_open and (self.latency_bars or self.fill_model is not FillModel.DEFAULT):
+        if next_open and (
+            self.latency_bars
+            or (
+                self.fill_model is not FillModel.DEFAULT
+                and self.effective_entry_fill is not FillTiming.NEXT_OPEN
+            )
+        ):
             raise ValueError("NEXT_OPEN cannot mix with latency_bars or a venue fill_model")
         if not isinstance(self.profile, Profile):
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
@@ -605,6 +619,12 @@ def _simulate(
         raise ValueError("entry_limit_ioc does not support OTO protection; use callback")
     if ioc_used and rules.fill_model is FillModel.ONE_TICK:
         raise ValueError("entry_limit_ioc ONE_TICK execution is unproved")
+    if next_open and rules.fill_model is FillModel.ONE_TICK:
+        # R13 admits market entries, market/flatten exits and stops; the rest is unproved.
+        if slots:
+            raise ValueError(ONE_TICK_SLOTS)
+        if np.any(entries & (np.isfinite(target) | np.isfinite(target_pts))):
+            raise ValueError("ONE_TICK with next-open entries does not support targets: unproved")
     if instrument is not None:
         _check_tick(ioc, entries, instrument.tick, "entry_limit_ioc")
     for a, name in zip(slot_arrays[:4], slot_names[:4], strict=True):

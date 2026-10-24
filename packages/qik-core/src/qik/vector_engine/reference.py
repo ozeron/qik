@@ -278,11 +278,14 @@ def simulate_column_reference(
                     for i, v in enumerate(stop_entry)
                 ]
             )
-    if (
+    slots = (
         oto
         or mit
         or any(a is not None for a in (stop_entry, stop_update, target_update, be_after, be_offset))
-    ):
+    )
+    if one_tick and next_open and (slots or latency_bars):
+        raise ValueError("R13 covers the next-open scalar path only")
+    if slots:
         return _simulate_slots_reference(
             o,
             h,
@@ -330,7 +333,7 @@ def simulate_column_reference(
             amend_close=amend_close,
             completed_close=completed_close,
         )
-    if latency_bars or one_tick:
+    if latency_bars or (one_tick and not next_open):
         return _simulate_venue_reference(
             o,
             h,
@@ -364,6 +367,9 @@ def simulate_column_reference(
             combine=combine,
         )
     n = len(o)
+    # R13: with next-open entries ONE_TICK moves every market and stop fill one tick against
+    # the position; protection measures from that slipped entry. Targets are refused upstream.
+    slip = tick if one_tick else 0.0
     starts_day = np.zeros(n, bool) if new_day is None else new_day
     nan = np.full(n, np.nan)
     lim_sig = nan if entry_limit is None else entry_limit
@@ -397,10 +403,12 @@ def simulate_column_reference(
             return RefColumn(trades, ERR_PENDING_NEW_DAY, i, pos, entry_i)
         if force_open[i]:
             if pos:
-                trades.append(RefTrade(entry_i, i, pos, entry_px, float(o[i]), REASON_SIGNAL, stop))
+                out = float(o[i]) - pos * slip
+                trades.append(RefTrade(entry_i, i, pos, entry_px, out, REASON_SIGNAL, stop))
             pos, pending, market_entry, market_exit, exited = 0, None, None, False, True
         if market_exit:
-            trades.append(RefTrade(entry_i, i, pos, entry_px, float(o[i]), REASON_SIGNAL, stop))
+            out = float(o[i]) - pos * slip
+            trades.append(RefTrade(entry_i, i, pos, entry_px, out, REASON_SIGNAL, stop))
             pos = 0
             exited = True
             market_exit = False
@@ -409,7 +417,7 @@ def simulate_column_reference(
                 market_entry = None
         if market_entry is not None:
             m = market_entry
-            px = float(o[i])
+            px = float(o[i]) + m.side * slip
             st, tg = _levels(
                 m.side,
                 _anchor(bracket_anchor, m.decision_close, px, px),
@@ -422,10 +430,12 @@ def simulate_column_reference(
                 combine=combine,
                 fill=px,
             )
-            # R1's newly placed protection cannot retroactively gap-fill across the entry open.
-            if not math.isnan(st) and (st >= px if m.side > 0 else st <= px):
+            # R1's newly placed protection cannot retroactively gap-fill across the entry open,
+            # which is the market the levels meet, slipped fill or not.
+            market = float(o[i])
+            if not math.isnan(st) and (st >= market if m.side > 0 else st <= market):
                 return RefColumn(trades, ERR_STOP_IN_MARKET, i, pos, entry_i)
-            if not math.isnan(tg) and (tg <= px if m.side > 0 else tg >= px):
+            if not math.isnan(tg) and (tg <= market if m.side > 0 else tg >= market):
                 return RefColumn(trades, ERR_TARGET_IN_MARKET, i, pos, entry_i)
             pos, entry_i, entry_px, stop, target = m.side, i, px, st, tg
             market_entry = None
@@ -485,7 +495,7 @@ def simulate_column_reference(
                 if not math.isnan(stop):
                     px = _stop_fill(pos, stop, label, price)
                     if px is not None:
-                        fill = (REASON_STOP_GAP if label == "O" else REASON_STOP, px)
+                        fill = (REASON_STOP_GAP if label == "O" else REASON_STOP, px - pos * slip)
                         continue
                 if not adverse_hit and not math.isnan(target):
                     px = _limit_fill(pos, target, price)
@@ -503,7 +513,8 @@ def simulate_column_reference(
             continue
         if _force_for(int(force_close[i]), pos if pos else (pending.side if pending else 0)):
             if pos:
-                trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
+                out = close - pos * slip
+                trades.append(RefTrade(entry_i, i, pos, entry_px, out, REASON_SIGNAL, stop))
             pos, pending, market_entry, market_exit = 0, None, None, False
             continue
         if force_open[i]:
@@ -519,7 +530,8 @@ def simulate_column_reference(
             return RefColumn(trades, ERR_NEXT_OPEN_SESSION_END, i, pos, entry_i)
         if exit_now and not exit_next_open:
             if pos != 0:
-                trades.append(RefTrade(entry_i, i, pos, entry_px, close, REASON_SIGNAL, stop))
+                out = close - pos * slip
+                trades.append(RefTrade(entry_i, i, pos, entry_px, out, REASON_SIGNAL, stop))
                 pos = 0
                 exited = True
             pending = None

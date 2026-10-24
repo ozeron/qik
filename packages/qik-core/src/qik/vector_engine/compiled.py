@@ -28,6 +28,7 @@ from numba.typed import List
 
 from . import kernel as K
 from .api import (
+    ONE_TICK_SLOTS,
     SIGNAL_FIELDS,
     Bars,
     BracketAnchor,
@@ -340,6 +341,12 @@ def _run_arrays(
             }
         )
     )
+    if (
+        slots
+        and rules.fill_model is FillModel.ONE_TICK
+        and rules.effective_entry_fill is FillTiming.NEXT_OPEN
+    ):
+        raise ValueError(ONE_TICK_SLOTS)
     dates_needed = (
         bool(fields & {"entry_limit", "entry_stop", "entry_limit_ioc"})
         or ("flatten" in fields and rules.flatten is Flatten.NEXT_OPEN)

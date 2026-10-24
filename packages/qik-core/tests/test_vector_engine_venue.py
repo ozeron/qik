@@ -10,6 +10,7 @@ from qik.vector_engine import (
     Compliance,
     Costs,
     FillModel,
+    FillTiming,
     Instrument,
     MarketFill,
     Profile,
@@ -27,7 +28,7 @@ def test_venue_rules_are_typed_and_exclude_next_open() -> None:
         Rules(fill_model="one_tick")
     for kwargs in (
         {"latency_bars": 1},
-        {"fill_model": FillModel.ONE_TICK},
+        {"fill_model": FillModel.ONE_TICK, "entry_fill": FillTiming.CLOSE},  # R13: entries only
         {"latency_bars": 1, "fill_model": FillModel.ONE_TICK},
     ):
         with pytest.raises(ValueError, match="NEXT_OPEN cannot mix"):
