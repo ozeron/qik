@@ -206,6 +206,8 @@ def _run(
                 core,
                 levels[10],
                 combine=int(rules[22]),
+                amend_close=bool(rules[23]),
+                completed_close=bool(rules[24]),
             )
         else:
             result = K._compiled_column(
@@ -402,6 +404,8 @@ def _run_arrays(
                 SessionBoundary.NEXT_OBSERVED: 2,
             }[rules.session_boundary],
             (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
+            rules.amend_timing == "close_submit",
+            rules.entry_bar_decision == "completed_close",
         ],
         float,
     )

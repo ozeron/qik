@@ -254,6 +254,8 @@ def simulate_column_reference(
     ratchet: bool = False,
     stop_skip: bool = False,
     combine: int = 0,
+    amend_close: bool = False,
+    completed_close: bool = False,
 ) -> RefColumn:
     exit_next_open = next_open if exit_next_open is None else exit_next_open
     long_exits = np.zeros(len(c), bool) if exit_long is None else exit_long
@@ -325,6 +327,8 @@ def simulate_column_reference(
             protect_flatten=protect_flatten,
             stale_drop=stale_drop,
             combine=combine,
+            amend_close=amend_close,
+            completed_close=completed_close,
         )
     if latency_bars or one_tick:
         return _simulate_venue_reference(
@@ -953,6 +957,8 @@ def _simulate_slots_reference(
     protect_flatten: bool,
     stale_drop: bool,
     combine: int = 0,
+    amend_close: bool = False,
+    completed_close: bool = False,
 ) -> RefColumn:
     nan = np.full(len(c), np.nan)
     limits, sp, tp, triggers, su, tu, ba, bo = [
@@ -989,6 +995,8 @@ def _simulate_slots_reference(
                 delay += int(exit_next_open)
             elif kind == "cancel":
                 delay += int(exit_next_open if exit_now else next_open)
+            elif kind in ("stop", "target") and amend_close:
+                pass  # Submit at this completed close; no following-open price participates.
             elif kind in ("submit", "replace", "stop", "target"):
                 delay += (
                     1 if kind == "submit" and not math.isnan(float(caps[d])) else int(next_open)
@@ -1298,6 +1306,8 @@ def _simulate_slots_reference(
                     if not math.isnan(float(caps[d])):
                         if s * (settlement - float(caps[d])) <= 0:
                             fill(d, settlement, quote(-s))
+                            if completed_close and phase == 0:
+                                busy = False
                         else:
                             pending, resting, chasing, closing = -1, False, False, False
                     elif not math.isnan(triggers[d]):
@@ -1314,6 +1324,8 @@ def _simulate_slots_reference(
                         s, float(limits[d]), False, settlement + s * slip
                     ):
                         fill(d, settlement + s * slip, quote(-s))
+                        if completed_close and phase == 0 and math.isnan(limits[d]):
+                            busy = False
                     else:
                         resting = True
                 elif kind == "cancel" and pending == d:

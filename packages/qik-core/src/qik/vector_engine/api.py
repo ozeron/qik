@@ -184,6 +184,13 @@ class Rules:
     always use the actual fill, regardless of bracket_anchor; selection precedes
     tick rounding. Missing legs retain their existing anchor semantics. Marketable
     levels retain the existing rejection/fill policy. Both default to ``"refuse"``.
+
+    ``amend_timing="close_submit"`` validates and settles stop/target amendments
+    at the completed decision close, independently of the entry fill clock. It
+    requires zero command latency. The default retains next-open slot timing.
+    ``entry_bar_decision="completed_close"`` lets a next-open market entry that
+    closes intrabar schedule a fresh entry at this close for the following open.
+    ``reenter_on_exit_bar`` still gates that entry; resting-entry callbacks keep A15.
     """
 
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
@@ -208,6 +215,8 @@ class Rules:
     protection: Literal["callback", "oto"] = "callback"
     target_order: Literal["limit", "mit"] = "limit"
     amend_rejected: Literal["error", "keep"] = "error"
+    amend_timing: Literal["next_open", "close_submit"] = field(default="next_open", kw_only=True)
+    entry_bar_decision: Literal["legacy", "completed_close"] = field(default="legacy", kw_only=True)
     stop_update_mode: Literal["any", "ratchet"] = "any"
     stop_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
     target_combine: Literal["refuse", "tighter"] = field(default="refuse", kw_only=True)
@@ -257,6 +266,8 @@ class Rules:
             ("protection", ("callback", "oto")),
             ("target_order", ("limit", "mit")),
             ("amend_rejected", ("error", "keep")),
+            ("amend_timing", ("next_open", "close_submit")),
+            ("entry_bar_decision", ("legacy", "completed_close")),
             ("stop_update_mode", ("any", "ratchet")),
             ("stop_entry_in_market", ("error", "skip")),
         ):
@@ -264,6 +275,8 @@ class Rules:
                 raise ValueError(f"{name} must be one of {choices}")
         if not is_int(self.latency_bars) or self.latency_bars not in (0, 1):
             raise ValueError("latency_bars must be the integer 0 or 1")
+        if self.amend_timing == "close_submit" and self.latency_bars:
+            raise ValueError("close_submit requires latency_bars=0")
         if not isinstance(self.fill_model, FillModel):
             raise ValueError("fill_model must be a FillModel enum")
         if next_open and (self.latency_bars or self.fill_model is not FillModel.DEFAULT):
@@ -749,6 +762,8 @@ def _simulate(
         be_after=slot_data[3], be_offset=slot_data[4],
         mit=rules.target_order == "mit", oto=rules.protection == "oto",
         amend_keep=rules.amend_rejected == "keep", ratchet=rules.stop_update_mode == "ratchet",
+        amend_close=rules.amend_timing == "close_submit",
+        completed_close=rules.entry_bar_decision == "completed_close",
         stop_skip=rules.stop_entry_in_market == "skip",
         exit_next_open=exit_next_open,
         target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,

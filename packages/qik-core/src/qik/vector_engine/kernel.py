@@ -1778,7 +1778,7 @@ def run_columns(
     be_offset: np.ndarray | None = None,
     mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
     exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0,
+    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False,
 ):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
@@ -1884,6 +1884,8 @@ def run_columns(
                 0,
                 ioc_limits=ioc_column,
                 combine=combine,
+                amend_close=amend_close,
+                completed_close=completed_close,
             )
         else:
             cnt, err, eb, fs, fe, fpx, fst = _column(
@@ -1978,6 +1980,8 @@ def run_columns(
                     offsets[j],
                     ioc_limits=ioc_column,
                     combine=combine,
+                    amend_close=amend_close,
+                    completed_close=completed_close,
                 )
             else:
                 _column(
@@ -2050,6 +2054,8 @@ def _slots_column(
     core=None,
     ioc_limits=None,
     combine=0,
+    amend_close=False,
+    completed_close=False,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     queue = [(0, 0, 0, 0.0)]
@@ -2111,6 +2117,8 @@ def _slots_column(
         base,
         ioc_limits,
         combine,
+        amend_close,
+        completed_close,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2180,6 +2188,8 @@ def _slots_column_advance(state, i, inputs, core=None):
         base,
         ioc_limits,
         combine,
+        amend_close,
+        completed_close,
     ) = inputs
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
@@ -2556,14 +2566,21 @@ def _slots_column_advance(state, i, inputs, core=None):
                     if np.isnan(stop):
                         error = ERR_AMEND_NO_ORDER
                     elif not ratchet or pos * (update - bound) > 0:
-                        queue.append((i + latency + next_open, _SLOT_AMEND_STOP, gen, update))
+                        queue.append(
+                            (
+                                i + latency + (next_open and not amend_close),
+                                _SLOT_AMEND_STOP,
+                                gen,
+                                update,
+                            )
+                        )
                 if not np.isnan(tu[i]):
                     if np.isnan(target):
                         error = ERR_AMEND_NO_ORDER
                     else:
                         queue.append(
                             (
-                                i + latency + next_open,
+                                i + latency + (next_open and not amend_close),
                                 _SLOT_AMEND_TARGET,
                                 gen,
                                 _round_price(tu[i], round_tick, tick_round, pos),
@@ -2691,6 +2708,10 @@ def _slots_column_advance(state, i, inputs, core=None):
             else:
                 s, px, anchor = 0, 0.0, 0.0
             if s:
+                # A market entry at this open is settled before the completed-close
+                # decision. Resting limit/stop callbacks keep their A15 busy contract.
+                if completed_close and phase == 0 and np.isnan(limits[d]) and np.isnan(triggers[d]):
+                    busy = False
                 pos, ei, ep, gen = s, i, px, d
                 stop, target = levels(
                     s,
