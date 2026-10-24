@@ -1365,6 +1365,7 @@ def quantity_reference(
     risk_per_contract: float,
     lot_step: float = 1.0,
     min_qty: float = 1.0,
+    clamp_min_qty: bool = False,
 ) -> float:
     """Reference quantity, including the established negative refusal codes."""
     if mode == 0:
@@ -1381,6 +1382,8 @@ def quantity_reference(
     quantity = rounded * lot_step
     if cap > 0:
         quantity = min(quantity, cap)
+    if clamp_min_qty and quantity < min_qty:
+        quantity = min_qty
     return -1.0 if quantity < min_qty - 1e-10 else quantity
 
 

@@ -27,6 +27,7 @@ def quantity(
     risk_per_contract: float,
     lot_step: float = 1.0,
     min_qty: float = 1.0,
+    clamp_min_qty: bool = False,
 ) -> float:
     """Contracts for one entry, or a negative error code."""
 
@@ -40,6 +41,8 @@ def quantity(
     n = np.floor(budget / risk_per_contract / lot_step + 1e-9) * lot_step
     if cap > 0 and n > cap:
         n = cap
+    if clamp_min_qty:
+        n = max(min_qty, n)
     if n < min_qty - 1e-10:
         return float(-ERR_ZERO)
     return n

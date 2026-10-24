@@ -122,7 +122,7 @@ def _run(
         view = np.full(12, np.nan)
         view[K.V_LAST_EXIT_I] = -1
         decision = np.empty(16)
-        account = np.array([0.0, initial_cash])
+        account = np.array([0.0, initial_cash, 0.0])
         core = K.CoreContext(
             step,
             _initial_core_state(init_state, cores, j),
@@ -254,7 +254,8 @@ def _run(
                 levels[10],
                 combine=int(rules[22]),
             )
-        counts[j] = result[0]
+        # Negative counts carry sizing refusals out of prange without exceptions.
+        counts[j] = -int(account[2]) if account[2] else result[0]
         meta[j, 0] = result[1]
         meta[j, 1] = result[2]
         meta[j, 2] = result[3]
@@ -422,6 +423,7 @@ def _run_arrays(
             sizing.cap if sizing else 0.0,
             sizing.lot_step if sizing else 1.0,
             sizing.min_qty if sizing else 1.0,
+            sizing.min_qty_policy == "clamp" if sizing else False,
         ]
     )
     runner: Any = _run if _bound_runner is None else _bound_runner
@@ -462,6 +464,9 @@ def _run_arrays(
             next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
             price = float(bars.open[bar] if next_open else bars.close[bar])
             _raise_kernel_error(int(meta[j, 0]), bar, j, price, next_open=next_open)
+        if cnt < 0:
+            phase = "entry" if cnt == -1 else "open"
+            raise ValueError(f"compiled core: {phase} sizing refused")
         # Validation and accounting use the existing API; the matcher is not run again.
         sig = Signals(
             decisions[j, 0].astype(np.int8),
@@ -543,6 +548,30 @@ class Position(NamedTuple):
     equity: float
 
 
+def _decision_ioc(decision: Any) -> float:
+    """Read the optional IOC field from either numeric decision ABI."""
+    return decision[15] if len(decision) > 15 else np.nan
+
+
+@overload(_decision_ioc)
+def _decision_ioc_type(decision: Any) -> Callable[[Any], float] | None:
+    if not isinstance(decision, nb.types.BaseTuple):
+        return None
+    # Numba type-checks both arms of a conditional index before folding len().
+    # Select an implementation before indexing a legacy 15-field tuple.
+    if len(decision) > 15:
+
+        def with_ioc(decision: Any) -> float:
+            return decision[15]
+
+        return with_ioc
+
+    def without_ioc(decision: Any) -> float:
+        return np.nan
+
+    return without_ioc
+
+
 @nb.njit(cache=False)
 def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     bar = CompiledBar(i, int(feats[i, 0]), o, h, lo, c, v)
@@ -576,7 +605,7 @@ def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
     out[12] = decision[12]
     out[13] = decision[13]
     out[14] = decision[14]
-    out[15] = decision[15] if len(decision) > 15 else np.nan
+    out[15] = _decision_ioc(decision)
 
 
 def _run_jitclass(

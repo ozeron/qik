@@ -840,6 +840,7 @@ def _simulate(
                 k,
                 sizing.lot_step,
                 sizing.min_qty,
+                sizing.min_qty_policy == "clamp",
             )
             if err:
                 _sizing_error(err, int(cfg[row]), int(e_i[row]))
@@ -852,6 +853,7 @@ def _simulate(
                 sizing.cap,
                 sizing.lot_step,
                 sizing.min_qty,
+                sizing.min_qty_policy == "clamp",
             )
             if (open_contracts < 0).any():
                 r = int(np.flatnonzero(open_contracts < 0)[0])

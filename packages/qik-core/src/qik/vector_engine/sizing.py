@@ -13,6 +13,7 @@ Nautilus trade a different path, and the engine refuses both instead of guessing
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numba as nb
 import numpy as np
@@ -48,7 +49,9 @@ class Sizing[Quantity: int | float = int]:
 
     The stop distance is in points from the entry fill; costs are not part of the risk.
     ``max_contracts`` caps the risk modes. Risk quantities floor to ``lot_step`` multiples
-    and refuse below ``min_qty``; fixed quantities must already be on that grid.
+    and refuse below ``min_qty`` by default. Opt-in ``min_qty_policy="clamp"``
+    raises risk quantities to the grid-aligned minimum, potentially exceeding the risk budget.
+    Fixed quantities must already be on that grid.
     Defaults retain integer-only construction; explicit fractional steps admit float quantities.
     """
 
@@ -59,8 +62,11 @@ class Sizing[Quantity: int | float = int]:
 
     lot_step: float = 1.0
     min_qty: float = 1.0
+    min_qty_policy: Literal["refuse", "clamp"] = "refuse"
 
     def __post_init__(self) -> None:
+        if self.min_qty_policy not in ("refuse", "clamp"):
+            raise ValueError("min_qty_policy must be refuse or clamp")
         set_ = [x is not None for x in (self.contracts, self.risk_usd, self.risk_fraction)]
         if sum(set_) != 1:
             raise ValueError("Sizing needs exactly one of contracts, risk_usd, risk_fraction")
@@ -68,6 +74,10 @@ class Sizing[Quantity: int | float = int]:
             v = getattr(self, name)
             if isinstance(v, bool) or not (np.isfinite(v) and v > 0):
                 raise ValueError(f"{name} must be finite and positive")
+        if self.min_qty_policy == "clamp" and (
+            abs(self.min_qty / self.lot_step - round(self.min_qty / self.lot_step)) > 1e-7
+        ):
+            raise ValueError("clamped min_qty must be a multiple of lot_step")
         for name in ("contracts", "max_contracts"):
             v = getattr(self, name)
             if v is not None and (
@@ -115,6 +125,7 @@ def size_trades(
     k: int,
     lot_step: float = 1.0,
     min_qty: float = 1.0,
+    clamp_min_qty: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Sequential sizing of closed trades grouped by config, in time order within each config.
 
@@ -127,7 +138,14 @@ def size_trades(
     for r in range(m):
         j = cfg[r]
         n = _contracts_for(
-            mode, amount, cap, final_equity[j], risk_per_contract[r], lot_step, min_qty
+            mode,
+            amount,
+            cap,
+            final_equity[j],
+            risk_per_contract[r],
+            lot_step,
+            min_qty,
+            clamp_min_qty,
         )
         if n < 0:
             return contracts, final_equity, int(-n), r
@@ -146,6 +164,7 @@ def size_open(
     cap: float,
     lot_step: float = 1.0,
     min_qty: float = 1.0,
+    clamp_min_qty: bool = False,
 ) -> np.ndarray:
     """Contracts of the positions still open after the last bar (equity = after the last close)."""
 
@@ -153,7 +172,14 @@ def size_open(
     out = np.zeros(m, np.float64)
     for r in range(m):
         out[r] = _contracts_for(
-            mode, amount, cap, equity[cfg[r]], risk_per_contract[r], lot_step, min_qty
+            mode,
+            amount,
+            cap,
+            equity[cfg[r]],
+            risk_per_contract[r],
+            lot_step,
+            min_qty,
+            clamp_min_qty,
         )  # < 0: error code
     return out
 

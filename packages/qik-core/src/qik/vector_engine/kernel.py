@@ -2890,12 +2890,16 @@ def _core_decision(
 ):
     """Observe settled fills, call a core, and publish its close decision (no matching here)."""
     seen = int(core.account[0])
-    pv, friction, bps, mode, amount, cap, lot, minimum = core.economic
+    if core.account[2]:
+        return
+    pv, friction, bps, mode, amount, cap, lot, minimum = core.economic[:8]
+    clamp = len(core.economic) > 8 and bool(core.economic[8])
     for k in range(seen, cnt):
         risk = abs(out_ep[k] - out_st[k]) * pv
-        qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum)
+        qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
         if qty < 0:
-            raise ValueError("compiled core: entry sizing refused")
+            core.account[2] = 1
+            return
         net = settle(
             out_sd[k] * (out_xp[k] - out_ep[k]),
             pv,
@@ -2913,10 +2917,11 @@ def _core_decision(
     view[V_STOP], view[V_TARGET] = (stop if pos else np.nan), (target if pos else np.nan)
     if pos:
         qty = _contracts_for(
-            mode, amount, cap, core.account[1], abs(ep - risk_stop) * pv, lot, minimum
+            mode, amount, cap, core.account[1], abs(ep - risk_stop) * pv, lot, minimum, clamp
         )
         if qty < 0:
-            raise ValueError("compiled core: open sizing refused")
+            core.account[2] = 2
+            return
         view[V_QTY] = qty
     view[V_WORK_SIDE], view[V_WORK_LEVEL] = work_side, work_level
     view[V_EQUITY] = core.account[1]
