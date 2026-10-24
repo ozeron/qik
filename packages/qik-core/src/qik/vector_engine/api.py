@@ -183,7 +183,7 @@ class Rules:
     it requires timezone-aware Bars.index and excludes limit-then-market entries.
     ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
     changes venue liquidity and needs Instrument.tick. Latency never combines with NEXT_OPEN;
-    ONE_TICK does only with next-open entries (R13): each market, stop and flatten fill moves
+    ONE_TICK does only with next-open entries (R15): each market, stop and flatten fill moves
     one tick against the position and protection measures from that slipped entry.
 
     ``stop_combine="tighter"`` permits a level plus points on the same entry: long
@@ -295,6 +295,15 @@ class Rules:
             )
         ):
             raise ValueError("NEXT_OPEN cannot mix with latency_bars or a venue fill_model")
+        if (
+            self.effective_entry_fill is FillTiming.NEXT_OPEN
+            and self.fill_model is FillModel.ONE_TICK
+        ):
+            if self.amend_timing != "next_open" or self.entry_bar_decision != "legacy":
+                raise ValueError(
+                    "ONE_TICK with next-open entries does not support "
+                    "amend_timing or entry_bar_decision overrides: unproved"
+                )
         if not isinstance(self.profile, Profile):
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
@@ -620,7 +629,7 @@ def _simulate(
     if ioc_used and rules.fill_model is FillModel.ONE_TICK:
         raise ValueError("entry_limit_ioc ONE_TICK execution is unproved")
     if next_open and rules.fill_model is FillModel.ONE_TICK:
-        # R13 admits market entries, market/flatten exits and stops; the rest is unproved.
+        # R15 admits market entries, market/flatten exits and stops; the rest is unproved.
         if slots:
             raise ValueError(ONE_TICK_SLOTS)
         if np.any(entries & (np.isfinite(target) | np.isfinite(target_pts))):

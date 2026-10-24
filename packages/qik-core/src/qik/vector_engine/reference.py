@@ -284,7 +284,7 @@ def simulate_column_reference(
         or any(a is not None for a in (stop_entry, stop_update, target_update, be_after, be_offset))
     )
     if one_tick and next_open and (slots or latency_bars):
-        raise ValueError("R13 covers the next-open scalar path only")
+        raise ValueError("R15 covers the next-open scalar path only")
     if slots:
         return _simulate_slots_reference(
             o,
@@ -367,7 +367,7 @@ def simulate_column_reference(
             combine=combine,
         )
     n = len(o)
-    # R13: with next-open entries ONE_TICK moves every market and stop fill one tick against
+    # R15: with next-open entries ONE_TICK moves every market and stop fill one tick against
     # the position; protection measures from that slipped entry. Targets are refused upstream.
     slip = tick if one_tick else 0.0
     starts_day = np.zeros(n, bool) if new_day is None else new_day

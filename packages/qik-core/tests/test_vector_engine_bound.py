@@ -54,7 +54,7 @@ def test_bound_record_matches_batch(bound_runner, mode: str):
     x = np.array([100.0, 101.0, 102.0, 100.0])
     states = np.zeros(2, dtype=[("calls", "i8")]).view(np.recarray)
     params = np.array([[2.0], [3.0]])
-    rules = np.zeros(22)
+    rules = np.zeros(25)
     rules[0] = 1
     rules[7] = int(mode == "venue")
     days = np.zeros(len(x), bool)

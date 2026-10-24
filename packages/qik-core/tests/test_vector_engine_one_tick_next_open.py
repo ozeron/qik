@@ -1,4 +1,4 @@
-"""R13: ONE_TICK with next-open entries (P025, P024): hand cases, refusals, kernel == reference."""
+"""R15: ONE_TICK with next-open entries (P025, P024): hand cases, refusals, kernel == reference."""
 
 from __future__ import annotations
 
@@ -34,6 +34,7 @@ from qik.vector_engine import (
     TickRound,
     TypedDecision,
     enter,
+    enter_limit_ioc,
     run,
     simulate,
     strategy,
@@ -230,9 +231,9 @@ def breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
 
 
 def test_typed_python_equals_jit_and_slots_refuse_before_matching() -> None:
-    def typed(fields: tuple[str, ...], jit: bool = True):
+    def typed(fields: tuple[str, ...], jit: bool = True, rules: Rules = RULES):
         return run(
-            breakout, tape(), rules=RULES, features=F(), instrument=INSTRUMENT, costs=Costs(),
+            breakout, tape(), rules=rules, features=F(), instrument=INSTRUMENT, costs=Costs(),
             signal_fields=fields, jit=jit,
         )  # fmt: skip
 
@@ -243,6 +244,8 @@ def test_typed_python_equals_jit_and_slots_refuse_before_matching() -> None:
     assert j.trades.iloc[0].entry_px == 101.25 and j.trades.iloc[0].exit_px == 99.0
     with pytest.raises(ValueError, match="does not support order slots"):
         typed(("entry_side", "stop_update"))
+    with pytest.raises(ValueError, match="does not support order slots"):
+        typed(("entry_side", "stop_points"), rules=replace(RULES, protection="oto"))
 
 
 def _compare(
@@ -265,7 +268,7 @@ def _compare(
     exit_long: np.ndarray | None,
     exit_short: np.ndarray | None,
 ) -> list[tuple]:
-    """Kernel and independent reference on one R13 column; equal trades, errors and finals."""
+    """Kernel and independent reference on one R15 column; equal trades, errors and finals."""
     n = len(side)
     nan = np.full(n, np.nan)
     ref = simulate_column_reference(
@@ -362,3 +365,55 @@ def test_kernel_equals_reference_dense(exit_next_open: bool) -> None:
         )  # fmt: skip
         reasons.update(t[5] for t in trades)
     assert {K.REASON_SIGNAL, K.REASON_STOP, K.REASON_STOP_GAP} <= reasons
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"amend_timing": "close_submit"},
+        {"entry_bar_decision": "completed_close"},
+        {"amend_timing": "close_submit", "entry_bar_decision": "completed_close"},
+    ],
+)
+def test_slot_clock_overrides_refuse_before_any_matching(overrides: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="does not support amend_timing or entry_bar_decision"):
+        replace(RULES, **overrides)
+
+
+@strategy(state=S, params=P, features=F)
+def ioc_breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
+    if bar.i == 0:
+        return enter_limit_ioc(1, 102.0, stop=99.0)
+    return HOLD
+
+
+def test_typed_ioc_one_tick_refused() -> None:
+    with pytest.raises(ValueError, match="entry_limit_ioc ONE_TICK"):
+        run(
+            ioc_breakout,
+            tape(),
+            rules=RULES,
+            features=F(),
+            instrument=INSTRUMENT,
+            signal_fields=("entry_side", "entry_limit_ioc", "stop"),
+        )
+
+
+@pytest.mark.parametrize("side", [1, -1])
+def test_combined_stop_clamp_and_proportional_costs(side: int) -> None:
+    result = simulate(
+        tape(side),
+        entry(side, stop=mirror(side, 99.5), stop_points=2.0),
+        rules=replace(RULES, stop_combine="tighter", tick_round=TickRound.NEAREST),
+        instrument=INSTRUMENT,
+        sizing=Sizing(risk_usd=1.0, max_contracts=5, min_qty_policy="clamp"),
+        costs=Costs(proportional_bps=3.0),
+        initial_cash=1000.0,
+    )
+    t = result.trades.iloc[0]
+    assert t.contracts == 1
+    assert t.entry_px == mirror(side, 101.25)
+    assert t.stop == mirror(side, 99.5)
+    assert t.exit_px == mirror(side, 99.25)
+    expected_fee = (abs(t.entry_px) + abs(t.exit_px)) * 2.0 * 3.0 / 10000
+    assert t.pnl_usd == -4.0 - expected_fee

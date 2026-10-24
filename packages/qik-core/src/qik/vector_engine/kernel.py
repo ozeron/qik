@@ -813,7 +813,7 @@ def _column(
     Returns ``(n_trades, err, err_bar, final_side, final_entry_i, final_entry_px, final_stop)``.
     """
 
-    # R13: ONE_TICK with next-open entries stays on this scheduler, adding the tick per fill.
+    # R15: ONE_TICK with next-open entries stays on this scheduler, adding the tick per fill.
     if latency_bars or (one_tick and not next_open):
         venue_slip = tick if one_tick else 0.0
         venue = _venue_driver(core)
@@ -989,7 +989,7 @@ def _column_advance(state, i, inputs, core=None):
         market_exit,
     ) = state
     n = len(o)
-    slip = tick if one_tick else 0.0  # R13: one adverse tick on each market and stop fill
+    slip = tick if one_tick else 0.0  # R15: one adverse tick on each market and stop fill
     exited = False
     busy = False  # a working entry resolved on this bar: the sleeve could not act (A15)
     stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
