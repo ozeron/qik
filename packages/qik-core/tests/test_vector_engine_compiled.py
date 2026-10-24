@@ -81,6 +81,11 @@ def compare(*args, **kwargs):
             d["stop_skip"],
             0,
             0,
+            # Numba does not bounds-check: the replay vector must cover every
+            # index _run reads (combine, amend_close, completed_close).
+            0,
+            0,
+            0,
         ],
         float,
     )
