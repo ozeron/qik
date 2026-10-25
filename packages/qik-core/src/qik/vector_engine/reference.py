@@ -24,6 +24,7 @@ from .kernel import (
     ERR_NONE,
     ERR_PENDING_NEW_DAY,
     ERR_PROTECT_REJECTED,
+    ERR_REARM_BEFORE_CLOSE,
     ERR_STALE_BOOK,
     ERR_STOP_ENTRY_IN_MARKET,
     ERR_STOP_IN_MARKET,
@@ -1295,6 +1296,21 @@ def _simulate_slots_reference(
             return False
         if pending >= 0 and paired(pending) and (long_exits[i] or short_exits[i] or mask & 6):
             return False  # side-specific cancellation of a pair keeps its refusal
+        # A market or limit entry submitted at this close would fill (or rest) while the
+        # old position's reduce-only close waits for the next open: the venue would hold
+        # both (a netting account reverses or doubles). Refuse; a stop, IOC or next-open
+        # replacement acts only after that open's close.
+        if (
+            position is not None
+            and not flatten
+            and exit_next_open
+            and not next_open
+            and not paired(i)
+            and math.isnan(triggers[i])
+            and math.isnan(float(caps[i]))
+        ):
+            fail(ERR_REARM_BEFORE_CLOSE)
+            return True
         # (1) Cancel. A flatten supersedes every queued message (as without A23); an exit
         # cancels the working entry, while the open position's messages already due at
         # this close (its protection activation) are consumed ahead of its close.

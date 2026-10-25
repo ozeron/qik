@@ -201,8 +201,10 @@ class Rules:
     ``reenter_on_exit_bar`` still gates that entry; resting-entry callbacks keep A15.
 
     ``exit_and_rearm=True`` settles a close exit before submitting a fresh pair
-    for the next bar. It requires close exits, zero latency and callback DEFAULT
-    execution. Sizing includes the realized close P&L. V2 refuses this opt-in.
+    for the next bar. It requires zero latency, DEFAULT fills (or ONE_TICK with
+    next-open entries) and ``day_order_expiry="refuse"``; it composes with ``arm_stop="next_bar"``,
+    single-entry OTO and next-open exits (a market or limit replacement beside a
+    next-open exit refuses). Sizing includes the realized close P&L. V2 refuses it.
 
     ``order_lifetime="next_bar"`` makes a pending stop entry (or stop pair) submitted at
     a close valid for exactly the next bar, across a date or session boundary, then
@@ -248,16 +250,19 @@ class Rules:
         if not isinstance(self.exit_and_rearm, bool):
             raise ValueError("exit_and_rearm must be bool")
         if self.exit_and_rearm and (
-            self.effective_exit_fill is not FillTiming.CLOSE
-            or self.latency_bars
-            or self.fill_model is not FillModel.DEFAULT
-            or self.protection != "callback"
-            or self.arm_stop != "refuse"
+            self.latency_bars
+            or not (
+                self.fill_model is FillModel.DEFAULT
+                or (
+                    self.fill_model is FillModel.ONE_TICK
+                    and self.effective_entry_fill is FillTiming.NEXT_OPEN
+                )
+            )
             or self.day_order_expiry != "refuse"
         ):
             raise ValueError(
-                "exit_and_rearm requires close exits, zero latency, callback protection, "
-                "DEFAULT fills, arm_stop=refuse and day_order_expiry=refuse"
+                "exit_and_rearm requires zero latency, DEFAULT fills (or ONE_TICK with "
+                "next-open entries, R15/R15b) and day_order_expiry=refuse"
             )
         if (
             not isinstance(self.author_platform, str)
@@ -1266,6 +1271,7 @@ def _new_york_date_starts(stamps: pd.DatetimeIndex) -> np.ndarray:
 
 _KERNEL_ERRORS = {
     K.ERR_STRADDLE_SIDE_CANCEL: "straddle side-specific cancellation at bar {bar}, config {j} is unproved; use exit",
+    K.ERR_REARM_BEFORE_CLOSE: "exit_and_rearm at bar {bar}, config {j}: a market or limit entry submitted at this close cannot share the close with an exit that fills at the next open (A23); use a stop, IOC or next-open entry, or exit_fill=CLOSE",
     K.ERR_BUSY_ENTRY_DROPPED: "entry decided at bar {bar}, config {j} would be dropped: an entry order already resolved on this bar keeps it busy (A15/R14 whole-bar guard). ONE_TICK next-open refuses a silent drop; use entry_bar_decision='completed_close' for market entries",
     K.ERR_STOP_REPLACE_LATENCY: "stop entry replacement at bar {bar}, config {j} with latency is not pinned: cancel the old entry and wait before replacing it",
     K.ERR_STOP_ENTRY_IN_MARKET: "stop entry at bar {bar}, config {j} is in the market at submission",

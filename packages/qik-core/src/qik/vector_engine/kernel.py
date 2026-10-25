@@ -46,6 +46,7 @@ ERR_AMEND_NO_ORDER = 10
 ERR_STOP_REPLACE_LATENCY = 11
 ERR_STRADDLE_SIDE_CANCEL = 12
 ERR_BUSY_ENTRY_DROPPED = 13  # R15b: a whole-bar busy guard would silently discard an entry
+ERR_REARM_BEFORE_CLOSE = 14  # A23: replacement fills at this close, the old close at the next open
 
 _SLOT_SUBMIT = 1
 _SLOT_PROTECT = 2
@@ -2902,6 +2903,17 @@ def _slots_column_advance(state, i, inputs, core=None):
                 and (sides[i] or _pair_at(straddle, i))
                 and (reenter or not exited)
             ):
+                if (
+                    exit_and_rearm
+                    and exit_now
+                    and pos
+                    and exit_next_open
+                    and not next_open
+                    and not _pair_at(straddle, i)
+                    and np.isnan(triggers[i])
+                    and np.isnan(_optional_at(ioc_limits, i, np.nan))
+                ):
+                    error = ERR_REARM_BEFORE_CLOSE
                 pending = i
                 if _pair_at(straddle, i) or not np.isnan(_optional_at(ioc_limits, i, np.nan)):
                     due = i + latency + 1
