@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
@@ -22,8 +23,8 @@ from ._testing_replay import (  # noqa: F401 -- public testing helpers
     replay_step,
     signal_rows,
 )
-from .api import Bars
-from .core import BarView, Core, Decision
+from .api import Bars, Result
+from .compiled import GridResult
 from .types import Decision as RecordDecision
 
 
@@ -106,47 +107,40 @@ def minute_bars(
     return frame
 
 
-def bar_view(bars: Bars | pd.DataFrame, i: int = 0) -> BarView:
-    """Return one completed bar, preserving the timestamp and missing-volume NaN."""
-    if not 0 <= i < len(bars):
-        raise IndexError(i)
-    if isinstance(bars, pd.DataFrame):
-        row = bars.iloc[i]
-        timestamp = pd.Timestamp(row.datetime)
-        if not isinstance(timestamp, pd.Timestamp):
-            raise ValueError(f"bar {i}: timestamp must not be NaT")
-        return BarView(
-            i,
-            timestamp,
-            float(row.open),
-            float(row.high),
-            float(row.low),
-            float(row.close),
-            float(row.get("volume", np.nan)),
-        )
-    timestamp = None if bars.index is None else bars.index[i]
-    if timestamp is not None and not isinstance(timestamp, pd.Timestamp):
-        raise ValueError(f"bar {i}: timestamp must not be NaT")
-    return BarView(
-        i,
-        timestamp,
-        bars.open[i],
-        bars.high[i],
-        bars.low[i],
-        bars.close[i],
-        np.nan if bars.volume is None else bars.volume[i],
+@dataclass(frozen=True)
+class DecisionTape:
+    """One configuration's emitted decisions and its declared signal fields."""
+
+    decisions: tuple[RecordDecision, ...]
+    signal_fields: tuple[str, ...]
+
+
+def capture_decisions(
+    step: Callable[..., Any], bars: Bars, **run_kwargs: Any
+) -> tuple[Result[Any] | GridResult[Any], tuple[DecisionTape, ...]]:
+    """Run a typed strategy once and record each configuration's decision tape.
+
+    The tape is what the strategy emitted on its own run, including position
+    feedback from these rules. ``replay_decisions`` executes it unchanged under
+    other rules; re-running the strategy there could emit different decisions.
+    """
+    from .compiled import _record_run
+
+    captured: list[Any] = []
+    result = _record_run(
+        step,
+        bars,
+        grid=run_kwargs.pop("grid", None),
+        features=run_kwargs.pop("features", None),
+        jit=run_kwargs.pop("jit", True),
+        _capture_signals=captured,
+        **run_kwargs,
     )
-
-
-def decision_stream(core: Core, bars: Bars | pd.DataFrame) -> list[Decision | RecordDecision]:
-    """Advance the supplied core exactly once per bar; callers own fresh-core creation."""
-    decisions = []
-    for i in range(len(bars)):
-        decision = core.step(bar_view(bars, i))
-        if not isinstance(decision, (Decision, RecordDecision)):
-            raise TypeError(f"bar {i}: step must return a Decision")
-        decisions.append(decision)
-    return decisions
+    tapes = tuple(
+        DecisionTape(captured_decisions(column), declared_signal_fields(column))
+        for column in captured
+    )
+    return result, tapes
 
 
 def assert_trades_equal(a: pd.DataFrame, b: pd.DataFrame, fields: Sequence[str]) -> None:
@@ -204,7 +198,7 @@ def assert_python_jit_equal(step: Callable[..., Any], bars: Bars, **run_kwargs: 
 
     import numba as nb
 
-    from .compiled import GridResult, run
+    from .compiled import run
 
     if getattr(nb.config, "DISABLE_JIT"):
         raise ValueError("assert_python_jit_equal requires a JIT-enabled parent process")
