@@ -7,11 +7,12 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from test_vector_engine_lifecycle import differential, tape
 
-from qik.vector_engine import Bars, Costs, FillModel, Instrument, Rules, Signals, simulate
+from qik.vector_engine import Bars, Costs, FillModel, Instrument, Rules
 
 
 @pytest.mark.parametrize("fill", [FillModel.DEFAULT, FillModel.ONE_TICK])
@@ -37,7 +38,7 @@ def test_fresh_stop_after_expiry(fill, side, latency, date, gap_minutes) -> None
     h, lo = b.high.copy(), b.low.copy()
     h[2:], lo[2:] = 110.0, 90.0
     b = replace(b, high=h, low=lo)
-    sig = Signals(
+    sig = script(
         np.array([side, 0, side, 0, 0]),
         np.array([False] * 4 + [True]),
         entry_stop=np.full(5, 100.0 + side * 5.0),
@@ -46,7 +47,7 @@ def test_fresh_stop_after_expiry(fill, side, latency, date, gap_minutes) -> None
     rules = Rules(day_order_expiry="cancel", latency_bars=latency, fill_model=fill)
     # Exit with latency may remain in flight on the final bar; the old DAY order
     # must never become the entry, irrespective of the eventual new-order fill.
-    r = simulate(b, sig, rules=rules, instrument=Instrument(0.25, 1.0), costs=Costs())
+    r = replay(b, sig, rules=rules, instrument=Instrument(0.25, 1.0), costs=Costs())
     rows = r.trades if not r.trades.empty else r.open_positions
     assert len(rows) == 1
     assert int(rows.entry_i.iloc[0]) == 3 + latency
@@ -62,20 +63,20 @@ def test_expiry_preserves_held_position_and_protection() -> None:
         np.array([100.0, 100.0]),
         index=index,
     )
-    sig = Signals(np.array([1, 0]), np.zeros(2, bool), stop=np.full(2, 97.0))
-    r = simulate(b, sig, rules=Rules(day_order_expiry="cancel"))
+    sig = script(np.array([1, 0]), np.zeros(2, bool), stop=np.full(2, 97.0))
+    r = replay(b, sig, rules=Rules(day_order_expiry="cancel"))
     assert r.trades[["entry_i", "exit_i", "exit_px"]].values.tolist() == [[0, 1, 95.0]]
 
 
 def test_rejected_first_stop_cancels_new_target() -> None:
     b = tape(pd.date_range("2023-01-03 10:00", periods=4, freq="min", tz="America/New_York"))
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0]),
         np.zeros(4, bool),
         stop_update=np.array([np.nan, 100.0, np.nan, np.nan]),
         target_update=np.array([np.nan, 99.0, np.nan, np.nan]),
     )
     rules = Rules(arm_stop="next_bar", protect_rejected="flatten")
-    r = simulate(b, sig, rules=rules)
+    r = replay(b, sig, rules=rules)
     assert r.trades.reason.tolist() == ["protect_fail"]
     differential(b, sig, rules)

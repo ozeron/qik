@@ -8,6 +8,7 @@ import numba as nb
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import Script, replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from vector_engine.lifecycle_fixtures import F, lifecycle_step
@@ -20,9 +21,7 @@ from qik.vector_engine import (
     Instrument,
     Profile,
     Rules,
-    Signals,
     run,
-    simulate,
 )
 from qik.vector_engine import kernel as K
 from qik.vector_engine.api import _day_order_dates
@@ -35,12 +34,17 @@ def tape(times: pd.DatetimeIndex) -> Bars:
     return Bars(c, c + 1, c - 1, c, index=times)
 
 
-def differential(b: Bars, sig: Signals, rules: Rules) -> None:
+def differential(b: Bars, sig: Script, rules: Rules) -> None:
     """Compare independently replayed price points, including refusal metadata."""
     n = len(b)
     nan = np.full(n, np.nan)
 
-    def arr(x: np.ndarray | None) -> np.ndarray:
+    def col(name: str) -> np.ndarray | None:
+        x = sig.get(name)
+        return None if x is None else x[:, 0]
+
+    def arr(name: str) -> np.ndarray:
+        x = col(name)
         return nan if x is None else x
 
     days = _day_order_dates(b)
@@ -50,17 +54,17 @@ def differential(b: Bars, sig: Signals, rules: Rules) -> None:
         amend_close=rules.amend_timing == "close_submit",
         completed_close=rules.entry_bar_decision == "completed_close",
     )
-    slots = sig.stop_update is not None or sig.entry_stop is not None
+    slots = sig.get("stop_update") is not None or sig.get("entry_stop") is not None
     raw = K.run_columns(
         b.open,
         b.high,
         b.low,
         b.close,
-        np.asarray(sig.entry_side, np.int8)[None],
-        np.asarray(sig.exit, bool)[None],
-        arr(sig.stop)[None],
-        arr(sig.target)[None],
-        arr(sig.entry_limit)[None],
+        np.asarray(sig.entry_side[:, 0], np.int8)[None],
+        np.asarray(sig.exit[:, 0], bool)[None],
+        arr("stop")[None],
+        arr("target")[None],
+        arr("entry_limit")[None],
         nan[None],
         nan[None],
         days,
@@ -72,9 +76,9 @@ def differential(b: Bars, sig: Signals, rules: Rules) -> None:
         latency_bars=rules.latency_bars,
         one_tick=rules.fill_model is FillModel.ONE_TICK,
         tick=0.25,
-        entry_trigger=arr(sig.entry_stop)[None] if slots else None,
-        stop_updates=arr(sig.stop_update)[None] if slots else None,
-        target_updates=arr(sig.target_update)[None] if slots else None,
+        entry_trigger=arr("entry_stop")[None] if slots else None,
+        stop_updates=arr("stop_update")[None] if slots else None,
+        target_updates=arr("target_update")[None] if slots else None,
         be_after=nan[None] if slots else None,
         be_offset=nan[None] if slots else None,
         arm_stop=rules.arm_stop == "next_bar",
@@ -87,14 +91,14 @@ def differential(b: Bars, sig: Signals, rules: Rules) -> None:
         b.high,
         b.low,
         b.close,
-        np.asarray(sig.entry_side, np.int8),
-        np.asarray(sig.exit, bool),
-        arr(sig.stop),
-        arr(sig.target),
-        entry_limit=sig.entry_limit,
-        stop_entry=sig.entry_stop,
-        stop_update=sig.stop_update,
-        target_update=sig.target_update,
+        np.asarray(sig.entry_side[:, 0], np.int8),
+        np.asarray(sig.exit[:, 0], bool),
+        arr("stop"),
+        arr("target"),
+        entry_limit=col("entry_limit"),
+        stop_entry=col("entry_stop"),
+        stop_update=col("stop_update"),
+        target_update=col("target_update"),
         new_day=days,
         latency_bars=rules.latency_bars,
         one_tick=rules.fill_model is FillModel.ONE_TICK,
@@ -187,7 +191,7 @@ def test_arm_properties(
     su[2] = level
     if target:
         tu[2] = 100 + side * 3
-    sig = Signals(
+    sig = script(
         np.array([side, 0, 0, 0, 0, 0, 0]), np.zeros(7, bool), stop_update=su, target_update=tu
     )
     differential(
@@ -232,7 +236,7 @@ def test_expiry_before_exact_boundary_match(kind, latency, date) -> None:
     h[2], lo[2] = 110, 90  # expired entry would fill here
     b = replace(b, high=h, low=lo)
     nan = np.full(5, np.nan)
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0, 0]),
         np.zeros(5, bool),
         stop=np.full(5, 80.0),
@@ -241,11 +245,11 @@ def test_expiry_before_exact_boundary_match(kind, latency, date) -> None:
         stop_update=nan if kind == "slots_limit" else None,
     )
     rules = Rules(day_order_expiry="cancel", latency_bars=latency, limit_chase_bars=10)
-    assert simulate(b, sig, rules=rules).trades.empty
-    assert simulate(b, sig, rules=rules).open_positions.empty
+    assert replay(b, sig, rules=rules).trades.empty
+    assert replay(b, sig, rules=rules).open_positions.empty
     differential(b, sig, rules)
     with pytest.raises(ValueError, match="DAY limit/stop entry"):
-        simulate(b, sig, rules=replace(rules, day_order_expiry="refuse"))
+        replay(b, sig, rules=replace(rules, day_order_expiry="refuse"))
 
 
 def test_p111_daily_reissue_and_custom_sessions() -> None:
@@ -268,15 +272,15 @@ def test_p111_daily_reissue_and_custom_sessions() -> None:
 
 def test_day_expiry_is_research_only() -> None:
     b = tape(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="America/New_York"))
-    sig = Signals(np.array([1, 0, 0]), np.zeros(3, bool), stop=np.array([95.0, np.nan, np.nan]))
-    assert simulate(b, sig).deployable
-    assert not simulate(b, sig, rules=Rules(day_order_expiry="cancel")).deployable
+    sig = script(np.array([1, 0, 0]), np.zeros(3, bool), stop=np.array([95.0, np.nan, np.nan]))
+    assert replay(b, sig).deployable
+    assert not replay(b, sig, rules=Rules(day_order_expiry="cancel")).deployable
 
 
 @pytest.mark.parametrize("protect", ["error", "flatten"])
 def test_marketable_first_stop_uses_protection_policy(protect: str) -> None:
     b = tape(pd.date_range("2023-01-03 10:00", periods=4, freq="min", tz="America/New_York"))
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0]),
         np.zeros(4, bool),
         stop_update=np.array([np.nan, 100.0, np.nan, np.nan]),
@@ -284,9 +288,9 @@ def test_marketable_first_stop_uses_protection_policy(protect: str) -> None:
     rules = Rules(arm_stop="next_bar", protect_rejected=protect, amend_rejected="keep")
     if protect == "error":
         with pytest.raises(ValueError, match="protection goes out"):
-            simulate(b, sig, rules=rules)
+            replay(b, sig, rules=rules)
     else:
-        r = simulate(b, sig, rules=rules)
+        r = replay(b, sig, rules=rules)
         assert r.trades[["exit_i", "exit_px", "reason"]].values.tolist() == [
             [1, 100.0, "protect_fail"]
         ]
@@ -299,14 +303,14 @@ def test_new_bracket_tie_uses_existing_ohlc_path(adaptive: bool, expected: str) 
     h, lo = b.high.copy(), b.low.copy()
     h[2], lo[2] = 104.0, 96.0
     b = replace(b, high=h, low=lo)
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0]),
         np.zeros(4, bool),
         stop_update=np.array([np.nan, 97.0, np.nan, np.nan]),
         target_update=np.array([np.nan, 103.0, np.nan, np.nan]),
     )
     rules = Rules(arm_stop="next_bar", adaptive_high_low_ordering=adaptive)
-    r = simulate(b, sig, rules=rules)
+    r = replay(b, sig, rules=rules)
     assert r.trades.exit_i.tolist() == [2]
     assert r.trades.reason.tolist() == [expected]
     differential(b, sig, rules)
@@ -323,11 +327,11 @@ def test_new_bracket_tie_uses_existing_ohlc_path(adaptive: bool, expected: str) 
 def test_dst_and_early_close_do_not_change_civil_date(times: list[str]) -> None:
     b = tape(pd.DatetimeIndex(times))
     np.testing.assert_array_equal(_day_order_dates(b), [False, False])
-    sig = Signals(np.array([1, 0]), np.zeros(2, bool), entry_stop=np.full(2, 105.0))
-    result = simulate(b, sig, rules=Rules(day_order_expiry="cancel"))
+    sig = script(np.array([1, 0]), np.zeros(2, bool), entry_stop=np.full(2, 105.0))
+    result = replay(b, sig, rules=Rules(day_order_expiry="cancel"))
     # A pending order remains; the absence of a fill alone cannot prove expiry.
     assert result.trades.empty
     h = b.high.copy()
     h[1] = 106.0
-    result = simulate(replace(b, high=h), sig, rules=Rules(day_order_expiry="cancel"))
+    result = replay(replace(b, high=h), sig, rules=Rules(day_order_expiry="cancel"))
     assert len(result.open_positions) == 1

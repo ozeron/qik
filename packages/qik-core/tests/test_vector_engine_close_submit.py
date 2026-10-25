@@ -7,6 +7,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -20,13 +21,11 @@ from qik.vector_engine import (
     Position,
     Profile,
     Rules,
-    Signals,
     State,
     TypedDecision,
     enter,
     exit,
     run,
-    simulate,
     strategy,
     trail,
 )
@@ -55,36 +54,36 @@ def tape(side: int = 1, gap: float = 98.0) -> Bars:
 @pytest.mark.parametrize("keep", [False, True])
 def test_amend_validated_at_submission_and_gap_fills_at_open(side: int, keep: bool) -> None:
     bars = tape(side)
-    sig = Signals(
+    sig = script(
         np.array([side, 0, 0, 0]),
         np.array([False, False, False, True]),
         stop=np.full(4, 95.0 if side > 0 else 105.0),
         stop_update=np.array([np.nan, 99.0 if side > 0 else 101.0, np.nan, np.nan]),
     )
     rules = replace(RULES, amend_rejected="keep" if keep else "error")
-    result = simulate(bars, sig, rules=rules)
+    result = replay(bars, sig, rules=rules)
     assert result.trades.exit_i.tolist() == [2]
     assert result.trades.exit_px.tolist() == [98.0 if side > 0 else 102.0]
     assert result.trades.reason.tolist() == ["stop_gap"]
     assert result.trades.stop.tolist() == [95.0 if side > 0 else 105.0]  # entry risk stays fixed
     if keep:
-        old = simulate(bars, sig, rules=replace(rules, amend_timing="next_open"))
+        old = replay(bars, sig, rules=replace(rules, amend_timing="next_open"))
         assert old.trades.exit_i.tolist() == [3]
     else:
         with pytest.raises(ValueError, match="amendment at bar 2"):
-            simulate(bars, sig, rules=replace(rules, amend_timing="next_open"))
+            replay(bars, sig, rules=replace(rules, amend_timing="next_open"))
 
 
 @pytest.mark.parametrize("side", [-1, 1])
 def test_close_submit_still_refuses_marketable_amend(side: int) -> None:
-    sig = Signals(
+    sig = script(
         np.array([side, 0, 0, 0]),
         np.zeros(4, bool),
         stop=np.full(4, 95.0 if side > 0 else 105.0),
         stop_update=np.array([np.nan, 100.0, np.nan, np.nan]),
     )
     with pytest.raises(ValueError, match="amendment at bar 1"):
-        simulate(tape(side), sig, rules=RULES)
+        replay(tape(side), sig, rules=RULES)
 
 
 class S(State):
@@ -266,22 +265,21 @@ def test_python_jit_full_results_and_state() -> None:
 
 def test_close_submit_terminal_amend_and_marketable_limit_target() -> None:
     bars = tape(gap=100.0)
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0]),
         np.zeros(4, bool),
         stop=np.full(4, 95.0),
         stop_update=np.array([np.nan, np.nan, np.nan, 99.0]),
     )
-    assert len(simulate(bars, sig, rules=RULES).open_positions) == 1
+    assert len(replay(bars, sig, rules=RULES).open_positions) == 1
     with pytest.raises(ValueError, match="NEXT_OPEN"):
-        simulate(bars, sig, rules=replace(RULES, amend_timing="next_open"))
-    sig = replace(
-        sig,
+        replay(bars, sig, rules=replace(RULES, amend_timing="next_open"))
+    sig = sig.replace(
         stop_update=None,
         target=np.full(4, 105.0),
         target_update=np.array([np.nan, 100.0, np.nan, np.nan]),
     )
-    result = simulate(bars, sig, rules=RULES)
+    result = replay(bars, sig, rules=RULES)
     assert result.trades.exit_i.tolist() == [1]
     assert result.trades.exit_px.tolist() == [100.0]
     assert result.trades.reason.tolist() == ["target"]

@@ -8,6 +8,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -24,12 +25,10 @@ from qik.vector_engine import (
     Position,
     Profile,
     Rules,
-    Signals,
     State,
     TypedDecision,
     enter,
     run,
-    simulate,
     strategy,
 )
 from qik.vector_engine import protection as P
@@ -83,7 +82,7 @@ def tape(side=1):
 
 
 def signals(side=1):
-    return Signals(
+    return script(
         entry_side=np.array([side, 0, 0, 0]),
         exit=np.zeros(4, bool),
         stop=np.array([105.0 if side > 0 else 95.0, math.nan, math.nan, math.nan]),
@@ -98,8 +97,7 @@ def test_schedulers_reference_and_existing_level_equivalence(side, scheduler):
     if scheduler == "venue":
         rules = Rules(stop_combine="tighter", latency_bars=1)
         # Delayed close fills use 111, not decision 100: channel stays the tighter stop.
-        sig = replace(
-            signals(side),
+        sig = signals(side).replace(
             stop=np.array([109.5 if side > 0 else 90.5, math.nan, math.nan, math.nan]),
         )
     else:
@@ -111,21 +109,21 @@ def test_schedulers_reference_and_existing_level_equivalence(side, scheduler):
         )
         sig = signals(side)
     kwargs = dict(rules=rules, instrument=Instrument(tick=0.25, point_value=1), costs=Costs())
-    actual = simulate(bars, sig, **kwargs)
+    actual = replay(bars, sig, **kwargs)
     resolved = 109.5 if scheduler == "venue" else 108.0
     stop = np.array([resolved if side > 0 else 200 - resolved, math.nan, math.nan, math.nan])
-    expected = simulate(bars, replace(sig, stop=stop, stop_points=None), **kwargs)
+    expected = replay(bars, sig.replace(stop=stop, stop_points=None), **kwargs)
     pd.testing.assert_frame_equal(actual.trades, expected.trades, check_exact=True)
     ref = R.simulate_column_reference(
         bars.open,
         bars.high,
         bars.low,
         bars.close,
-        sig.entry_side,
+        sig.entry_side[:, 0],
         np.zeros(4, bool),
-        sig.stop,
+        sig.fields["stop"][:, 0],
         np.full(4, math.nan),
-        stop_pts=sig.stop_points,
+        stop_pts=sig.fields["stop_points"][:, 0],
         combine=1,
         next_open=scheduler != "venue",
         oto=scheduler == "slots",
@@ -149,14 +147,14 @@ def test_schedulers_reference_and_existing_level_equivalence(side, scheduler):
 
 def test_refusal_and_validation():
     with pytest.raises(ValueError, match="level and as points"):
-        simulate(tape(), signals())
+        replay(tape(), signals())
     for name in ["stop_combine", "target_combine"]:
         with pytest.raises(ValueError, match=name):
             Rules(**{name: "unknown"})
     with pytest.raises(ValueError, match="positive"):
-        simulate(
+        replay(
             tape(),
-            replace(signals(), stop_points=np.array([-1.0, math.nan, math.nan, math.nan])),
+            signals().replace(stop_points=np.array([-1.0, math.nan, math.nan, math.nan])),
             rules=Rules(stop_combine="tighter"),
         )
 
@@ -206,8 +204,7 @@ def test_typed_python_jit(scheduler):
 @pytest.mark.parametrize("side", [-1, 1])
 def test_target_combines_and_defaults_refuse(side):
     bars = tape(side)
-    sig = replace(
-        signals(side),
+    sig = signals(side).replace(
         stop=None,
         stop_points=None,
         target=np.array([115.0 if side > 0 else 85.0, math.nan, math.nan, math.nan]),
@@ -215,23 +212,23 @@ def test_target_combines_and_defaults_refuse(side):
     )
     rules = Rules(profile=Profile.REPRO, entry_fill=FillTiming.NEXT_OPEN)
     with pytest.raises(ValueError, match="target is given"):
-        simulate(bars, sig, rules=rules)
-    actual = simulate(bars, sig, rules=replace(rules, target_combine="tighter"))
+        replay(bars, sig, rules=rules)
+    actual = replay(bars, sig, rules=replace(rules, target_combine="tighter"))
     assert len(actual.trades) == 1
     assert actual.trades.iloc[0].exit_i == 1
     assert actual.trades.iloc[0].exit_px == (111 if side > 0 else 89)
 
 
 def test_nautilus_oto_combined_admission_and_marketable_stop():
-    sig = replace(signals(), stop=np.array([98.0, math.nan, math.nan, math.nan]))
+    sig = signals().replace(stop=np.array([98.0, math.nan, math.nan, math.nan]))
     rules = Rules(protection="oto", stop_combine="tighter")
-    result = simulate(tape(), sig, rules=rules)
+    result = replay(tape(), sig, rules=rules)
     assert result.compliance is Compliance.NAUTILUS
     assert not result.deployable  # Preserve the existing V2 OTO admission boundary.
     assert result.open_positions.iloc[0].stop == 98.0
     # The chosen level cannot silently be clipped to the fill or ignored.
     with pytest.raises(ValueError, match="stop|protection"):
-        simulate(tape(), signals(), rules=rules)
+        replay(tape(), signals(), rules=rules)
 
 
 @pytest.mark.parametrize("side", [-1, 1])
@@ -268,15 +265,15 @@ def test_ioc_fill_combines_from_actual_open(side, slots, latency, leg, level_tig
         fields["stop"] = first(100 - side * 20)
     cap = first(100.0)
     sides = np.array([side, 0, 0, 0, 0, 0], dtype=np.int8)
-    sig = Signals(sides, np.zeros(6, bool), entry_limit_ioc=cap, **fields)
+    sig = script(sides, np.zeros(6, bool), entry_limit_ioc=cap, **fields)
     rules = Rules(
         target_order="mit" if slots else "limit",
         latency_bars=latency,
         **{f"{leg}_combine": "tighter"},
     )
-    actual = simulate(bars, sig, rules=rules)
-    expected = simulate(
-        bars, replace(sig, **{leg: first(resolved_px), f"{leg}_points": None}), rules=rules
+    actual = replay(bars, sig, rules=rules)
+    expected = replay(
+        bars, sig.replace(**{leg: first(resolved_px), f"{leg}_points": None}), rules=rules
     )
     pd.testing.assert_frame_equal(actual.trades, expected.trades, check_exact=True)
     assert len(actual.trades) == 1

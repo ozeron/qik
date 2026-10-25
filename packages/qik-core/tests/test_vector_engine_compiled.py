@@ -3,33 +3,78 @@
 from __future__ import annotations
 
 import inspect
-from collections import namedtuple
 
 import numba as nb
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
-from numba.experimental import jitclass
 from test_vector_engine import _case, _dense_case
 
-from qik.vector_engine import Bars, Rules, Signals, run, simulate
+from qik.vector_engine import (
+    Bar,
+    Bars,
+    BoolArray,
+    Decision,
+    Features,
+    FloatArray,
+    IntArray,
+    Position,
+    Rules,
+    run,
+    strategy,
+)
 from qik.vector_engine import kernel as K
-from qik.vector_engine.api import SIGNAL_FIELDS
-from qik.vector_engine.compiled import RULES_WIDTH, _jitclass_step, _run
+from qik.vector_engine.compiled import RULES_WIDTH, _bound
+from qik.vector_engine.testing import (
+    ReplayParams,
+    ReplayState,
+    replay_decisions,
+    replay_features,
+    replay_step,
+)
 
 _BATCH = K.run_columns
+# Stateless typed records: numba refuses zero-width records (same byte as run).
+_EMPTY = np.zeros(1, dtype=[("_empty", "i1")]).view(np.recarray)
 
 
-@nb.njit(cache=True)
-def replay(state, params, i, feats, o, h, lo, c, v, view, out):
-    # The saved pre-IOC fixture retains its original fifteen numeric fields.
-    out[:15] = feats[int(params[0]), i]
+def rows(matrix: np.ndarray) -> list[tuple[float, ...]]:
+    """The saved pre-IOC fixture retains its original fifteen numeric fields."""
+    return [tuple(row) for row in matrix]
+
+
+def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
+    """One recorded column through the strategy-bound runner of typed replay_step."""
+    features = replay_features(decisions)
+    clock = np.full(len(c), -1, np.int64)
+    raw = _bound(replay_step).run(
+        _EMPTY,
+        _EMPTY,
+        (clock, *features),
+        o,
+        h,
+        lo,
+        c,
+        np.zeros(len(c)),
+        days,
+        np.zeros(len(c), bool),
+        rc,
+        np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
+        np.nan,
+        slots,
+        None,
+        masks,
+        None,
+        expiry_days,
+        False,
+    )
+    return raw[:-1]  # drop the final (empty) state rows
 
 
 def compare(*args, **kwargs):
-    class_core = kwargs.pop("_class_core", False)
     batch = _BATCH(*args, **kwargs)
     sig = inspect.signature(_BATCH if nb.config.DISABLE_JIT else _BATCH.py_func).bind(
         *args, **kwargs
@@ -84,7 +129,7 @@ def compare(*args, **kwargs):
             0,
             0,
             # Numba does not bounds-check: the replay vector must cover every
-            # index _run reads (combine, amend_close, completed_close,
+            # index the runner reads (combine, amend_close, completed_close,
             # arm_stop, day_cancel, next_bar, exit_and_rearm).
             d["combine"],
             d["amend_close"],
@@ -101,45 +146,29 @@ def compare(*args, **kwargs):
     for q, name in enumerate(("force_close", "force_open")):
         if d[name] is not None:
             masks[:, q] = d[name]
-    cores = None
-    clock = feats
-    if class_core:
-        from numba.typed import List
-
-        cores = List([ReplayCore(np.ascontiguousarray(row)) for row in feats])
-        clock = np.full((n, 1), -1, np.int64)
-    raw = _run(
-        _jitclass_step if class_core else replay,
-        np.zeros(0),
-        np.arange(k, dtype=float)[:, None],
-        clock,
-        d["o"],
-        d["h"],
-        d["lo"],
-        d["c"],
-        np.zeros(n),
-        d["new_day"],
-        np.zeros(n, bool),
-        rc,
-        np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0]),
-        np.nan,
-        d["entry_trigger"] is not None,
-        cores,
-        masks,
-        expiry_days=d["expiry_days"],
-    )
-    counts, meta, *arrays = raw
-    np.testing.assert_array_equal(meta[:, 0], batch[2])
-    np.testing.assert_array_equal(meta[:, 1], batch[3])
     for j in range(k):
+        counts, meta, *arrays = replay_column(
+            rows(feats[j]),
+            d["o"],
+            d["h"],
+            d["lo"],
+            d["c"],
+            d["new_day"],
+            rc,
+            d["entry_trigger"] is not None,
+            np.ascontiguousarray(masks[j : j + 1]),
+            d["expiry_days"],
+        )
+        np.testing.assert_array_equal(meta[0, 0], batch[2][j])
+        np.testing.assert_array_equal(meta[0, 1], batch[3][j])
         if batch[2][j]:
             continue
-        assert counts[j] == batch[0][j]
+        assert counts[0] == batch[0][j]
         for q in range(4):
-            np.testing.assert_array_equal(meta[j, q + 2], batch[q + 4][j])
+            np.testing.assert_array_equal(meta[0, q + 2], batch[q + 4][j])
         start, stop = batch[1][j : j + 2]
         for q in range(7):
-            np.testing.assert_array_equal(arrays[q][j, : counts[j]], batch[q + 8][start:stop])
+            np.testing.assert_array_equal(arrays[q][0, : counts[0]], batch[q + 8][start:stop])
     return batch
 
 
@@ -231,38 +260,7 @@ def test_stateless_replay_dense():
             )
 
 
-# The legacy 16-value record (through IOC); the adapter fills absent paired fields.
-NumericDecision = namedtuple("NumericDecision", ("side", *SIGNAL_FIELDS[1:16]))
-
-
-@jitclass([("signals", nb.float64[:, ::1])])
-class ReplayCore:
-    def __init__(self, signals):
-        self.signals = signals
-
-    def step(self, bar, pos):
-        r = self.signals[bar.i]
-        return NumericDecision(
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            r[4],
-            r[5],
-            r[6],
-            r[7],
-            r[8],
-            r[9],
-            r[10],
-            r[11],
-            r[12],
-            r[13],
-            r[14],
-            np.nan,  # IOC is absent in the saved pre-IOC corpus.
-        )
-
-
-def test_public_jitclass_runner_is_field_exact():
+def test_public_replay_runner_is_field_exact():
     c = np.array([100.0, 100.0, 101.0])
     bars = Bars(c, c + 1, c - 1, c)
     feats = np.full((3, 15), np.nan)
@@ -270,30 +268,13 @@ def test_public_jitclass_runner_is_field_exact():
     feats[:, 1] = [0, 0, 1]
     feats[:, 5] = 5.0
     feats[:, 12:] = 0
-    result = run(
-        ReplayCore,
-        bars,
-        features={"signals": feats},
-        signal_fields=("entry_side", "exit", "stop_points"),
-    )[0]
-    expected = simulate(
-        bars,
-        Signals(feats[:, 0].astype(np.int8), feats[:, 1].astype(bool), stop_points=feats[:, 5]),
+    fields = ("entry_side", "exit", "stop_points")
+    python, compiled = (
+        replay_decisions(rows(feats), bars, signal_fields=fields, jit=jit) for jit in (False, True)
     )
-    pd.testing.assert_frame_equal(result.trades, expected.trades, check_exact=True)
-
-
-def test_jitclass_replays_hypothesis_and_dense_corpora(monkeypatch):
-    import sys
-
-    numeric_compare = compare
-
-    def class_compare(*args, **kwargs):
-        return numeric_compare(*args, **kwargs, _class_core=True)
-
-    monkeypatch.setattr(sys.modules[__name__], "compare", class_compare)
-    test_stateless_replay_hypothesis()
-    test_stateless_replay_dense()
+    pd.testing.assert_frame_equal(python.trades, compiled.trades, check_exact=True)
+    trades = compiled.trades[["entry_i", "exit_i", "side", "entry_px", "exit_px", "stop", "reason"]]
+    assert trades.values.tolist() == [[0, 2, 1, 100.0, 101.0, 95.0, "signal"]]
 
 
 def test_public_last_close_flatten_needs_no_calendar():
@@ -306,24 +287,13 @@ def test_public_last_close_flatten_needs_no_calendar():
     matrix[0, 0] = 1
     matrix[2, 12] = 1
     rules = Rules(profile=Profile.REPRO, flatten=Flatten.LAST_BAR_CLOSE)
-    result = run(
-        ReplayCore,
-        bars,
-        features={"signals": matrix},
-        signal_fields=("entry_side", "exit", "flatten"),
-        rules=rules,
-    )[0]
-    expected = simulate(
-        bars,
-        Signals(
-            matrix[:, 0].astype(np.int8),
-            matrix[:, 1].astype(bool),
-            flatten=matrix[:, 12].astype(bool),
-        ),
-        rules=rules,
+    fields = ("entry_side", "exit", "flatten")
+    python, compiled = (
+        replay_decisions(rows(matrix), bars, signal_fields=fields, rules=rules, jit=jit)
+        for jit in (False, True)
     )
-    pd.testing.assert_frame_equal(result.trades, expected.trades, check_exact=True)
-    assert result.trades.exit_i.tolist() == [2]
+    pd.testing.assert_frame_equal(python.trades, compiled.trades, check_exact=True)
+    assert compiled.trades.exit_i.tolist() == [2]
 
 
 @pytest.mark.parametrize("slots", [False, True])
@@ -364,46 +334,70 @@ def test_replay_original_dense_corpora(monkeypatch):
             )
 
 
-@jitclass(
-    [("signals", nb.float64[:, ::1]), ("observed", nb.float64[:, ::1]), ("clock", nb.int64[::1])]
-)
-class CaptureCore:
-    def __init__(self, signals, observed, clock):
-        self.signals, self.observed, self.clock = signals, observed, clock
+class CaptureFeatures(Features):
+    """Scripted inputs plus writable per-bar observation outputs (test capture only)."""
 
-    def step(self, bar, pos):
-        self.clock[bar.i] = bar.ts
-        self.observed[bar.i, 0] = pos.side
-        self.observed[bar.i, 1] = pos.qty
-        self.observed[bar.i, 2] = pos.entry_i
-        self.observed[bar.i, 3] = pos.entry_px
-        self.observed[bar.i, 4] = pos.stop
-        self.observed[bar.i, 5] = pos.target
-        self.observed[bar.i, 6] = pos.working_side
-        self.observed[bar.i, 7] = pos.working_level
-        self.observed[bar.i, 8] = pos.last_exit_i
-        self.observed[bar.i, 9] = pos.last_exit_px
-        self.observed[bar.i, 10] = pos.last_exit_reason
-        self.observed[bar.i, 11] = pos.equity
-        r = self.signals[bar.i]
-        return NumericDecision(
-            r[0],
-            r[1],
-            r[2],
-            r[3],
-            r[4],
-            r[5],
-            r[6],
-            r[7],
-            r[8],
-            r[9],
-            r[10],
-            r[11],
-            r[12],
-            r[13],
-            r[14],
-            np.nan,  # IOC is absent in the saved pre-IOC corpus.
-        )
+    side: IntArray
+    exit: BoolArray
+    stop: FloatArray
+    target: FloatArray
+    entry_limit: FloatArray
+    stop_update: FloatArray
+    seen_side: FloatArray
+    seen_entry_px: FloatArray
+    seen_stop: FloatArray
+    seen_target: FloatArray
+    seen_last_exit_i: FloatArray
+    seen_last_exit_px: FloatArray
+    seen_last_exit_reason: FloatArray
+    seen_equity: FloatArray
+    seen_ts: IntArray
+
+
+@strategy(state=ReplayState, params=ReplayParams, features=CaptureFeatures)
+def capture_step(
+    s: ReplayState, p: ReplayParams, f: CaptureFeatures, bar: Bar, pos: Position
+) -> Decision:
+    f.seen_ts[bar.i] = bar.ts
+    f.seen_side[bar.i] = pos.side
+    f.seen_entry_px[bar.i] = pos.entry_px
+    f.seen_stop[bar.i] = pos.stop
+    f.seen_target[bar.i] = pos.target
+    f.seen_last_exit_i[bar.i] = pos.last_exit_i
+    f.seen_last_exit_px[bar.i] = pos.last_exit_px
+    f.seen_last_exit_reason[bar.i] = pos.last_exit_reason
+    f.seen_equity[bar.i] = pos.equity
+    i = bar.i
+    return Decision(
+        side=f.side[i],
+        exit=f.exit[i],
+        stop=f.stop[i],
+        target=f.target[i],
+        entry_limit=f.entry_limit[i],
+        stop_update=f.stop_update[i],
+    )
+
+
+def capture(scripted: Script) -> CaptureFeatures:
+    """Fresh NaN observation arrays (zero clock) beside the scripted inputs."""
+    n = len(scripted.entry_side)
+
+    def level(name: str) -> np.ndarray:
+        value = scripted.get(name)
+        return np.full(n, np.nan) if value is None else value[:, 0]
+
+    seen = {name: np.full(n, np.nan) for name in CaptureFeatures._fields if name[:5] == "seen_"}
+    return CaptureFeatures(
+        side=scripted.entry_side[:, 0].copy(),
+        exit=scripted.exit[:, 0].copy(),
+        **{name: level(name) for name in ("stop", "target", "entry_limit", "stop_update")},
+        **dict(seen, seen_ts=np.zeros(n, np.int64)),
+    )
+
+
+def first(n: int, *values: float) -> np.ndarray:
+    """NaN column with the given leading values (decision bars 0, 1, ...)."""
+    return np.r_[values, np.full(n - len(values), np.nan)]
 
 
 def test_view_is_after_resting_fills_and_reports_actual_amended_stop():
@@ -414,21 +408,18 @@ def test_view_is_after_resting_fills_and_reports_actual_amended_stop():
     bars = Bars(
         o, o + 1, o - 1, c, index=pd.date_range("2023-01-03", periods=5, freq="1ns", tz="UTC")
     )
-    signals = np.full((5, 15), np.nan)
-    signals[:, 0] = 0
-    signals[:, 1] = 0
-    signals[:, 12:] = 0
-    signals[0, 0] = 1
-    signals[0, 2] = 95
-    signals[0, 3] = 110
-    signals[1, 8] = 101
-    signals[2, 8] = 103
-    observed = np.full((5, 12), np.nan)
-    clock = np.zeros(5, np.int64)
+    scripted = script(
+        np.array([1, 0, 0, 0, 0]),
+        np.zeros(5, bool),
+        stop=first(5, 95),
+        target=first(5, 110),
+        stop_update=first(5, np.nan, 101, 103),
+    )
+    f = capture(scripted)
     result = run(
-        CaptureCore,
+        capture_step,
         bars,
-        features={"signals": signals, "observed": observed, "clock": clock},
+        features=f,
         rules=Rules(
             stop_update_mode="ratchet",
             amend_rejected="keep",
@@ -440,12 +431,13 @@ def test_view_is_after_resting_fills_and_reports_actual_amended_stop():
         sizing=Sizing(contracts=1),
         initial_cash=1000.0,
         signal_fields=("entry_side", "exit", "stop", "target", "stop_update"),
-    )[0]
+    )
     assert len(result.trades) == 1
-    np.testing.assert_array_equal(observed[:, 0], [0, 1, 1, 0, 0])
-    np.testing.assert_array_equal(observed[1:3, 4], [95, 101])
-    np.testing.assert_array_equal(observed[3, 8:12], [3, 99, 4, 996])
-    np.testing.assert_array_equal(clock, bars.index.asi8)
+    np.testing.assert_array_equal(f.seen_side, [0, 1, 1, 0, 0])
+    np.testing.assert_array_equal(f.seen_stop[1:3], [95, 101])
+    last_exit = (f.seen_last_exit_i, f.seen_last_exit_px, f.seen_last_exit_reason, f.seen_equity)
+    np.testing.assert_array_equal([x[3] for x in last_exit], [3, 99, 4, 996])
+    np.testing.assert_array_equal(f.seen_ts, bars.index.asi8)
 
 
 @pytest.mark.parametrize("slots", [False, True])
@@ -454,32 +446,28 @@ def test_view_has_no_working_protection_until_callback_order_settles(slots):
 
     c = np.full(7, 100.0)
     bars = Bars(c, c + 1, c - 1, c)
-    signals = np.full((7, 15), np.nan)
-    signals[:, 0] = 0
-    signals[:, 1] = 0
-    signals[:, 12:] = 0
-    signals[0, 0] = 1
-    signals[0, 2] = 95
-    signals[0, 3] = 110
-    signals[4, 1] = 1
-    observed = np.full((7, 12), np.nan)
-    clock = np.zeros(7, np.int64)
+    exits = np.zeros(7, bool)
+    exits[4] = True
+    scripted = script(
+        np.array([1, 0, 0, 0, 0, 0, 0]), exits, stop=first(7, 95), target=first(7, 110)
+    )
+    f = capture(scripted)
     fields = ("entry_side", "exit", "stop", "target") + (("stop_update",) if slots else ())
     result = run(
-        CaptureCore,
+        capture_step,
         bars,
-        features={"signals": signals, "observed": observed, "clock": clock},
+        features=f,
         rules=Rules(latency_bars=1),
         instrument=Instrument(0.25, 2.0),
         costs=Costs(),
         sizing=Sizing(contracts=1),
         initial_cash=1000.0,
         signal_fields=fields,
-    )[0]
+    )
     assert len(result.trades) == 1
-    np.testing.assert_array_equal(observed[:, 0], [0, 0, 1, 1, 1, 1, 0])
-    assert np.isnan(observed[2, 4:6]).all()
-    np.testing.assert_array_equal(observed[3:6, 4:6], [[95, 110]] * 3)
+    np.testing.assert_array_equal(f.seen_side, [0, 0, 1, 1, 1, 1, 0])
+    assert np.isnan([f.seen_stop[2], f.seen_target[2]]).all()
+    np.testing.assert_array_equal(np.c_[f.seen_stop, f.seen_target][3:6], [[95, 110]] * 3)
 
 
 @pytest.mark.parametrize("target", [110.0, 99.5])
@@ -493,34 +481,28 @@ def test_resting_limit_view_precedes_callback_protection(slots, target):
         c,
         index=pd.date_range("2023-01-03 15:00", periods=4, freq="min", tz="UTC"),
     )
-    signals = np.full((4, 15), np.nan)
-    signals[:, (0, 1, 12, 13, 14)] = 0
-    signals[0, [0, 2, 3, 4]] = [1, 95, target, 99]
-    signals[2, 1] = 1
-    observed, clock = np.full((4, 12), np.nan), np.zeros(4, np.int64)
+    scripted = script(
+        np.array([1, 0, 0, 0]),
+        np.array([False, False, True, False]),
+        stop=first(4, 95),
+        target=first(4, target),
+        entry_limit=first(4, 99),
+    )
+    f = capture(scripted)
     fields = ("entry_side", "exit", "stop", "target", "entry_limit")
     result = run(
-        CaptureCore,
+        capture_step,
         bars,
-        features={"signals": signals, "observed": observed, "clock": clock},
+        features=f,
         signal_fields=fields + (("stop_update",) if slots else ()),
-    )[0]
-    assert observed[1, 0] == 1
-    assert observed[1, 3] == 99
-    assert np.isnan(observed[1, 4:6]).all()
-    assert observed[1, 8] == -1
-    # The callback may fill a newly accepted target at the same close. The decision
-    # must precede that settlement, but the batch trade remains field-exact.
-    expected = simulate(
-        bars,
-        Signals(
-            signals[:, 0].astype(np.int8),
-            signals[:, 1].astype(bool),
-            stop=signals[:, 2],
-            target=signals[:, 3],
-            entry_limit=signals[:, 4],
-        ),
     )
+    assert f.seen_side[1] == 1
+    assert f.seen_entry_px[1] == 99
+    assert np.isnan([f.seen_stop[1], f.seen_target[1]]).all()
+    assert f.seen_last_exit_i[1] == -1
+    # The callback may fill a newly accepted target at the same close. The decision
+    # must precede that settlement, but the scripted replay trade remains field-exact.
+    expected = replay(bars, scripted)
     pd.testing.assert_frame_equal(result.trades, expected.trades, check_exact=True)
 
 
@@ -533,10 +515,11 @@ def test_declared_inactive_calendar_fields_allow_naive_last_close():
     signals[:, (0, 1, 12, 13, 14)] = 0
     signals[0, 0], signals[2, 12] = 1, 1
     rules = Rules(profile=Profile.REPRO, flatten=Flatten.LAST_BAR_CLOSE)
-    actual = run(ReplayCore, bars, features={"signals": signals}, rules=rules)[0]
-    expected = simulate(
+    # Every field declared (the replay default), all but three inactive.
+    actual = replay_decisions(rows(signals), bars, rules=rules)
+    expected = replay(
         bars,
-        Signals(
+        script(
             signals[:, 0].astype(np.int8),
             signals[:, 1].astype(bool),
             flatten=signals[:, 12].astype(bool),
@@ -544,6 +527,7 @@ def test_declared_inactive_calendar_fields_allow_naive_last_close():
         rules=rules,
     )
     pd.testing.assert_frame_equal(actual.trades, expected.trades, check_exact=True)
+    assert actual.trades.exit_i.tolist() == [2]
 
 
 def test_pending_limit_refuses_explicit_session_boundary_without_index():
@@ -556,11 +540,11 @@ def test_pending_limit_refuses_explicit_session_boundary_without_index():
     signals[0, [0, 2, 4]], signals[2, 1] = [1, 95, 99], 1
     rules = Rules(profile=Profile.REPRO)
     with pytest.raises(ValueError, match="pending|New York|DAY"):
-        run(ReplayCore, bars, features={"signals": signals}, rules=rules)
+        replay_decisions(rows(signals), bars, rules=rules)
     with pytest.raises(ValueError, match="pending|New York|DAY"):
-        simulate(
+        replay(
             bars,
-            Signals(
+            script(
                 signals[:, 0].astype(np.int8),
                 signals[:, 1].astype(bool),
                 stop=signals[:, 2],
@@ -585,25 +569,33 @@ def test_sequential_cash_is_opt_in_and_default_is_batch_exact():
         costs=Costs(commission_per_side=0.1),
         sizing=Sizing(contracts=1),
         initial_cash=100000.0,
+        signal_fields=("entry_side", "exit"),
     )
-    fields = ("entry_side", "exit")
-    default = run(ReplayCore, bars, features={"signals": signals}, signal_fields=fields, **kw)[0]
-    sequential = run(
-        ReplayCore,
-        bars,
-        features={"signals": signals},
-        signal_fields=fields,
-        cash_accumulation="sequential",
-        **kw,
-    )[0]
-    batch = simulate(bars, Signals(signals[:, 0].astype(np.int8), signals[:, 1].astype(bool)), **kw)
-    pd.testing.assert_frame_equal(default.trades, batch.trades, check_exact=True)
-    pd.testing.assert_frame_equal(default.open_positions, batch.open_positions, check_exact=True)
-    expected = batch.trades.copy()
-    expected["equity_usd"] = np.fromiter(
-        accumulate(expected.pnl_usd, initial=kw["initial_cash"]), float
-    )[1:]
+    default = replay_decisions(rows(signals), bars, **kw)
+    sequential = replay_decisions(rows(signals), bars, cash_accumulation="sequential", **kw)
+    # Pinned from the legacy array-path engine at main 7a9b562f2 on these inputs:
+    # ten long round trips 100.0 -> 100.25 at $2/point less 2 x $0.1, batch equity
+    # initial_cash + k * 0.3 (each value the float nearest that decimal).
+    trades = default.trades
+    assert trades.entry_i.tolist() == list(range(0, 20, 2))
+    assert trades.exit_i.tolist() == list(range(1, 20, 2))
+    assert trades.side.tolist() == [1] * 10
+    assert trades.reason.tolist() == ["signal"] * 10
+    assert trades.entry_px.tolist() == [100.0] * 10
+    assert trades.exit_px.tolist() == [100.25] * 10
+    assert trades.contracts.tolist() == [1] * 10
+    assert trades.gross_usd.tolist() == [0.5] * 10
+    assert trades.pnl_usd.tolist() == [0.3] * 10
+    assert trades.equity_usd.tolist() == [
+        100000.3, 100000.6, 100000.9, 100001.2, 100001.5,
+        100001.8, 100002.1, 100002.4, 100002.7, 100003.0,
+    ]  # fmt: skip
+    assert default.open_positions.empty
+    # Sequential accumulates the pinned per-trade PnL in trade order.
+    expected = trades.copy()
+    expected["equity_usd"] = list(accumulate([0.3] * 10, initial=kw["initial_cash"]))[1:]
     pd.testing.assert_frame_equal(sequential.trades, expected, check_exact=True)
+    pd.testing.assert_frame_equal(sequential.open_positions, default.open_positions)
     assert not np.array_equal(default.trades.equity_usd, sequential.trades.equity_usd)
 
 

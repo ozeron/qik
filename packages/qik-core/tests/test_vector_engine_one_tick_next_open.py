@@ -8,6 +8,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from test_vector_engine import _case, _dense_case, _kernel_final, _nan_free, _ref_final, _ref_trades
@@ -28,7 +29,6 @@ from qik.vector_engine import (
     Profile,
     Rules,
     SessionBoundary,
-    Signals,
     Sizing,
     State,
     TickRound,
@@ -36,7 +36,6 @@ from qik.vector_engine import (
     enter,
     enter_limit_ioc,
     run,
-    simulate,
     strategy,
 )
 from qik.vector_engine import kernel as K
@@ -71,23 +70,23 @@ def tape(side: int = 1, rows: list[tuple[float, float, float, float]] = ROWS) ->
     return Bars(o, h, lo, c, index=index)
 
 
-def entry(side: int = 1, n: int = 4, **levels: float) -> Signals:
+def entry(side: int = 1, n: int = 4, exit: np.ndarray | None = None, **levels: float) -> Script:
     def first(value: float) -> np.ndarray:
         return np.r_[value, np.full(n - 1, NAN)]
 
-    return Signals(
+    return script(
         entry_side=np.r_[side, np.zeros(n - 1)].astype(np.int8),
-        exit=np.zeros(n, bool),
+        exit=np.zeros(n, bool) if exit is None else exit,
         **{name: first(value) for name, value in levels.items()},
     )
 
 
-def one_tick(sig: Signals, rules: Rules = RULES, side: int = 1) -> pd.DataFrame:
-    return simulate(tape(side), sig, rules=rules, instrument=INSTRUMENT, costs=Costs()).trades
+def one_tick(sig: Script, rules: Rules = RULES, side: int = 1) -> pd.DataFrame:
+    return replay(tape(side), sig, rules=rules, instrument=INSTRUMENT, costs=Costs()).trades
 
 
-def trade(rules: Rules, side: int, sig: Signals) -> pd.Series:
-    result = simulate(tape(side), sig, rules=rules, instrument=INSTRUMENT, costs=Costs())
+def trade(rules: Rules, side: int, sig: Script) -> pd.Series:
+    result = replay(tape(side), sig, rules=rules, instrument=INSTRUMENT, costs=Costs())
     assert len(result.trades) == 1
     return result.trades.iloc[0]
 
@@ -108,7 +107,7 @@ def test_entry_slips_and_protection_anchors_on_the_slipped_fill(side: int) -> No
 @pytest.mark.parametrize("side", [1, -1])
 def test_gap_stop_fills_one_tick_through_the_open(side: int) -> None:
     rows = [*ROWS[:3], (98.0, 98.5, 97.5, 98.0)]
-    t = simulate(
+    t = replay(
         tape(side, rows), entry(side, stop_points=3.0),
         rules=RULES, instrument=INSTRUMENT, costs=Costs(),
     ).trades.iloc[0]  # fmt: skip
@@ -140,7 +139,7 @@ def test_tick_round_and_combined_stop_use_the_slipped_fill(side: int) -> None:
 
 @pytest.mark.parametrize("side", [1, -1])
 def test_market_exits_slip_on_both_clocks(side: int) -> None:
-    sig = replace(entry(side), exit=np.array([False, True, False, False]))
+    sig = entry(side, exit=np.array([False, True, False, False]))
     t = trade(RULES, side, sig)
     assert (t.exit_i, t.exit_px) == (2, mirror(side, 100.75))  # bar 2 open 101 - tick
     t = trade(replace(RULES, exit_fill=FillTiming.CLOSE), side, sig)
@@ -151,13 +150,13 @@ def test_market_exits_slip_on_both_clocks(side: int) -> None:
 def test_flatten_and_boundary_exits_slip(side: int) -> None:
     session = trade(replace(RULES, flatten=Flatten.SESSION_END), side, entry(side))
     assert (session.exit_i, session.exit_px) == (3, mirror(side, 98.5))
-    flat = replace(entry(side), flatten=np.array([False, True, False, False]))
+    flat = entry(side).replace(flatten=np.array([False, True, False, False]))
     t = trade(RULES, side, flat)
     assert (t.exit_i, t.exit_px) == (2, mirror(side, 100.75))
     t = trade(replace(RULES, flatten=Flatten.LAST_BAR_CLOSE), side, flat)
     assert (t.exit_i, t.exit_px) == (1, mirror(side, 101.25))
     boundary = replace(RULES, session_boundary=SessionBoundary.LAST_BAR_CLOSE)
-    last = replace(entry(side), exit=np.array([False, False, False, True]))
+    last = entry(side, exit=np.array([False, False, False, True]))
     t = trade(boundary, side, last)
     assert (t.exit_i, t.exit_px) == (3, mirror(side, 98.5))
 
@@ -166,7 +165,7 @@ def test_flatten_and_boundary_exits_slip(side: int) -> None:
 def test_risk_sizing_clamp_and_costs_measure_the_slipped_fill(side: int) -> None:
     sizing = Sizing(risk_usd=1.0, max_contracts=5, min_qty_policy="clamp")
     costs = Costs(commission_per_side=1.0, slippage_ticks=1.0)
-    result = simulate(
+    result = replay(
         tape(side), entry(side, stop_points=2.0),
         rules=RULES, instrument=INSTRUMENT, costs=costs, sizing=sizing, initial_cash=1000.0,
     )  # fmt: skip
@@ -181,7 +180,7 @@ def test_one_tick_stop_is_in_the_market_after_slippage() -> None:
     with pytest.raises(ValueError, match="stop"):
         one_tick(entry(1, stop_points=TICK))
     default = replace(RULES, fill_model=FillModel.DEFAULT)
-    t = simulate(tape(), entry(1, stop_points=TICK), rules=default).trades.iloc[0]
+    t = replay(tape(), entry(1, stop_points=TICK), rules=default).trades.iloc[0]
     assert t.stop == 100.75
 
 
@@ -205,7 +204,7 @@ def test_refusals() -> None:
     with pytest.raises(ValueError, match="entry_limit_ioc ONE_TICK"):
         one_tick(entry(1, entry_limit_ioc=102.0))
     with pytest.raises(ValueError, match="Instrument"):
-        simulate(tape(), entry(1), rules=RULES)
+        replay(tape(), entry(1), rules=RULES)
 
 
 class S(State):
@@ -379,7 +378,7 @@ def test_slot_clock_overrides_depend_on_config_not_data(overrides: dict[str, str
     # amendment and one with a no-op amendment (same level) are both accepted and equal.
     rules = replace(RULES, **overrides)
     plain = one_tick(entry(1, stop_points=2.0), rules)
-    amended = replace(entry(1, stop_points=2.0), stop_update=np.array([NAN, 99.25, NAN, NAN]))
+    amended = entry(1, stop_points=2.0).replace(stop_update=np.array([NAN, 99.25, NAN, NAN]))
     pd.testing.assert_frame_equal(plain, one_tick(amended, rules), check_exact=True)
     assert plain.entry_px.tolist() == [101.25] and plain.stop.tolist() == [99.25]
 
@@ -405,7 +404,7 @@ def test_typed_ioc_one_tick_refused() -> None:
 
 @pytest.mark.parametrize("side", [1, -1])
 def test_combined_stop_clamp_and_proportional_costs(side: int) -> None:
-    result = simulate(
+    result = replay(
         tape(side),
         entry(side, stop=mirror(side, 99.5), stop_points=2.0),
         rules=replace(RULES, stop_combine="tighter", tick_round=TickRound.NEAREST),

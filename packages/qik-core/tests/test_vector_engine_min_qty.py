@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -25,14 +26,12 @@ from qik.vector_engine import (
     Profile,
     Result,
     Rules,
-    Signals,
     Sizing,
     State,
     TickRound,
     enter,
     exit,
     run,
-    simulate,
     strategy,
 )
 from qik.vector_engine.account import quantity
@@ -63,6 +62,15 @@ def risk_step(s: EmptyState, p: RiskParams, f: EmptyFeatures, bar: Bar, pos: Pos
     if bar.i == 1:
         return exit()
     return HOLD
+
+
+def zero_contracts(bar: int) -> str:
+    """Exact sizing refusal for a column whose entry rounds to zero contracts."""
+    return (
+        f"sizing gives 0 contracts for the entry at bar {bar}, config 0: Nautilus would not "
+        "enter, which changes every later trade of the config; raise the risk, set fixed "
+        "contracts, or tighten the stop"
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -127,11 +135,11 @@ def test_batch_clamp_matches_floor_to_one_projects() -> None:
     )
     side = np.where(rng.random(n) < 0.05, rng.choice([-1, 1], n), 0).astype(np.int8)
     stop = bars.close - side * rng.integers(2, 120, n) * 0.25
-    signals = Signals(side, np.zeros(n, bool), stop, bars.close + side * 8 * 0.25)
+    signals = script(side, np.zeros(n, bool), stop=stop, target=bars.close + side * 8 * 0.25)
     instrument = Instrument(tick=0.25, point_value=20)
 
     def sized(policy: Literal["refuse", "clamp"]) -> Result:
-        return simulate(
+        return replay(
             bars,
             signals,
             instrument=instrument,
@@ -139,8 +147,9 @@ def test_batch_clamp_matches_floor_to_one_projects() -> None:
             sizing=Sizing(risk_usd=300, max_contracts=4, min_qty_policy=policy),
         )
 
-    with pytest.raises(ValueError, match="0 contracts"):
+    with pytest.raises(ValueError) as refused:
         sized("refuse")
+    assert str(refused.value) == zero_contracts(28)
     clamped = sized("clamp")
     for frame in (clamped.trades, clamped.open_positions):
         risk = (frame.entry_px - frame.stop).abs() * 20
@@ -199,7 +208,8 @@ def test_python_jit_refusal_and_clamp(distance: float, phase: str) -> None:
             execute(Sizing(risk_usd=1), jit)
         errors.append(str(exc.value))
         results.append(execute(Sizing(risk_usd=1, min_qty_policy="clamp"), jit))
-    assert errors == [f"compiled core: {phase} sizing refused for config 0"] * 2
+    # Entry- and open-phase sizing both refuse with the entry bar (depends on t3/shim3-f1a).
+    assert errors == [zero_contracts(1)] * 2
 
     pd.testing.assert_frame_equal(results[0][0].trades, results[1][0].trades, check_exact=True)
     assert results[0][0].trades.contracts.tolist() == [1]
