@@ -3311,7 +3311,8 @@ def _core_decision(
         risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
         qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
         if qty < 0:
-            core.account[2] = 1
+            # Entry bar and sizing error code: the array path's refusal text needs both.
+            core.account[2], core.account[3], core.account[4] = 1, out_ei[k], -qty
             return
         net = settle(
             out_sd[k] * (out_xp[k] - out_ep[k]),
@@ -3333,7 +3334,7 @@ def _core_decision(
         risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
         qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
         if qty < 0:
-            core.account[2] = 2
+            core.account[2], core.account[3], core.account[4] = 2, ei, -qty
             return
         view[V_QTY] = qty
     view[V_WORK_SIDE], view[V_WORK_LEVEL] = work_side, work_level

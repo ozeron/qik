@@ -12,9 +12,10 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import Script, bracket_step, replay, script
 
 from qik.metrics import summarize_trades
-from qik.vector_engine import Bars, Costs, Instrument, Signals, Sizing, grid, simulate, stack
+from qik.vector_engine import Bars, Costs, Instrument, Sizing, grid, run
 
 TICK = 0.25
 INST = Instrument(tick=TICK, point_value=20.0)
@@ -30,21 +31,28 @@ def _tape(n: int = 3000, seed: int = 3, volume: float = 4000.0) -> Bars:
     return Bars(o, h, lo, c, index=idx, volume=np.full(n, volume))
 
 
-def _signals(bars: Bars, sl_ticks: int, tp_ticks: int, seed: int = 5) -> Signals:
+def _signals(bars: Bars, sl_ticks: int, tp_ticks: int, seed: int = 5) -> Script:
     rng = np.random.default_rng(seed)
     n = len(bars)
     side = np.where(rng.random(n) < 0.03, rng.choice([-1, 1], n), 0).astype(np.int8)
-    return Signals(
+    return script(
         side,
         np.zeros(n, bool),
-        bars.close - side * sl_ticks * TICK,
-        bars.close + side * tp_ticks * TICK,
+        stop=bars.close - side * sl_ticks * TICK,
+        target=bars.close + side * tp_ticks * TICK,
     )
 
 
-def _lv(levels: np.ndarray | None) -> np.ndarray:
-    assert levels is not None
-    return levels
+def _configs(bars: Bars, params: pd.DataFrame, tp: int = 9) -> list[Script]:
+    """One script per grid row, in config order (stop/target distances in ticks)."""
+    return [_signals(bars, row["sl"], row.get("tp", tp)) for row in params.to_dict("records")]
+
+
+def _lv(scripts: list[Script], name: str = "stop") -> np.ndarray:
+    """A declared level across configs, (n_bars, n_configs)."""
+    levels = [level for s in scripts if (level := s.get(name)) is not None]
+    assert len(levels) == len(scripts)
+    return np.hstack(levels)
 
 
 def _index(bars: Bars) -> pd.DatetimeIndex:
@@ -52,7 +60,7 @@ def _index(bars: Bars) -> pd.DatetimeIndex:
     return bars.index
 
 
-# -- grid / stack ------------------------------------------------------------------------------------
+# -- grid ------------------------------------------------------------------------------------
 
 
 def test_grid_is_the_cartesian_product_first_axis_slowest() -> None:
@@ -73,42 +81,88 @@ def test_grid_refuses_empty_or_string_axes(axes) -> None:
         grid(**axes)
 
 
+BRACKET_FIELDS = ("entry_side", "exit", "stop", "target")
+
+
+def _bracket_grid(bars: Bars, stop_ticks: list[int], target_ticks: list[int], **kw):
+    """One typed multi-config run of ``_signals``' side column (seed 5) over a tick grid."""
+    side = _signals(bars, 0, 0).entry_side[:, 0].astype(np.int64)
+    return run(
+        bracket_step,
+        bars,
+        grid={"stop_ticks": stop_ticks, "target_ticks": target_ticks},
+        features={"side": side, "close": bars.close},
+        signal_fields=BRACKET_FIELDS,
+        **kw,
+    )
+
+
 def test_stack_equals_hand_built_columns() -> None:
+    """A typed multi-config grid run equals each config replayed alone: no config bleeds."""
     bars = _tape(500)
     params = grid(sl=[4, 8], tp=[8, 16])
-    sig = stack(params, lambda sl, tp: _signals(bars, sl, tp))
-    assert sig.entry_side.shape == (500, 4)
+    batched = _bracket_grid(bars, [4, 8], [8, 16])
     rows = params.to_dict("records")
+    assert batched.params[["stop_ticks", "target_ticks"]].values.tolist() == [
+        [row["sl"], row["tp"]] for row in rows
+    ]
     for j, row in enumerate(rows):
-        one = _signals(bars, row["sl"], row["tp"])
-        np.testing.assert_array_equal(sig.entry_side[:, j], one.entry_side)
-        np.testing.assert_array_equal(_lv(sig.stop)[:, j], one.stop)
-        np.testing.assert_array_equal(_lv(sig.target)[:, j], one.target)
-    stacked = simulate(bars, sig).trades
-    for j, row in enumerate(rows):
-        alone = simulate(bars, _signals(bars, row["sl"], row["tp"])).trades.drop(columns="config")
-        mine = stacked[stacked.config == j].drop(columns="config").reset_index(drop=True)
-        pd.testing.assert_frame_equal(mine, alone)
+        alone = replay(bars, _signals(bars, row["sl"], row["tp"]))
+        pd.testing.assert_frame_equal(batched[j].trades, alone.trades)
+        pd.testing.assert_frame_equal(batched[j].open_positions, alone.open_positions)
 
 
-def test_stack_fills_missing_levels_with_nan_and_checks_shapes() -> None:
-    bars = _tape(50)
-    params = grid(with_stop=[True, False])
+def _sizing_bars(stopped: bool) -> Bars:
+    """Long entry at bar 0's close 100; bar 1 either stops a 10-point stop or holds it."""
+    low = 89.0 if stopped else 99.5
+    o = np.array([100.0, 100.0, 100.0, 100.0])
+    c = np.array([100.0, low + 0.5, 100.0, 100.0])
+    lo = np.array([99.75, low, 99.75, 99.75])
+    h = np.array([100.25, 100.25, 100.25, 100.25])
+    idx = pd.date_range("2023-01-03 15:00", periods=4, freq="5min", tz="UTC")
+    return Bars(o, h, lo, c, index=idx, volume=np.full(4, 4000.0))
 
-    def build(with_stop: bool) -> Signals:
-        s = _signals(bars, 4, 8)
-        return Signals(s.entry_side, s.exit, s.stop if with_stop else None, None)
 
-    sig = stack(params, build)
-    assert sig.target is None
-    assert np.isnan(_lv(sig.stop)[:, 1]).all() and not np.isnan(_lv(sig.stop)[:, 0]).all()
+@pytest.mark.parametrize("stopped", [True, False], ids=["settled_trade", "open_position"])
+@pytest.mark.parametrize("jit", [True, False])
+def test_typed_sizing_refusal_text_names_the_refused_config(stopped: bool, jit: bool) -> None:
+    """Config 0 (1-point stop) sizes; config 1 (10-point stop) is refused with the exact text.
 
-    def ragged(with_stop: bool) -> Signals:
-        n = 10 if with_stop else 11
-        return Signals(np.zeros(n, np.int8), np.zeros(n, bool))
-
-    with pytest.raises(ValueError, match="config 1"):
-        stack(params, ragged)
+    ``settled_trade``: the refused entry closes before it is ever sized as open (kernel's
+    settled-trade branch); ``open_position``: it is still open when sized.
+    """
+    bars = _sizing_bars(stopped)
+    side = np.array([1, 0, 0, 0], np.int64)
+    with pytest.raises(ValueError) as refused:
+        run(
+            bracket_step,
+            bars,
+            grid={"stop_ticks": [4, 40], "target_ticks": [400]},
+            features={"side": side, "close": bars.close},
+            signal_fields=BRACKET_FIELDS,
+            instrument=INST,
+            costs=Costs(),
+            sizing=Sizing(risk_usd=100.0),
+            jit=jit,
+        )
+    assert str(refused.value) == (
+        "sizing gives 0 contracts for the entry at bar 0, config 1: Nautilus would not enter, "
+        "which changes every later trade of the config; raise the risk, set fixed contracts, "
+        "or tighten the stop"
+    )
+    sized = run(
+        bracket_step,
+        bars,
+        grid={"stop_ticks": [4], "target_ticks": [400]},
+        features={"side": side, "close": bars.close},
+        signal_fields=BRACKET_FIELDS,
+        instrument=INST,
+        costs=Costs(),
+        sizing=Sizing(risk_usd=100.0),
+        jit=jit,
+    )
+    contracts = (sized[0].trades if stopped else sized[0].open_positions).contracts
+    assert contracts.tolist() == [5]
 
 
 # -- sizing ------------------------------------------------------------------------------------------
@@ -135,8 +189,8 @@ def test_fixed_contracts_scale_pnl_and_costs_and_keep_fills() -> None:
     bars = _tape()
     sig = _signals(bars, 6, 10)
     costs = Costs(commission_per_side=2.0, slippage_ticks=1)
-    one = simulate(bars, sig, instrument=INST, costs=costs)
-    three = simulate(bars, sig, instrument=INST, costs=costs, sizing=Sizing(contracts=3))
+    one = replay(bars, sig, instrument=INST, costs=costs)
+    three = replay(bars, sig, instrument=INST, costs=costs, sizing=Sizing(contracts=3))
     cols = ["config", "entry_i", "exit_i", "side", "entry_px", "exit_px", "reason"]
     pd.testing.assert_frame_equal(one.trades[cols], three.trades[cols])
     assert (one.trades.contracts == 1).all() and (three.trades.contracts == 3).all()
@@ -148,12 +202,12 @@ def test_fixed_contracts_scale_pnl_and_costs_and_keep_fills() -> None:
 def test_risk_usd_is_floor_of_budget_over_stop_risk_capped() -> None:
     bars = _tape()
     params = grid(sl=[3, 7, 13])
-    sig = stack(params, lambda sl: _signals(bars, sl, 9))
-    res = simulate(
+    sig = _configs(bars, params)
+    res = replay(
         bars, sig, instrument=INST, costs=Costs(), sizing=Sizing(risk_usd=500.0, max_contracts=12)
     )
     t = res.trades
-    stop = _lv(sig.stop)[t.entry_i.to_numpy(), t.config.to_numpy()]
+    stop = _lv(sig)[t.entry_i.to_numpy(), t.config.to_numpy()]
     risk = np.abs(t.entry_px.to_numpy() - stop) * INST.point_value
     want = np.minimum(np.floor(500.0 / risk + 1e-9), 12)
     np.testing.assert_array_equal(t.contracts.to_numpy(), want)
@@ -164,10 +218,10 @@ def test_risk_usd_is_floor_of_budget_over_stop_risk_capped() -> None:
 
 def test_risk_fraction_compounds_on_the_equity_before_each_trade() -> None:
     bars = _tape()
-    sig = stack(grid(sl=[5, 9]), lambda sl: _signals(bars, sl, 9))
+    sig = _configs(bars, grid(sl=[5, 9]))
     cash = 50_000.0
     costs = Costs(commission_per_side=1.5, slippage_ticks=1)
-    res = simulate(
+    res = replay(
         bars,
         sig,
         instrument=INST,
@@ -175,14 +229,14 @@ def test_risk_fraction_compounds_on_the_equity_before_each_trade() -> None:
         sizing=Sizing(risk_fraction=0.01),
         initial_cash=cash,
     )
-    unsized = simulate(bars, sig, instrument=INST, costs=costs).trades
+    unsized = replay(bars, sig, instrument=INST, costs=costs).trades
     per_contract_cost = 2 * (1.5 + 1 * TICK * INST.point_value)
     for j in (0, 1):
         equity = cash
         mine = res.trades[res.trades.config == j]
         base = unsized[unsized.config == j]
         for (_, t), (_, u) in zip(mine.iterrows(), base.iterrows(), strict=True):
-            risk = abs(t.entry_px - _lv(sig.stop)[t.entry_i, j]) * INST.point_value
+            risk = abs(t.entry_px - _lv(sig)[t.entry_i, j]) * INST.point_value
             n = math.floor(0.01 * equity / risk + 1e-9)
             assert t.contracts == n
             pnl = n * (u.gross_points * INST.point_value - per_contract_cost)
@@ -194,7 +248,7 @@ def test_risk_fraction_compounds_on_the_equity_before_each_trade() -> None:
 def test_zero_contracts_is_refused() -> None:
     bars = _tape()
     with pytest.raises(ValueError, match="0 contracts"):
-        simulate(
+        replay(
             bars,
             _signals(bars, 40, 9),
             instrument=INST,
@@ -207,7 +261,7 @@ def test_risk_sizing_needs_a_stop() -> None:
     bars = _tape()
     s = _signals(bars, 5, 9)
     with pytest.raises(ValueError, match="no stop"):
-        simulate(bars, Signals(s.entry_side, s.exit, None, s.target), instrument=INST, costs=Costs(),
+        replay(bars, script(s.entry_side, s.exit, target=s.get("target")), instrument=INST, costs=Costs(),
                  sizing=Sizing(risk_usd=1000.0))  # fmt: skip
 
 
@@ -215,16 +269,16 @@ def test_sizing_needs_instrument_and_fraction_needs_cash() -> None:
     bars = _tape(200)
     sig = _signals(bars, 5, 9)
     with pytest.raises(ValueError, match="instrument"):
-        simulate(bars, sig, sizing=Sizing(contracts=2))
+        replay(bars, sig, sizing=Sizing(contracts=2))
     with pytest.raises(ValueError, match="initial_cash"):
-        simulate(bars, sig, instrument=INST, costs=Costs(), sizing=Sizing(risk_fraction=0.01))
+        replay(bars, sig, instrument=INST, costs=Costs(), sizing=Sizing(risk_fraction=0.01))
 
 
 def test_running_out_of_cash_is_refused() -> None:
     bars = _tape()
     sig = _signals(bars, 5, 9)
     with pytest.raises(ValueError, match="out of cash"):
-        simulate(bars, sig, instrument=INST, costs=Costs(50.0), sizing=Sizing(contracts=5),
+        replay(bars, sig, instrument=INST, costs=Costs(50.0), sizing=Sizing(contracts=5),
                  initial_cash=1_000.0)  # fmt: skip
 
 
@@ -236,13 +290,13 @@ def test_liquidity_limit_is_max_of_floor_volume_quarter_and_one() -> None:
         b = Bars(
             bars.open, bars.high, bars.low, bars.close, index=bars.index, volume=np.full(n, volume)
         )
-        simulate(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed))
+        replay(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed))
         with pytest.raises(ValueError, match="liquidity"):
-            simulate(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed + 1))
+            replay(b, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=allowed + 1))
     no_volume = Bars(bars.open, bars.high, bars.low, bars.close)
-    simulate(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=1))
+    replay(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=1))
     with pytest.raises(ValueError, match="volume"):
-        simulate(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=2))
+        replay(no_volume, sig, instrument=INST, costs=Costs(), sizing=Sizing(contracts=2))
 
 
 # -- summary -----------------------------------------------------------------------------------------
@@ -251,8 +305,9 @@ def test_liquidity_limit_is_max_of_floor_volume_quarter_and_one() -> None:
 def test_summary_is_qik_metrics_per_config() -> None:
     bars = _tape()
     params = grid(sl=[5, 9], tp=[9])
-    sig = stack(params, lambda sl, tp: _signals(bars, sl, tp))
-    res = simulate(bars, sig, instrument=INST, costs=Costs(2.0, 1), initial_cash=100_000.0)
+    res = replay(
+        bars, _configs(bars, params), instrument=INST, costs=Costs(2.0, 1), initial_cash=100_000.0
+    )
     out = res.summary()
     assert list(out.index) == [0, 1]
     sessions = sorted(set(pd.Series(_index(bars)).dt.tz_convert("America/New_York").dt.date))
@@ -277,10 +332,14 @@ def test_summary_keeps_configs_without_trades() -> None:
     bars = _tape(300)
     s = _signals(bars, 5, 9)
     side = np.column_stack([s.entry_side, np.zeros(len(bars), np.int8)])
-    stop, target = _lv(s.stop), _lv(s.target)
-    sig = Signals(side, np.zeros(side.shape, bool), np.column_stack([stop, stop]),
-                  np.column_stack([target, target]))  # fmt: skip
-    out = simulate(bars, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
+    stop, target = _lv([s]), _lv([s], "target")
+    sig = script(
+        side,
+        np.zeros(side.shape, bool),
+        stop=np.column_stack([stop, stop]),
+        target=np.column_stack([target, target]),
+    )
+    out = replay(bars, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
     assert len(out) == 2 and out.loc[1, "n_trades"] == 0 and out.loc[0, "n_trades"] > 0
 
 
@@ -288,28 +347,12 @@ def test_summary_needs_usd_index_and_cash() -> None:
     bars = _tape(300)
     sig = _signals(bars, 5, 9)
     with pytest.raises(ValueError, match="instrument"):
-        simulate(bars, sig, initial_cash=1e5).summary()
+        replay(bars, sig, initial_cash=1e5).summary()
     with pytest.raises(ValueError, match="initial_cash"):
-        simulate(bars, sig, instrument=INST, costs=Costs()).summary()
+        replay(bars, sig, instrument=INST, costs=Costs()).summary()
     plain = Bars(bars.open, bars.high, bars.low, bars.close)
     with pytest.raises(ValueError, match="index"):
-        simulate(plain, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
-
-
-def test_stack_keeps_every_signal_field() -> None:
-    n = 4
-
-    def build(off: int) -> Signals:
-        lim = np.full(n, np.nan)
-        lim[0] = 100.0 - off * TICK
-        pts = np.where(np.isfinite(lim), 1.0, np.nan)
-        return Signals(np.array([1, 0, 0, 0], np.int8), np.zeros(n, bool), entry_limit=lim,
-                       stop_points=pts, target_points=pts)  # fmt: skip
-
-    sig = stack(grid(off=[1, 2]), build)
-    assert sig.entry_limit is not None and sig.stop_points is not None
-    assert sig.target_points is not None and sig.stop is None and sig.target is None
-    np.testing.assert_array_equal(sig.entry_limit[0], [100.0 - TICK, 100.0 - 2 * TICK])
+        replay(plain, sig, instrument=INST, costs=Costs(), initial_cash=1e5).summary()
 
 
 def test_sizing_integers_must_be_integers() -> None:

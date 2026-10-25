@@ -6,9 +6,11 @@ import math
 
 import numpy as np
 import pytest
+from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from qik.vector_engine import Bars, Costs, Instrument
 from qik.vector_engine import account as A
 from qik.vector_engine import protection as P
 from qik.vector_engine import reference as R
@@ -151,48 +153,26 @@ def test_protection_close_ties_and_gaps(side, flatten, stop_offset, target_offse
 
 @pytest.mark.parametrize("handling", ["raise", "warn"])
 def test_batch_cost_overflow_respects_numpy_errstate(handling: str) -> None:
-    from qik.vector_engine import Bars, Costs, Instrument, Signals, simulate
-
     price = np.full(2, 1e308)
     bars = Bars(price, price, price, price)
-    signals = Signals(entry_side=np.array([1, 0], np.int8), exit=np.array([False, True]))
+    signals = script(np.array([1, 0]), np.array([False, True]))
     context = (
         pytest.raises(FloatingPointError, match="overflow encountered in add")
         if handling == "raise"
         else pytest.warns(RuntimeWarning, match="overflow encountered in add")
     )
     with np.errstate(over=handling), context:
-        simulate(bars, signals, instrument=Instrument(0.25, 1.0), costs=Costs(proportional_bps=1.0))
+        replay(bars, signals, instrument=Instrument(0.25, 1.0), costs=Costs(proportional_bps=1.0))
 
 
-@pytest.mark.parametrize("typed", [False, True])
-def test_host_fixed_cost_preserves_numpy_scalar_promotion(typed: bool) -> None:
-    from test_vector_engine_compiled import ReplayCore
-
-    from qik.vector_engine import Bars, Costs, Instrument, Signals, run, simulate
-
+@pytest.mark.parametrize("jit", [False, True])
+def test_host_fixed_cost_preserves_numpy_scalar_promotion(jit: bool) -> None:
     price = np.array([100.0, 101.0])
     bars = Bars(price, price, price, price)
     instrument = Instrument(np.float32(0.01), np.float32(1.1))
     costs = Costs(commission_per_side=0.1, slippage_ticks=0.3)
-    kwargs = dict(instrument=instrument, costs=costs)
-    if typed:
-        signals = np.full((2, 15), np.nan)
-        signals[:, (0, 1, 12, 13, 14)] = 0
-        signals[0, 0], signals[1, 1] = 1, 1
-        result = run(
-            ReplayCore,
-            bars,
-            features={"signals": signals},
-            signal_fields=("entry_side", "exit"),
-            **kwargs,
-        )[0]
-    else:
-        result = simulate(
-            bars,
-            Signals(np.array([1, 0], np.int8), np.array([False, True])),
-            **kwargs,
-        )
+    signals = script(np.array([1, 0]), np.array([False, True]))
+    result = replay(bars, signals, instrument=instrument, costs=costs, jit=jit)
     friction = 2.0 * (
         costs.commission_per_side + costs.slippage_ticks * instrument.tick * instrument.point_value
     )

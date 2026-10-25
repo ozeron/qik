@@ -5,6 +5,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 
 from qik.vector_engine import (
     Bars,
@@ -16,15 +17,10 @@ from qik.vector_engine import (
     Profile,
     Rules,
     SessionBoundary,
-    Signals,
     Sizing,
     TargetGap,
     TickRound,
-    grid,
     require_nautilus,
-    signals_from_core,
-    simulate,
-    stack,
 )
 
 
@@ -57,9 +53,9 @@ def test_repro_admission_all_values(field, enum) -> None:
         with pytest.raises(ValueError, match="repro"):
             Rules(**{field: value})
         for profile in (Profile.REPRO, Profile.TRADINGVIEW):
-            result = simulate(
+            result = replay(
                 tape(),
-                Signals([0] * 4, [False] * 4),
+                script([0] * 4, [False] * 4),
                 rules=Rules(profile=profile, **{field: value}),
                 instrument=Instrument(0.25, 1),
                 costs=Costs(),
@@ -74,7 +70,7 @@ def test_repro_admission_all_values(field, enum) -> None:
 def test_session_labels_boundary_exit_and_terminal_entry(side: int, slots: bool) -> None:
     b = tape(labels=np.array(["day1", "day1", "day2", "day2"]))
     mask = np.array([False, True, False, False])
-    sig = Signals(
+    sig = script(
         [side, 0, 0, 0],
         [False] * 4,
         exit_long=mask if side > 0 else None,
@@ -83,19 +79,17 @@ def test_session_labels_boundary_exit_and_terminal_entry(side: int, slots: bool)
     )
     rules = Rules(profile=Profile.REPRO, exit_fill=FillTiming.NEXT_OPEN)
     with pytest.raises(ValueError, match="session end"):
-        simulate(b, sig, rules=rules)
-    fallback = simulate(
-        b, sig, rules=replace(rules, session_boundary=SessionBoundary.LAST_BAR_CLOSE)
-    )
+        replay(b, sig, rules=rules)
+    fallback = replay(b, sig, rules=replace(rules, session_boundary=SessionBoundary.LAST_BAR_CLOSE))
     assert fallback.trades.exit_i.tolist() == [1]
     assert fallback.trades.exit_px.tolist() == [101.0]
-    across = simulate(b, sig, rules=replace(rules, session_boundary=SessionBoundary.NEXT_OBSERVED))
+    across = replay(b, sig, rules=replace(rules, session_boundary=SessionBoundary.NEXT_OBSERVED))
     assert across.trades.exit_i.tolist() == [2]
     assert across.trades.exit_px.tolist() == [102.0]
     # Entries at a terminal decision are refused, never silently dropped.
-    terminal = Signals([0, 0, 0, side], [False] * 4, stop_update=sig.stop_update)
+    terminal = script([0, 0, 0, side], [False] * 4, stop_update=sig.get("stop_update"))
     with pytest.raises(ValueError, match="session end"):
-        simulate(
+        replay(
             b,
             terminal,
             rules=replace(
@@ -104,7 +98,7 @@ def test_session_labels_boundary_exit_and_terminal_entry(side: int, slots: bool)
                 session_boundary=SessionBoundary.LAST_BAR_CLOSE,
             ),
         )
-    ended = simulate(
+    ended = replay(
         b,
         terminal,
         rules=replace(rules, entry_fill=FillTiming.NEXT_OPEN, flatten=Flatten.SESSION_END),
@@ -115,42 +109,42 @@ def test_session_labels_boundary_exit_and_terminal_entry(side: int, slots: bool)
 @pytest.mark.parametrize("mode", list(Flatten))
 def test_flatten_intent_and_boundary(mode: Flatten) -> None:
     b = tape()
-    sig = Signals([1, 0, 0, 0], [False] * 4, flatten=[False, False, False, True])
+    sig = script([1, 0, 0, 0], [False] * 4, flatten=[False, False, False, True])
     rules = Rules(profile=Profile.REPRO, flatten=mode)
     if mode is Flatten.NEXT_OPEN:
         with pytest.raises(ValueError, match="session end"):
-            simulate(b, sig, rules=rules)
+            replay(b, sig, rules=rules)
         rules = replace(rules, session_boundary=SessionBoundary.LAST_BAR_CLOSE)
-    r = simulate(b, sig, rules=rules)
+    r = replay(b, sig, rules=rules)
     assert r.trades.exit_i.tolist() == [3]
     assert r.trades.exit_px.tolist() == [103.0]
     with pytest.raises(ValueError, match="repro"):
-        simulate(b, sig)
+        replay(b, sig)
 
 
 def test_flatten_cancels_resting_entry_and_suppresses_new_entry() -> None:
     b = tape()
-    sig = Signals(
+    sig = script(
         [1, 0, 0, 1],
         [False] * 4,
         entry_stop=[105, np.nan, np.nan, 106],
         stop=[99, np.nan, np.nan, 99],
     )
-    r = simulate(b, sig, rules=Rules(profile=Profile.REPRO, flatten=Flatten.SESSION_END))
+    r = replay(b, sig, rules=Rules(profile=Profile.REPRO, flatten=Flatten.SESSION_END))
     assert r.trades.empty and r.open_positions.empty
 
 
 @pytest.mark.parametrize("side", [1, -1])
 def test_proportional_costs_and_fractional_compounding(side: int) -> None:
     b = tape(6, volume=np.full(6, 100.0))
-    sig = Signals(
+    sig = script(
         [side, 0, side, 0, side, 0],
         [False, True, False, True, False, True],
         stop=np.full(6, 90 if side > 0 else 110),
     )
     instr = Instrument(0.25, 10, lot_step=0.01, min_qty=0.01)
     costs = Costs(commission_per_side=0.2, slippage_ticks=0.5, proportional_bps=7)
-    r = simulate(
+    r = replay(
         b,
         sig,
         instrument=instr,
@@ -172,9 +166,9 @@ def test_proportional_costs_and_fractional_compounding(side: int) -> None:
 
 def test_fractional_grid_minimum_open_and_liquidity() -> None:
     b = tape(volume=np.full(4, 6.0))
-    sig = Signals([1, 0, 0, 0], [False] * 4)
+    sig = script([1, 0, 0, 0], [False] * 4)
     instr = Instrument(0.25, 1, lot_step=0.1, min_qty=0.1)
-    r = simulate(
+    r = replay(
         b,
         sig,
         instrument=instr,
@@ -183,7 +177,7 @@ def test_fractional_grid_minimum_open_and_liquidity() -> None:
     )
     assert r.open_positions.contracts.tolist() == [1.5]
     with pytest.raises(ValueError, match="liquidity"):
-        simulate(
+        replay(
             b,
             sig,
             instrument=instr,
@@ -191,7 +185,7 @@ def test_fractional_grid_minimum_open_and_liquidity() -> None:
             sizing=Sizing(contracts=1.6, lot_step=0.1, min_qty=0.1),
         )
     with pytest.raises(ValueError, match="quantity grid"):
-        simulate(
+        replay(
             b,
             sig,
             instrument=Instrument(0.25, 1),
@@ -199,9 +193,9 @@ def test_fractional_grid_minimum_open_and_liquidity() -> None:
             sizing=Sizing(contracts=0.1, lot_step=0.1, min_qty=0.1),
         )
     with pytest.raises(ValueError, match="0 contracts"):
-        simulate(
+        replay(
             b,
-            replace(sig, stop=[99, 99, 99, 99]),
+            sig.replace(stop=[99, 99, 99, 99]),
             instrument=instr,
             costs=Costs(),
             sizing=Sizing(risk_usd=0.01, lot_step=0.1, min_qty=0.1),
@@ -216,57 +210,40 @@ def test_fractional_grid_minimum_open_and_liquidity() -> None:
             Sizing(**kw)
 
 
-def test_directional_core_stack_fields_are_boolean_and_optional() -> None:
-    class Core:
-        def step(self, bar):
-            return Decision(side=1 if bar.i == 0 else 0, exit_short=True, exit_long=bar.i == 2)
-
+def test_directional_exits_are_optional_per_config() -> None:
     b = tape()
-    s = signals_from_core(Core, b)
-    assert s.exit_long.dtype == bool
-    result = simulate(b, s)
-    assert result.trades.exit_i.tolist() == [2]
-    both = stack(
-        grid(which=[True, False]), lambda which: s if which else Signals([1, 0, 0, 0], [False] * 4)
+    s = script(
+        [1, 0, 0, 0], [False] * 4, exit_short=[True] * 4, exit_long=[False, False, True, False]
     )
-    assert both.exit_long.dtype == bool
-    assert both.exit_long[:, 1].tolist() == [False] * 4
-    assert simulate(b, both).open_positions.config.tolist() == [1]
+    assert replay(b, s).trades.exit_i.tolist() == [2]
+    # A config without directional exits holds; the other's exits stay its own.
+    assert replay(b, [s, script([1, 0, 0, 0], [False] * 4)]).open_positions.config.tolist() == [1]
 
 
 def test_tick_round_requires_instrument_and_none_keeps_refusal() -> None:
     b = tape()
-    s = Signals([1, 0, 0, 0], [False, True, False, False], stop=[99.89, np.nan, np.nan, np.nan])
+    s = script([1, 0, 0, 0], [False, True, False, False], stop=[99.89, np.nan, np.nan, np.nan])
     with pytest.raises(ValueError, match="off the"):
-        simulate(b, s, instrument=Instrument(0.25, 1), costs=Costs())
+        replay(b, s, instrument=Instrument(0.25, 1), costs=Costs())
     with pytest.raises(ValueError, match="Instrument"):
-        simulate(b, s, rules=Rules(profile=Profile.REPRO, tick_round=TickRound.UP))
+        replay(b, s, rules=Rules(profile=Profile.REPRO, tick_round=TickRound.UP))
 
 
 def test_last_close_flatten_needs_no_calendar_and_default_quantity_is_admitted() -> None:
     b = Bars([100, 101], [100, 101], [100, 101], [100, 101])
-    sig = Signals([1, 0], [False, False], flatten=[False, True])
-    r = simulate(b, sig, rules=Rules(profile=Profile.REPRO, flatten=Flatten.LAST_BAR_CLOSE))
+    sig = script([1, 0], [False, False], flatten=[False, True])
+    r = replay(b, sig, rules=Rules(profile=Profile.REPRO, flatten=Flatten.LAST_BAR_CLOSE))
     assert r.trades.exit_px.tolist() == [101.0]
     with pytest.raises(ValueError, match="quantity grid"):
-        simulate(
+        replay(
             b,
-            Signals([1, 0], [False, True]),
+            script([1, 0], [False, True]),
             instrument=Instrument(0.25, 1, lot_step=0.3, min_qty=0.3),
             costs=Costs(),
         )
 
 
-def test_signal_and_decision_positional_fields_remain_compatible() -> None:
-    from qik.vector_engine.api import SIGNAL_FIELDS
-
-    old_fields = [np.array([i], float) for i in range(12)]
-    sig = Signals(*old_fields)
-    assert sig.stop is old_fields[2] and sig.breakeven_offset_points is old_fields[-1]
-    assert sig.flatten is sig.exit_long is sig.exit_short is None
-    full = replace(sig, exit_long=np.array([True]))
-    copied = Signals(*(getattr(full, name) for name in SIGNAL_FIELDS))
-    assert copied.exit_long.tolist() == [True]
+def test_decision_positional_fields_remain_compatible() -> None:
     d = Decision(1, False, 99, 102)
     assert d.stop == 99 and d.target == 102
     assert not (d.flatten or d.exit_long or d.exit_short)
@@ -280,9 +257,9 @@ def test_next_observed_does_not_extend_day_order_lifetime(kind: str) -> None:
         if kind == "limit"
         else {"entry_stop": [105, np.nan, np.nan, np.nan]}
     )
-    sig = Signals([1, 0, 0, 0], [False] * 4, stop=[95, np.nan, np.nan, np.nan], **kwargs)
+    sig = script([1, 0, 0, 0], [False] * 4, stop=[95, np.nan, np.nan, np.nan], **kwargs)
     with pytest.raises(ValueError, match="New York|calendar day"):
-        simulate(
+        replay(
             b,
             sig,
             rules=Rules(
@@ -301,7 +278,7 @@ def test_cross_session_flatten_cannot_bypass_day_admission(kind: str) -> None:
         if kind == "limit"
         else {"entry_stop": [105, np.nan, np.nan, np.nan]}
     )
-    sig = Signals(
+    sig = script(
         [1, 0, 0, 0],
         [False] * 4,
         stop=[95, np.nan, np.nan, np.nan],
@@ -309,7 +286,7 @@ def test_cross_session_flatten_cannot_bypass_day_admission(kind: str) -> None:
         **entry,
     )
     with pytest.raises(ValueError, match="New York|calendar day"):
-        simulate(
+        replay(
             b,
             sig,
             rules=Rules(
@@ -323,4 +300,4 @@ def test_cross_session_flatten_cannot_bypass_day_admission(kind: str) -> None:
 def test_custom_sessions_cannot_change_nautilus_day_contract() -> None:
     b = tape(labels=np.array(["a", "a", "a", "a"]))
     with pytest.raises(ValueError, match="repro"):
-        simulate(b, Signals([1, 0, 0, 0], [False, False, False, True]))
+        replay(b, script([1, 0, 0, 0], [False, False, False, True]))

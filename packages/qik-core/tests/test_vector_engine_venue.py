@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from _typed_scripts import replay, script
 
 from qik.vector_engine import (
     Bars,
@@ -15,8 +16,6 @@ from qik.vector_engine import (
     MarketFill,
     Profile,
     Rules,
-    Signals,
-    simulate,
 )
 
 
@@ -38,11 +37,11 @@ def test_venue_rules_are_typed_and_exclude_next_open() -> None:
 def test_one_tick_needs_instrument_and_keeps_compliance() -> None:
     c = np.array([100.0, 101.0, 102.0, 103.0])
     bars = Bars(c, c + 1, c - 1, c)
-    sig = Signals(np.array([1, 0, 0, 0]), np.array([False, False, True, False]))
+    sig = script(np.array([1, 0, 0, 0]), np.array([False, False, True, False]))
     rules = Rules(latency_bars=1, fill_model=FillModel.ONE_TICK)
     with pytest.raises(ValueError, match="Instrument"):
-        simulate(bars, sig, rules=rules)
-    res = simulate(bars, sig, rules=rules, instrument=Instrument(0.25, 1.0), costs=Costs())
+        replay(bars, sig, rules=rules)
+    res = replay(bars, sig, rules=rules, instrument=Instrument(0.25, 1.0), costs=Costs())
     assert res.compliance is Compliance.NAUTILUS and res.deployable
     assert res.trades[["entry_i", "exit_i", "entry_px", "exit_px"]].values.tolist() == [
         [1, 3, 101.25, 102.75]

@@ -8,10 +8,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules, Signals, simulate
+from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules
 from qik.vector_engine import kernel as K
 from qik.vector_engine.reference import simulate_column_reference
 
@@ -278,17 +279,17 @@ def test_next_open_equals_shifted_close_for_unprotected_markets(
     index = pd.date_range("2023-01-03 10:00", periods=len(rows), freq="min", tz="UTC")
     # Decision closes differ from fill opens, to catch accidentally filling at the decision price.
     bars = Bars(price, price + 2, price - 2, price + 1, index=index)
-    repro = simulate(
+    repro = replay(
         bars,
-        Signals(side, exit_),
+        script(side, exit_),
         rules=Rules(
             profile=Profile.TRADINGVIEW,
             market_fill=MarketFill.NEXT_OPEN,
         ),
     )
-    close = simulate(
+    close = replay(
         Bars(price, price + 2, price - 2, price, index=index),
-        Signals(np.r_[0, side[:-1]], np.r_[False, exit_[:-1]]),
+        script(np.r_[0, side[:-1]], np.r_[False, exit_[:-1]]),
     )
     pd.testing.assert_frame_equal(repro.trades, close.trades)
     pd.testing.assert_frame_equal(repro.open_positions, close.open_positions)
@@ -469,9 +470,9 @@ def test_simulate_basic_long_target_and_costs() -> None:
         [(100.0, 100.5, 99.5, 100.0), (100.0, 101.0, 99.75, 100.75), (100.75, 102.0, 100.5, 101.5)]
     )
     side = np.array([1, 0, 0], np.int8)
-    sig = Signals(entry_side=side, exit=np.zeros(3, bool), stop=np.array([99.0, np.nan, np.nan]),
-                  target=np.array([101.5, np.nan, np.nan]))  # fmt: skip
-    res = simulate(
+    sig = script(side, np.zeros(3, bool), stop=np.array([99.0, np.nan, np.nan]),
+                 target=np.array([101.5, np.nan, np.nan]))  # fmt: skip
+    res = replay(
         bars,
         sig,
         instrument=Instrument(TICK, 50.0),
@@ -497,7 +498,7 @@ def test_simulate_many_configs_independent() -> None:
     side[0, :] = 1
     stop = np.full((5, 3), np.nan)
     stop[0] = [99.75, 99.0, 98.0]
-    res = simulate(bars, Signals(entry_side=side, exit=np.zeros((5, 3), bool), stop=stop))
+    res = replay(bars, script(side, np.zeros((5, 3), bool), stop=stop))
     assert res.n_configs == 3
     by = res.trades.set_index("config")
     assert (
@@ -509,8 +510,7 @@ def test_index_adds_times() -> None:
     idx = pd.date_range("2024-01-02 14:30", periods=2, freq="1min", tz="UTC")
     bars = Bars(np.array([100.0, 100.0]), np.array([101.0, 101.0]), np.array([99.0, 99.0]),
                 np.array([100.0, 100.0]), index=idx)  # fmt: skip
-    sig = Signals(entry_side=np.array([1, 0], np.int8), exit=np.array([False, True]))
-    res = simulate(bars, sig)
+    res = replay(bars, script(np.array([1, 0]), np.array([False, True])))
     assert res.trades.iloc[0].entry_time == idx[0] and res.trades.iloc[0].exit_time == idx[1]
 
 
@@ -535,46 +535,37 @@ def test_bars_validation(bad) -> None:
 def test_signal_validation() -> None:
     bars = _bars([(100.0, 101.0, 99.0, 100.0)] * 3)
     ok_exit = np.zeros(3, bool)
-    with pytest.raises(ValueError, match="entry_side must be"):
-        simulate(bars, Signals(entry_side=np.array([2, 0, 0], np.int8), exit=ok_exit))
-    with pytest.raises(ValueError, match="shape"):
-        simulate(bars, Signals(entry_side=np.zeros(2, np.int8), exit=ok_exit))
+    with pytest.raises(ValueError, match="side must be -1, 0 or"):
+        replay(bars, script(np.array([2, 0, 0]), ok_exit))
+    with pytest.raises(ValueError, match="expected length 3"):
+        replay(bars, script(np.zeros(2), ok_exit[:2]))
     with pytest.raises(ValueError, match="finite or NaN"):
-        simulate(
-            bars,
-            Signals(
-                entry_side=np.zeros(3, np.int8), exit=ok_exit, stop=np.array([np.inf, 1.0, 1.0])
-            ),
-        )
+        replay(bars, script(np.zeros(3), ok_exit, stop=np.array([np.inf, 1.0, 1.0])))
     with pytest.raises(ValueError, match="costs need an instrument"):
-        simulate(bars, Signals(entry_side=np.zeros(3, np.int8), exit=ok_exit), costs=Costs(1.0))
+        replay(bars, script(np.zeros(3), ok_exit), costs=Costs(1.0))
     with pytest.raises(ValueError, match="stale_book"):
         Rules(stale_book="yes")  # ty: ignore[invalid-argument-type]
 
 
 def test_off_tick_level_refused() -> None:
     bars = _bars([(100.0, 101.0, 99.0, 100.0)] * 2)
-    sig = Signals(
-        entry_side=np.array([1, 0], np.int8), exit=np.zeros(2, bool), stop=np.array([99.9, np.nan])
-    )
+    sig = script(np.array([1, 0]), np.zeros(2, bool), stop=np.array([99.9, np.nan]))
     with pytest.raises(ValueError, match="tick grid"):
-        simulate(bars, sig, instrument=Instrument(TICK, 50.0), costs=Costs())
+        replay(bars, sig, instrument=Instrument(TICK, 50.0), costs=Costs())
 
 
 def test_stop_at_close_refused() -> None:
     bars = _bars([(100.0, 101.0, 99.0, 100.0)] * 2)
-    sig = Signals(
-        entry_side=np.array([1, 0], np.int8), exit=np.zeros(2, bool), stop=np.array([100.0, np.nan])
-    )
+    sig = script(np.array([1, 0]), np.zeros(2, bool), stop=np.array([100.0, np.nan]))
     with pytest.raises(ValueError, match="not beyond the entry close"):
-        simulate(bars, sig)
+        replay(bars, sig)
 
 
-def _stale_case():
+def _stale_case() -> tuple[Bars, Script]:
     bars = _bars([(3956.5, 3957.0, 3952.5, 3954.25), (3954.25, 3954.5, 3943.0, 3943.0)])
-    sig = Signals(
-        entry_side=np.array([-1, -1], np.int8),
-        exit=np.zeros(2, bool),
+    sig = script(
+        np.array([-1, -1]),
+        np.zeros(2, bool),
         stop=np.array([3954.75, 3950.0]),
         target=np.array([3953.75, np.nan]),
     )
@@ -584,8 +575,8 @@ def _stale_case():
 def test_stale_book_error_then_nautilus_mode() -> None:
     bars, sig = _stale_case()
     with pytest.raises(ValueError, match="stale"):
-        simulate(bars, sig)
-    res = simulate(bars, sig, rules=Rules(stale_book="nautilus"))
+        replay(bars, sig)
+    res = replay(bars, sig, rules=Rules(stale_book="nautilus"))
     assert list(res.trades.reason) == ["target"]
     held = res.open_positions.iloc[0]
     assert (held.entry_i, held.entry_px, held.side) == (
@@ -597,7 +588,7 @@ def test_stale_book_error_then_nautilus_mode() -> None:
 
 def test_stale_book_avoided_without_same_bar_reentry() -> None:
     bars, sig = _stale_case()
-    res = simulate(bars, sig, rules=Rules(reenter_on_exit_bar=False))
+    res = replay(bars, sig, rules=Rules(reenter_on_exit_bar=False))
     assert list(res.trades.reason) == ["target"] and res.open_positions.empty
 
 
@@ -612,45 +603,46 @@ def _limit_bars(n_days: int = 1) -> Bars:
     return Bars(o, h, lo, c, index=idx)
 
 
-def _limit_sig(**levels: np.ndarray) -> Signals:
+def _limit_sig(**levels: np.ndarray) -> Script:
     nan = np.full(3, np.nan)
-    return Signals(entry_side=np.array([1, 0, 0], np.int8), exit=np.zeros(3, bool),
-                   entry_limit=np.array([99.0, np.nan, np.nan]),
-                   **{k: levels.get(k, nan) for k in ("stop", "target")})  # fmt: skip
+    return script(np.array([1, 0, 0]), np.zeros(3, bool),
+                  entry_limit=np.array([99.0, np.nan, np.nan]),
+                  **{k: levels.get(k, nan) for k in ("stop", "target")})  # fmt: skip
 
 
 def test_limit_entry_needs_a_stop_and_dates() -> None:
     bars = _limit_bars()
     tgt = np.array([101.0, np.nan, np.nan])
     with pytest.raises(ValueError, match="needs a stop"):
-        simulate(bars, _limit_sig(target=tgt))  # V2 sends no protection without a stop
+        replay(bars, _limit_sig(target=tgt))  # V2 sends no protection without a stop
     stop = np.array([98.0, np.nan, np.nan])
     no_index = Bars(bars.open, bars.high, bars.low, bars.close)
     with pytest.raises(ValueError, match="index"):
-        simulate(no_index, _limit_sig(stop=stop))
+        replay(no_index, _limit_sig(stop=stop))
     assert bars.index is not None
     naive = Bars(bars.open, bars.high, bars.low, bars.close, index=bars.index.tz_localize(None))
     with pytest.raises(ValueError, match="timezone-aware"):
-        simulate(naive, _limit_sig(stop=stop))
-    res = simulate(bars, _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
+        replay(naive, _limit_sig(stop=stop))
+    res = replay(bars, _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
     assert res.trades.empty and res.open_positions.empty  # never filled, never chased
 
 
 def test_limit_entry_working_into_a_new_day_is_refused() -> None:
     stop = np.array([98.0, np.nan, np.nan])
     with pytest.raises(ValueError, match="new New York date"):
-        simulate(_limit_bars(n_days=2), _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
-    cancelled = _limit_sig(stop=stop)
+        replay(_limit_bars(n_days=2), _limit_sig(stop=stop), rules=Rules(limit_chase_bars=5))
     exit_ = np.array([False, True, False])  # cancelled before the session ends: fine
-    simulate(_limit_bars(n_days=2), Signals(cancelled.entry_side, exit_, cancelled.stop,
-             entry_limit=cancelled.entry_limit), rules=Rules(limit_chase_bars=5))  # fmt: skip
+    cancelled = script(
+        np.array([1, 0, 0]), exit_, stop=stop, entry_limit=np.array([99.0, np.nan, np.nan])
+    )
+    replay(_limit_bars(n_days=2), cancelled, rules=Rules(limit_chase_bars=5))
 
 
 def test_explicit_inputs_are_required() -> None:
     bars = _bars([(100.0, 101.0, 99.0, 100.0)] * 2)
-    sig = Signals(entry_side=np.array([1, 0], np.int8), exit=np.array([False, True]))
+    sig = script(np.array([1, 0]), np.array([False, True]))
     with pytest.raises(ValueError, match="costs"):
-        simulate(bars, sig, instrument=Instrument(TICK, 50.0))  # no silent zero costs
+        replay(bars, sig, instrument=Instrument(TICK, 50.0))  # no silent zero costs
     for bad in ({"commission_per_side": -1.0}, {"slippage_ticks": float("nan")}):
         with pytest.raises(ValueError, match="non-negative"):
             Costs(**bad)

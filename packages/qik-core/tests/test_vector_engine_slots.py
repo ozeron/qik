@@ -7,25 +7,23 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import infinite_stop_update_step, replay, script, stop_update_step
 
 from qik.vector_engine import (
     Bars,
     Compliance,
     Costs,
-    Decision,
     FillModel,
     Instrument,
     MarketFill,
     Profile,
     Rules,
-    Signals,
     Sizing,
-    check_causal,
-    signals_from_core,
-    simulate,
+    run,
 )
 from qik.vector_engine import kernel as K
 from qik.vector_engine.reference import simulate_column_reference
+from qik.vector_engine.testing import assert_causal
 
 
 def _bars(n: int = 5) -> Bars:
@@ -50,71 +48,54 @@ def test_slot_rules_validate_and_next_open_accepts_slots() -> None:
     ):
         with pytest.raises(ValueError, match=field):
             Rules(**{field: "unknown"})
-    sig = Signals(np.array([1, 0, 0, 0, 0]), np.zeros(5, bool), entry_stop=np.full(5, 101.0))
-    assert simulate(
+    sig = script(np.array([1, 0, 0, 0, 0]), np.zeros(5, bool), entry_stop=np.full(5, 101.0))
+    assert replay(
         _bars(), sig, rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN)
     ).trades.empty
     with pytest.raises(ValueError, match="both entry_stop and entry_limit"):
-        simulate(_bars(), replace(sig, entry_limit=np.full(5, 99.0)))
+        replay(_bars(), sig.replace(entry_limit=np.full(5, 99.0)))
     with pytest.raises(ValueError, match="timezone-aware"):
-        simulate(replace(_bars(), index=None), sig)
+        replay(replace(_bars(), index=None), sig)
     with pytest.raises(ValueError, match="positive"):
-        simulate(_bars(), replace(sig, stop_update=np.full(5, 0.0)))
+        replay(_bars(), sig.replace(stop_update=np.full(5, 0.0)))
     with pytest.raises(ValueError, match="finite or NaN"):
-        simulate(_bars(), replace(sig, target_update=np.full(5, np.inf)))
-    with pytest.raises(ValueError, match="same number of configs"):
-        simulate(_bars(), replace(sig, stop_update=np.ones((5, 2))))
+        replay(_bars(), sig.replace(target_update=np.full(5, np.inf)))
     with pytest.raises(ValueError, match="off the.*tick grid"):
-        simulate(
+        replay(
             _bars(),
-            replace(sig, stop_update=np.full(5, 99.1)),
+            sig.replace(stop_update=np.full(5, 99.1)),
             instrument=Instrument(0.25, 1),
             costs=Costs(),
         )
 
 
 def test_slot_decisions_and_deployability_include_empty_results() -> None:
-    class Core:
-        def step(self, bar):
-            return Decision(
-                side=1 if bar.i == 0 else 0,
-                entry_stop=101.0,
-                stop_update=99.0,
-                target_update=103.0,
-                breakeven_after_points=2.0,
-                breakeven_offset_points=0.25,
-                stop=98.0,
-            )
-
-    sig = signals_from_core(Core, _bars())
-    for name in (
-        "entry_stop",
-        "stop_update",
-        "target_update",
-        "breakeven_after_points",
-        "breakeven_offset_points",
-    ):
-        assert getattr(sig, name) is not None
-    np.testing.assert_array_equal(sig.entry_stop, np.full(5, 101.0))
-    np.testing.assert_array_equal(sig.stop_update, np.full(5, 99.0))
-    np.testing.assert_array_equal(sig.target_update, np.full(5, 103.0))
-    np.testing.assert_array_equal(sig.breakeven_after_points, np.full(5, 2.0))
-    np.testing.assert_array_equal(sig.breakeven_offset_points, np.full(5, 0.25))
-    res = simulate(_bars(), sig, instrument=Instrument(0.25, 1), costs=Costs(), initial_cash=10000)
+    every_bar = np.full(5, 1.0)
+    sig = script(
+        np.array([1, 0, 0, 0, 0]),
+        np.zeros(5, bool),
+        stop=98.0 * every_bar,
+        entry_stop=101.0 * every_bar,
+        stop_update=99.0 * every_bar,
+        target_update=103.0 * every_bar,
+        breakeven_after_points=2.0 * every_bar,
+        breakeven_offset_points=0.25 * every_bar,
+    )
+    res = replay(_bars(), sig, instrument=Instrument(0.25, 1), costs=Costs(), initial_cash=10000)
     assert res.compliance is Compliance.NAUTILUS and res.deployable
     assert res.trades.empty
     assert res.summary().deployable.tolist() == [True]
-    assert simulate(
-        _bars(), Signals(np.zeros(5), np.zeros(5)), rules=Rules(target_order="mit")
+    assert replay(
+        _bars(), script(np.zeros(5), np.zeros(5)), rules=Rules(target_order="mit")
     ).deployable
 
 
 @pytest.mark.parametrize("latency", [0, 1])
 @pytest.mark.parametrize("fill", [FillModel.DEFAULT, FillModel.ONE_TICK])
 def test_proven_callback_models_deploy_but_absolute_oto_does_not(latency, fill):
-    signals = Signals(np.zeros(5), np.zeros(5))
+    signals = script(np.zeros(5), np.zeros(5))
     for protection, expected in (("callback", True), ("oto", False)):
-        result = simulate(
+        result = replay(
             _bars(),
             signals,
             rules=Rules(
@@ -129,27 +110,27 @@ def test_proven_callback_models_deploy_but_absolute_oto_does_not(latency, fill):
 
 def test_unproved_slot_contracts_and_repro_remain_research_only():
     side = np.array([1, 0, 0, 0, 0])
-    sig = Signals(side, np.array([False, False, False, True, False]), stop=np.full(5, 90.0))
+    sig = script(side, np.array([False, False, False, True, False]), stop=np.full(5, 90.0))
     for rules, signals in (
         (Rules(target_order="mit", adaptive_high_low_ordering=True), sig),
         (Rules(target_order="mit", reenter_on_exit_bar=False), sig),
-        (Rules(target_order="mit"), replace(sig, stop=None)),
+        (Rules(target_order="mit"), sig.replace(stop=None)),
         (Rules(target_order="mit", profile=Profile.TRADINGVIEW), sig),
         (Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN), sig),
     ):
-        assert not simulate(_bars(), signals, rules=rules).deployable
+        assert not replay(_bars(), signals, rules=rules).deployable
 
 
 def test_amendments_preserve_entry_risk_for_sizing() -> None:
     b = _bars()
     su = np.array([np.nan, 99.0, np.nan, np.nan, np.nan])
-    sig = Signals(
+    sig = script(
         np.array([1, 0, 0, 0, 0]),
         np.array([False, False, True, False, False]),
         stop=np.full(5, 98.0),
         stop_update=su,
     )
-    result = simulate(
+    result = replay(
         b, sig, instrument=Instrument(0.25, 1), costs=Costs(), sizing=Sizing(risk_usd=10)
     )
     assert result.trades.contracts.tolist() == [5]
@@ -159,15 +140,15 @@ def test_amendments_preserve_entry_risk_for_sizing() -> None:
 
 def test_slot_refusals_and_stop_entry_skip() -> None:
     side, exit_ = np.array([1, 0, 0, 0, 0]), np.zeros(5, bool)
-    sig = Signals(side, exit_, stop=np.full(5, 98.0), entry_stop=np.full(5, 100.0))
+    sig = script(side, exit_, stop=np.full(5, 98.0), entry_stop=np.full(5, 100.0))
     with pytest.raises(ValueError, match="stop entry.*in the market"):
-        simulate(_bars(), sig)
-    skipped = simulate(_bars(), sig, rules=Rules(stop_entry_in_market="skip"))
+        replay(_bars(), sig)
+    skipped = replay(_bars(), sig, rules=Rules(stop_entry_in_market="skip"))
     assert skipped.trades.empty and skipped.open_positions.empty and skipped.deployable
     with pytest.raises(ValueError, match="new New York date"):
-        simulate(
+        replay(
             replace(_bars(), index=pd.date_range("2023-01-03", periods=5, freq="D", tz="UTC")),
-            replace(sig, entry_stop=np.full(5, 101.0)),
+            sig.replace(entry_stop=np.full(5, 101.0)),
         )
     for field, value, message in (
         ("entry_limit", np.full(5, 99.0), "entry_limit / chase"),
@@ -177,13 +158,13 @@ def test_slot_refusals_and_stop_entry_skip() -> None:
         if field == "stop_points":
             values["stop"] = None
         with pytest.raises(ValueError, match=message):
-            simulate(_bars(), replace(sig, **values), rules=Rules(protection="oto"))
+            replay(_bars(), sig.replace(**values), rules=Rules(protection="oto"))
     with pytest.raises(ValueError, match="no working order"):
-        simulate(_bars(), Signals(side, exit_, target_update=np.full(5, 103.0)))
+        replay(_bars(), script(side, exit_, target_update=np.full(5, 103.0)))
     with pytest.raises(ValueError, match="conflicts with breakeven"):
-        simulate(
+        replay(
             _bars(),
-            Signals(
+            script(
                 side,
                 exit_,
                 stop=np.full(5, 98.0),
@@ -192,29 +173,35 @@ def test_slot_refusals_and_stop_entry_skip() -> None:
             ),
         )
     with pytest.raises(ValueError, match="needs an entry stop"):
-        simulate(_bars(), Signals(side, exit_, breakeven_after_points=np.full(5, 1.0)))
+        replay(_bars(), script(side, exit_, breakeven_after_points=np.full(5, 1.0)))
     with pytest.raises(ValueError, match="needs breakeven_after_points"):
-        simulate(_bars(), Signals(side, exit_, breakeven_offset_points=np.full(5, 0.25)))
+        replay(_bars(), script(side, exit_, breakeven_offset_points=np.full(5, 0.25)))
 
 
 def test_causality_cuts_on_amendments_without_entry_signals() -> None:
-    def peek(b):
+    def peek(b: Bars) -> dict[str, np.ndarray]:
         update = np.full(len(b), np.nan)
         update[1] = float(len(b))
-        return Signals(np.zeros(len(b)), np.zeros(len(b), bool), stop_update=update)
+        return {"stop_update": update}
 
-    with pytest.raises(ValueError, match="look-ahead: stop_update at bar 1"):
-        check_causal(peek, _bars(), spaced=0)
+    with pytest.raises(AssertionError, match="not prefix-causal"):
+        assert_causal(
+            stop_update_step,
+            _bars(),
+            2,
+            features=peek,
+            signal_fields=("entry_side", "exit", "stop_update"),
+        )
 
 
 def test_invalid_core_slot_is_not_silently_dropped() -> None:
-    class InvalidCore:
-        def step(self, bar):
-            return Decision(stop_update=np.inf)
-
-    sig = signals_from_core(InvalidCore, _bars())
     with pytest.raises(ValueError, match="finite or NaN"):
-        simulate(_bars(), sig)
+        run(
+            infinite_stop_update_step,
+            _bars(),
+            features={"stop_update": np.full(5, np.nan)},
+            signal_fields=("entry_side", "exit", "stop_update"),
+        )
 
 
 @pytest.mark.parametrize(

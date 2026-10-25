@@ -49,6 +49,7 @@ from .api import (
     _one_tick_clock_slots,
     _raise_kernel_error,
     _simulate,
+    _sizing_error,
 )
 from .api import (
     Result as EngineResult,
@@ -115,7 +116,7 @@ def _run(
     # A bar can close existing protection and a new same-bar bracket: at most two trades.
     width = 2 * n
     counts = np.empty(k, np.int64)
-    meta = np.empty((k, 6))
+    meta = np.empty((k, 8))
     a0s, a1s = np.empty((k, width), np.int64), np.empty((k, width), np.int64)
     a2s, a5s = np.empty((k, width), np.int8), np.empty((k, width), np.int8)
     a3s, a4s, a6s = np.empty((k, width)), np.empty((k, width)), np.empty((k, width))
@@ -135,7 +136,8 @@ def _run(
         view = np.full(14, np.nan)
         view[K.V_LAST_EXIT_I] = -1
         decision = np.empty(31)
-        account = np.array([0.0, initial_cash, 0.0])
+        # seen trades, equity, refusal code, sizing refusal bar and sizing error code
+        account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0])
         core = K.CoreContext(
             step,
             _initial_core_state(init_state, cores, j),
@@ -300,6 +302,8 @@ def _run(
         meta[j, 3] = result[4]
         meta[j, 4] = result[5]
         meta[j, 5] = result[6]
+        meta[j, 6] = account[3]
+        meta[j, 7] = account[4]
         # Preserve original decisions rather than the boundary-transformed engine masks.
         bools_all[j, 0] = force_open
     return (
@@ -543,8 +547,7 @@ def _run_arrays(
             price = float(bars.open[bar] if next_open else bars.close[bar])
             _raise_kernel_error(int(meta[j, 0]), bar, j, price, next_open=next_open)
         if cnt < 0:
-            phase = "entry" if cnt == -1 else "open"
-            raise ValueError(f"compiled core: {phase} sizing refused for config {j}")
+            _sizing_error(int(meta[j, 7]), j, int(meta[j, 6]))
         # Validation and accounting use the existing API; the matcher is not run again.
         sig = Signals(
             decisions[j, 0].astype(np.int8),

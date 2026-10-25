@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from _typed_scripts import replay, script
 
 from qik.vector_engine import (
     Bars,
@@ -14,9 +15,7 @@ from qik.vector_engine import (
     MarketFill,
     Profile,
     Rules,
-    Signals,
     require_nautilus,
-    simulate,
 )
 
 
@@ -39,9 +38,9 @@ def test_typed_defaults_and_refusals() -> None:
 @pytest.mark.parametrize("empty", [False, True])
 def test_result_tags_guard_and_summary(profile: Profile, empty: bool) -> None:
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="US/Eastern"))
-    result = simulate(
+    result = replay(
         bars,
-        Signals(np.array([0 if empty else 1, 0, 0]), np.array([False, True, False])),
+        script(np.array([0 if empty else 1, 0, 0]), np.array([False, True, False])),
         rules=Rules(profile=profile),
         instrument=Instrument(tick=1, point_value=1),
         costs=Costs(),
@@ -62,9 +61,9 @@ def test_result_tags_guard_and_summary(profile: Profile, empty: bool) -> None:
 @pytest.mark.parametrize("index", [None, pd.date_range("2023-01-03", periods=3, freq="min")])
 def test_next_open_requires_timezone(index: pd.DatetimeIndex | None) -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
-        simulate(
+        replay(
             _bars(index),
-            Signals(np.array([1, 0, 0]), np.zeros(3, bool)),
+            script(np.array([1, 0, 0]), np.zeros(3, bool)),
             rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN),
         )
 
@@ -72,9 +71,9 @@ def test_next_open_requires_timezone(index: pd.DatetimeIndex | None) -> None:
 def test_next_open_refuses_limit_entries() -> None:
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
     with pytest.raises(ValueError, match="entry_limit"):
-        simulate(
+        replay(
             bars,
-            Signals(
+            script(
                 np.array([1, 0, 0]), np.zeros(3, bool), entry_limit=np.array([99, np.nan, np.nan])
             ),
             rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN),
@@ -87,20 +86,20 @@ def test_exit_clock_preserves_limit_entry_stop_requirement(
     profile: Profile, exit_fill: MarketFill
 ) -> None:
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
-    signals = Signals(
+    signals = script(
         np.array([1, 0, 0]),
         np.array([False, True, False]),
         entry_limit=np.array([101.0, np.nan, np.nan]),
     )
     with pytest.raises(ValueError, match="limit entry needs a stop"):
-        simulate(bars, signals, rules=Rules(profile=profile, exit_fill=exit_fill))
+        replay(bars, signals, rules=Rules(profile=profile, exit_fill=exit_fill))
 
 
 def test_next_open_tags_are_repro() -> None:
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
-    result = simulate(
+    result = replay(
         bars,
-        Signals(np.array([1, 0, 0]), np.array([False, True, False])),
+        script(np.array([1, 0, 0]), np.array([False, True, False])),
         rules=Rules(profile=Profile.TRADINGVIEW, market_fill=MarketFill.NEXT_OPEN),
     )
     assert result.compliance is Compliance.REPRO_TRADINGVIEW
@@ -144,9 +143,9 @@ def test_generic_repro_tags_and_boundary(platform: str, empty: bool) -> None:
     from qik.vector_engine import BracketAnchor, BracketPolicy, FillTiming
 
     bars = _bars(pd.date_range("2023-01-03 10:00", periods=3, freq="min", tz="UTC"))
-    result = simulate(
+    result = replay(
         bars,
-        Signals(np.array([0 if empty else 1, 0, 0]), np.array([False, True, False])),
+        script(np.array([0 if empty else 1, 0, 0]), np.array([False, True, False])),
         rules=Rules(
             profile=Profile.REPRO,
             author_platform=platform,
