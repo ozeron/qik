@@ -27,7 +27,8 @@ from qik.vector_engine import (
     strategy,
 )
 from qik.vector_engine import kernel as K
-from qik.vector_engine.compiled import RULES_WIDTH, _bound
+from qik.vector_engine.api import SIGNAL_FIELDS
+from qik.vector_engine.compiled import RULES_WIDTH, _bound, _Buffers, _layout
 from qik.vector_engine.testing import (
     ReplayParams,
     ReplayState,
@@ -50,6 +51,11 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
     """One recorded column through the strategy-bound runner of typed replay_step."""
     features = replay_features(decisions)
     clock = np.full(len(c), -1, np.int64)
+    # Every field stored, as the batch path stores them; rounding and the sizing risk row
+    # follow the rules the way run() derives them.
+    everything = frozenset(range(len(SIGNAL_FIELDS)))
+    layout = _layout(everything, everything, bool(rc[13]), bool(slots and rc[8] and rc[5]))
+    store, trades = _Buffers().take(1, layout.nrows, len(c), 2 * len(c))
     raw = _bound(replay_step).run(
         _EMPTY,
         _EMPTY,
@@ -65,13 +71,20 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
         np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0]),
         np.nan,
         slots,
+        layout.context,
+        layout.level_rows,
+        store,
+        trades,
+        np.full(len(c), np.nan),
+        np.full((12, 0), np.nan),
+        layout.risk_row,
         None,
         masks,
         np.empty(0, np.bool_),
         np.empty(0, np.bool_) if expiry_days is None else expiry_days,
         False,
     )
-    return raw[:-1]  # drop the final (empty) state rows
+    return (raw[0], raw[1], *trades)  # the final (empty) state rows are dropped
 
 
 def compare(*args, **kwargs):

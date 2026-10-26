@@ -88,7 +88,7 @@ def _fill_then_protect(
         reason = REASON_PROTECT_FAIL
     elif _in_market(s, tg, ci, False):
         reason = REASON_TARGET
-    if reason != 0 and not count_only:
+    if reason != 0 and not count_only and k < len(out_entry_i):
         out_entry_i[k] = i
         out_exit_i[k] = i
         out_side[k] = s

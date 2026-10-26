@@ -197,46 +197,47 @@ def _bound_step(state, params, i, feats, o, h, lo, c, v, view, out):
 """
 
 _RUNNER_SOURCE = """@nb.njit(parallel=True, cache=True)
-def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, days, ends, rules, economic, initial_cash, slots, cores=None, masks=None, session_days=None, expiry_days=None, pair_declared=False):
+def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, days, ends, rules, economic, initial_cash, slots, layout, level_rows, store, trades, blank, blank_pairs, risk_row, cores=None, masks=None, session_days=None, expiry_days=None, pair_declared=False):
     init_state = init_state.copy()
     if len(rules) != RULES_WIDTH:
         raise ValueError(f'compiled Rules ABI requires exactly {RULES_WIDTH} values')
     if pair_declared and (not slots):
         raise ValueError('straddle requires the slots scheduler')
     k, n = (len(params_grid), len(c))
-    width = 2 * n
     counts = np.empty(k, np.int64)
-    meta = np.empty((k, 8))
-    a0s, a1s = (np.empty((k, width), np.int64), np.empty((k, width), np.int64))
-    a2s, a5s = (np.empty((k, width), np.int8), np.empty((k, width), np.int8))
-    a3s, a4s, a6s = (np.empty((k, width)), np.empty((k, width)), np.empty((k, width)))
-    sides_all, exits_all = (np.zeros((k, n), np.int8), np.zeros((k, n), np.bool_))
-    levels_all = np.full((k, 26, n), np.nan)
-    bools_all = np.zeros((k, 3, n), np.bool_)
-    decisions_all = np.full((k, 31, n), np.nan)
-    sizing_risks_all = np.full((k, n), np.nan)
+    meta = np.empty((k, 9))
+    a0s, a1s, a2s, a3s, a4s, a5s, a6s = trades
+    rows = level_rows
+    pairs = rows[11]
     for column in nb.prange(k):
         j = np.int64(column)
-        sides, exits, levels = (sides_all[j], exits_all[j], levels_all[j])
-        long_exits, short_exits = (bools_all[j, 1], bools_all[j, 2])
+        # Buffers are reused across config batches: every stored row starts unvisited.
+        levels = store[j]
+        levels[:] = np.nan
+        sides, exits = (np.zeros(n, np.int8), np.zeros(n, np.bool_))
+        long_exits, short_exits = (np.zeros(n, np.bool_), np.zeros(n, np.bool_))
         force_close, force_open = (np.zeros(n, np.int8), np.zeros(n, np.bool_))
         if masks is not None and len(masks) > 0:
             force_close[:] = masks[j, 0]
             force_open[:] = masks[j, 1]
+        straddle = levels[pairs:pairs + 12] if pairs >= 0 else blank_pairs
         view = np.full(14, np.nan)
         view[K.V_LAST_EXIT_I] = -1
         decision = np.empty(31)
-        account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0])
-        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None or len(session_days) == 0 else session_days, ends, economic, account, int(rules[20]), int(rules[21]), rules[9], int(rules[13]), decisions_all[j], bool(rules[6]), int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]) + 16 * int(rules[25]) + 32 * int(rules[26]) + 64 * int(rules[5]) + 128 * int(rules[28]), sizing_risks_all[j])
+        # seen trades, equity, refusal code, sizing refusal bar, sizing error code and
+        # the bit set of undeclared fields the core emitted
+        account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0, 0.0])
+        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None or len(session_days) == 0 else session_days, ends, economic, account, int(rules[20]), int(rules[21]), rules[9], int(rules[13]), K._layout_context(layout), bool(rules[6]), int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]) + 16 * int(rules[25]) + 32 * int(rules[26]) + 64 * int(rules[5]) + 128 * int(rules[28]), K._level_row(levels, blank, risk_row))
         a0, a1, a2, a3, a4, a5, a6 = (a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j])
         slip = rules[9] if rules[8] else 0.0
         combine = int(rules[22]) if len(rules) > 22 else 0
         arm_stop = bool(rules[25])
         day_cancel = bool(rules[26])
         if slots:
-            result = K._compiled_slots_column(o, h, lo, c, sides, exits, levels[0], levels[1], levels[2], levels[3], levels[4], days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), slip, levels[5], levels[6], levels[7], levels[8], levels[9], bool(rules[15]), bool(rules[16]), bool(rules[17]), bool(rules[18]), bool(rules[19]), bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, levels[10], combine=int(rules[22]), amend_close=bool(rules[23]), completed_close=bool(rules[24]), arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, straddle=levels[11:23], from_open=levels[23], stop_fracs=levels[24], target_fracs=levels[25], next_bar=bool(rules[27]), exit_and_rearm=bool(rules[28]))
+            result = K._compiled_slots_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), slip, K._level_row(levels, blank, rows[5]), K._level_row(levels, blank, rows[6]), K._level_row(levels, blank, rows[7]), K._level_row(levels, blank, rows[8]), K._level_row(levels, blank, rows[9]), bool(rules[15]), bool(rules[16]), bool(rules[17]), bool(rules[18]), bool(rules[19]), bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), combine=int(rules[22]), amend_close=bool(rules[23]), completed_close=bool(rules[24]), arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, straddle=straddle, from_open=K._level_row(levels, blank, rows[23]), stop_fracs=K._level_row(levels, blank, rows[24]), target_fracs=K._level_row(levels, blank, rows[25]), next_bar=bool(rules[27]), exit_and_rearm=bool(rules[28]))
         else:
-            result = K._compiled_column(o, h, lo, c, sides, exits, levels[0], levels[1], levels[2], levels[3], levels[4], days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), bool(rules[8]), rules[9], bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, levels[10], combine, arm_stop, day_cancel, expiry_days)
+            result = K._compiled_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), bool(rules[8]), rules[9], bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), combine, arm_stop, day_cancel, expiry_days)
+        # Negative counts carry refusals out of prange without exceptions.
         counts[j] = -int(account[2]) if account[2] else result[0]
         meta[j, 0] = result[1]
         meta[j, 1] = result[2]
@@ -246,6 +247,6 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
         meta[j, 5] = result[6]
         meta[j, 6] = account[3]
         meta[j, 7] = account[4]
-        bools_all[j, 0] = force_open
-    return (counts, meta, a0s, a1s, a2s, a3s, a4s, a5s, a6s, sides_all, exits_all, levels_all, bools_all, sizing_risks_all, decisions_all)
+        meta[j, 8] = account[5]
+    return (counts, meta)
 """

@@ -11,8 +11,9 @@ import pytest
 
 from qik.vector_engine import Decision
 from qik.vector_engine import kernel as K
+from qik.vector_engine.api import SIGNAL_FIELDS
 from qik.vector_engine.bound import write_bound_module
-from qik.vector_engine.compiled import RULES_WIDTH
+from qik.vector_engine.compiled import RULES_WIDTH, _Buffers, _layout
 
 
 @nb.njit(cache=True)
@@ -49,6 +50,10 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     rules[0] = 1
     rules[7] = int(mode == "venue")
     days = np.zeros(len(x), bool)
+    everything = frozenset(range(len(SIGNAL_FIELDS)))
+    layout = _layout(everything, everything, False, False)
+    store, trades = _Buffers().take(2, layout.nrows, len(x), 2 * len(x))
+    blank = np.full(len(x), np.nan)
     args = (
         states,
         params,
@@ -64,6 +69,13 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0]),
         1000.0,
         mode == "slots",
+        layout.context,
+        layout.level_rows,
+        store,
+        trades,
+        blank,
+        np.full((12, 0), np.nan),
+        layout.risk_row,
     )
     if rules_width != RULES_WIDTH:
         with pytest.raises(
@@ -72,8 +84,8 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
             module.run(*args)
         return
     raw = module.run(*args)
-    decisions = raw[-1]
-    assert raw[-2].shape == (2, len(x))  # Submitted sizing risk, before the Decision array.
+    # Every field stored: the decision rows are the store rows in Signals order.
+    decisions = store[:, layout.rows]
     assert decisions.shape == (2, 31, len(x))
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
     batch = K.run_columns(
@@ -103,6 +115,6 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         start, end = batch[1][j : j + 2]
         np.testing.assert_array_equal(raw[1][j, :2], [batch[2][j], batch[3][j]])
         for q in range(7):
-            np.testing.assert_array_equal(raw[q + 2][j, :count], batch[q + 8][start:end])
+            np.testing.assert_array_equal(trades[q][j, :count], batch[q + 8][start:end])
     if not nb.config.DISABLE_JIT:
         assert not any(item.library.has_dynamic_globals for item in module.run.overloads.values())

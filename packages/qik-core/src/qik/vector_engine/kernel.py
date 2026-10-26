@@ -112,7 +112,8 @@ def _venue_record(
     out_reason,
     out_stop,
 ):
-    if not count_only:
+    # The bound: a compiled run's buffer may be smaller than the count; it then reruns.
+    if not count_only and k < len(out_entry_i):
         out_entry_i[k], out_exit_i[k], out_side[k] = ei, i, side
         out_entry_px[k], out_exit_px[k] = ep, px
         out_reason[k], out_stop[k] = why, stop
@@ -1089,7 +1090,7 @@ def _column_advance(state, i, inputs, core=None):
             cnt += 1
         pos, pend, market_entry, market_exit, exited = 0, 0, -1, False, True
     if market_exit:
-        if not count_only:
+        if not count_only and base + cnt < len(out_entry_i):
             k = base + cnt
             out_entry_i[k] = entry_i
             out_exit_i[k] = i
@@ -1341,7 +1342,7 @@ def _column_advance(state, i, inputs, core=None):
                 if reason != 0:
                     break
         if reason != 0:
-            if not count_only:
+            if not count_only and base + cnt < len(out_entry_i):
                 k = base + cnt
                 out_entry_i[k] = entry_i
                 out_exit_i[k] = i
@@ -1598,7 +1599,7 @@ def _column_advance(state, i, inputs, core=None):
     # --- decisions at bar i's close (on_bar): market orders fill at c[i] ---
     if exit_now and not exit_next_open:
         if pos != 0:
-            if not count_only:
+            if not count_only and base + cnt < len(out_entry_i):
                 k = base + cnt
                 out_entry_i[k] = entry_i
                 out_exit_i[k] = i
@@ -3231,8 +3232,37 @@ V_LAST_EXIT_I, V_LAST_EXIT_PX, V_LAST_EXIT_REASON, V_EQUITY = range(8, 12)
 CoreContext = namedtuple(
     "CoreContext",
     "step state params feats volume position_view decision sides exits levels long_exits short_exits "
-    "force_close force_open days ends economic account flatten_mode boundary tick rounding decisions exit_next_open pair_rules sizing_risks",
+    "force_close force_open days ends economic account flatten_mode boundary tick rounding layout exit_next_open pair_rules sizing_risks",
 )
+
+# CoreContext.layout is six integers: an array field access refcounts and a tuple indexed
+# at run time spills, and the core runs once per bar. CoreContext.levels rows, in order:
+# stored fields outside the straddle legs (Signals order); the raw decision of each leg
+# whose level _core_decision transforms; the twelve-row leg block the matcher reads (a
+# transformed leg's own row, otherwise that leg's decision); own rows for levels 2 and 5.
+# (stored fields, declared fields, transformed legs, own levels 2/5, block row, own row).
+
+
+@nb.njit(cache=True, inline="always")
+def _layout_context(codes):
+    return codes[0], codes[1], codes[2], codes[3], codes[4], codes[5]
+
+
+@nb.njit(cache=True, inline="always")
+def _level_row(store, blank, row):
+    """One matcher input column: a stored row, or the read-only all-NaN row."""
+    return store[row] if row >= 0 else blank
+
+
+@nb.njit(cache=True, inline="always")
+def _put_level(levels, layout, row, i, value):
+    """Write a level the core transforms; other levels are read from their field's row."""
+    legs, own, block, extra = layout[2], layout[3], layout[4], layout[5]
+    if 11 <= row <= 22:
+        if legs >> (row - 11) & 1:
+            levels[block + row - 11, i] = value
+    elif own >> row & 1:
+        levels[extra + (1 if row == 5 and own & 4 else 0), i] = value
 
 
 @nb.njit(cache=False, inline="always")
@@ -3268,18 +3298,23 @@ def _core_decision(
     ``next_px`` (the following bar's open) resolves open-relative triggers after the core
     returned; the core never sees it, and the position view publishes it only later.
     """
-    seen = int(core.account[0])
-    if core.account[2]:
+    account = core.account
+    seen = int(account[0])
+    if account[2]:
+        return
+    if cnt > len(out_ei):
+        # The trade buffer is smaller than the worst case; the caller reruns this config.
+        account[2] = 9
         return
     pv, friction, bps, mode, amount, cap, lot, minimum = core.economic[:8]
     clamp = len(core.economic) > 8 and bool(core.economic[8])
     for k in range(seen, cnt):
         points = core.sizing_risks[out_ei[k]]
         risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
-        qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
+        qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
         if qty < 0:
             # Entry bar and sizing error code: the array path's refusal text needs both.
-            core.account[2], core.account[3], core.account[4] = 1, out_ei[k], -qty
+            account[2], account[3], account[4] = 1, out_ei[k], -qty
             return
         net = settle(
             out_sd[k] * (out_xp[k] - out_ep[k]),
@@ -3287,11 +3322,11 @@ def _core_decision(
             friction,
             fill_cost(out_ep[k], out_xp[k], pv, bps),
         )
-        core.account[1] += qty * net
+        account[1] += qty * net
         core.position_view[V_LAST_EXIT_I] = out_xi[k]
         core.position_view[V_LAST_EXIT_PX] = out_xp[k]
         core.position_view[V_LAST_EXIT_REASON] = out_why[k]
-    core.account[0] = cnt
+    account[0] = cnt
     view = core.position_view
     view[V_SIDE], view[V_QTY] = pos, 0
     view[V_ENTRY_I], view[V_ENTRY_PX] = (ei if pos else -1), (ep if pos else np.nan)
@@ -3299,19 +3334,43 @@ def _core_decision(
     if pos:
         points = core.sizing_risks[ei]
         risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
-        qty = _contracts_for(mode, amount, cap, core.account[1], risk, lot, minimum, clamp)
+        qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
         if qty < 0:
-            core.account[2], core.account[3], core.account[4] = 2, ei, -qty
+            account[2], account[3], account[4] = 2, ei, -qty
             return
         view[V_QTY] = qty
     view[V_WORK_SIDE], view[V_WORK_LEVEL] = work_side, work_level
-    view[V_EQUITY] = core.account[1]
+    view[V_EQUITY] = account[1]
     view[12], view[13] = work_long, work_short
     d = core.decision
     d[:] = np.nan
     d[0], d[1], d[12], d[13], d[14], d[28] = 0, 0, 0, 0, 0, 0
     core.step(core.state, core.params, i, core.feats, o, h, lo, c, core.volume[i], view, d)
-    core.decisions[:, i] = d
+    levels, layout = core.levels, core.layout
+    stored, declared, legs, block, row = layout[0], layout[1], layout[2], layout[4], 0
+    dropped = False
+    for q in range(len(d)):
+        if (q < 16 or q > 27) and stored >> q & 1:
+            levels[row, i] = d[q]
+            row += 1
+        flag = q == 12 or q == 13 or q == 14 or q == 28
+        if not declared >> q & 1 and (d[q] != 0 if flag else np.isfinite(d[q])):
+            account[5] = float(int(account[5]) | (1 << q))
+        # Any non-default value (including +-inf) in a field this layout drops.
+        if not stored >> q & 1 and (d[q] != 0 if flag else not np.isnan(d[q])):
+            dropped = True
+    if dropped:
+        # The matcher would read a different decision from here on: stop, and let the
+        # caller rerun with every field stored.
+        account[2] = 10
+        return
+    if stored >> 16 & 1:
+        for leg in range(12):
+            if legs >> leg & 1:
+                levels[row, i] = d[16 + leg]
+                row += 1
+            else:
+                levels[block + leg, i] = d[16 + leg]
     if d[0] != -1 and d[0] != 0 and d[0] != 1:
         raise ValueError("compiled core: side must be -1, 0, 1")
     for col in (1, 12, 13, 14, 28):
@@ -3319,8 +3378,8 @@ def _core_decision(
             raise ValueError("compiled core: boolean decision must be 0 or 1")
     core.sides[i], core.exits[i] = int(d[0]), bool(d[1])
     for col in range(10):
-        core.levels[col, i] = d[col + 2]
-    core.levels[10, i] = d[15]
+        _put_level(levels, layout, col, i, d[col + 2])
+    _put_level(levels, layout, 10, i, d[15])
     # Carry these refusals out of prange like sizing refusals; raising inside
     # a compiled callback can otherwise leave uninitialized result buffers.
     pair = d[16:28].copy()
@@ -3329,17 +3388,17 @@ def _core_decision(
         pair[6] += next_px
     if np.isfinite(d[16:28]).any():
         if core.pair_rules & 16:
-            core.account[2] = 3
+            account[2] = 3
             return
         if core.pair_rules & 32:
-            core.account[2] = 4
+            account[2] = 4
             return
         if core.pair_rules & 8:
             if not core.pair_rules & 64:
-                core.account[2] = 5
+                account[2] = 5
                 return
             if not np.isnan(pair[1]) or not np.isnan(pair[7]):
-                core.account[2] = 7
+                account[2] = 7
                 return
             if (
                 not np.isnan(pair[3])
@@ -3347,13 +3406,13 @@ def _core_decision(
                 or not np.isnan(pair[9])
                 or not np.isnan(pair[11])
             ):
-                core.account[2] = 6
+                account[2] = 6
                 return
     if d[12] and core.pair_rules & 128 and core.flatten_mode == 0:
         # A23 settles a flatten at this close only; a future-open flatten is refused.
-        core.account[2] = 8
+        account[2] = 8
         return
-    if validate_pair(
+    validate_pair(
         pair,
         d[2:12],
         d[0],
@@ -3369,22 +3428,30 @@ def _core_decision(
         bool(core.pair_rules & 16),
         bool(core.pair_rules & 32),
         bool(core.pair_rules & 64),
-    ):
-        if core.levels.shape[0] < 23:
-            raise ValueError("straddle requires the slots scheduler")
+    )
     for col in range(12):
-        core.levels[11 + col, i] = pair[col]
+        _put_level(levels, layout, 11 + col, i, pair[col])
     for offset, direction in ((0, 1), (6, -1)):
-        core.levels[11 + offset, i] = _round_price(
-            pair[offset], core.tick, core.rounding, direction
+        _put_level(
+            levels,
+            layout,
+            11 + offset,
+            i,
+            _round_price(pair[offset], core.tick, core.rounding, direction),
         )
-        core.levels[12 + offset, i] = _round_price(
-            pair[1 + offset], core.tick, core.rounding, -direction
+        _put_level(
+            levels,
+            layout,
+            12 + offset,
+            i,
+            _round_price(pair[1 + offset], core.tick, core.rounding, -direction),
         )
-    core.levels[2, i] = _round_price(d[4], core.tick, core.rounding, -d[0])
+    _put_level(levels, layout, 2, i, _round_price(d[4], core.tick, core.rounding, -d[0]))
     trigger = d[7] + next_px if d[28] else d[7]
-    core.levels[5, i] = _round_price(trigger, core.tick, core.rounding, d[0])
-    core.levels[23, i], core.levels[24, i], core.levels[25, i] = d[28], d[29], d[30]
+    _put_level(levels, layout, 5, i, _round_price(trigger, core.tick, core.rounding, d[0]))
+    _put_level(levels, layout, 23, i, d[28])
+    _put_level(levels, layout, 24, i, d[29])
+    _put_level(levels, layout, 25, i, d[30])
     core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])
     # Match shared validation boundary transformation on the current decision, without future signals.
     if core.boundary == 1 and core.ends[i] and core.exit_next_open:
@@ -3411,7 +3478,13 @@ def _straddle_column(pair, j):
 
 @nb.njit(cache=True)
 def _pair_at(pair, i):
-    return pair is not None and i >= 0 and pair.shape[1] > i and not np.isnan(pair[:, i]).all()
+    if pair is None or i < 0 or pair.shape[1] <= i:
+        return False
+    # Any finite leg, without allocating a column per call (it runs several times a bar).
+    for leg in range(pair.shape[0]):
+        if not np.isnan(pair[leg, i]):
+            return True
+    return False
 
 
 @nb.njit(cache=True)
