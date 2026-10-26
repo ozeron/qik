@@ -162,6 +162,26 @@ context = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
                         assert isinstance(statement.value, ast.Call)
                         statement.value.args[3] = ast.Name("context", ast.Load())
                         break
+    if not callback:
+        # The plain Python loop must surface this config's refusal before a later
+        # callback can raise. Native prange still carries counts to the boundary.
+        for node in ast.walk(runner):
+            if isinstance(node, ast.For):
+                for index, statement in enumerate(node.body):
+                    if (
+                        isinstance(statement, ast.Assign)
+                        and isinstance(statement.targets[0], ast.Subscript)
+                        and isinstance(statement.targets[0].value, ast.Name)
+                        and statement.targets[0].value.id == "counts"
+                    ):
+                        node.body.insert(
+                            index + 1,
+                            ast.parse(
+                                "if counts[j] == -ACCOUNT_INVALID_SIDE:\n"
+                                "    raise ValueError('compiled core: side must be -1, 0, 1')"
+                            ).body[0],
+                        )
+                        break
     functions.append(runner)
     strategy = None if callback else importlib.import_module(strategy_module)
     fingerprint = hashlib.sha256(
@@ -285,16 +305,12 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
         # seen trades, equity, refusal code, sizing refusal bar, sizing error code and
         # the bit set of undeclared fields the core emitted
         account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0, 0.0])
-        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None or len(session_days) == 0 else session_days, ends, economic, account, int(rules[20]), int(rules[21]), rules[9], int(rules[13]), K._layout_context(layout), bool(rules[6]), int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]) + 16 * int(rules[25]) + 32 * int(rules[26]) + 64 * int(rules[5]) + 128 * int(rules[28]), K._level_row(levels, blank, risk_row))
+        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None or len(session_days) == 0 else session_days, ends, economic, account, int(rules[K.R_FLATTEN]), int(rules[K.R_BOUNDARY]), rules[K.R_TICK], int(rules[K.R_TICK_ROUND]), K._layout_context(layout), bool(rules[K.R_EXIT_NEXT_OPEN]), int(rules[K.R_COMBINE]) + 4 * int(rules[K.R_OTO]) + 8 * int(rules[K.R_ONE_TICK]) + 16 * int(rules[K.R_ARM_STOP]) + 32 * int(rules[K.R_DAY_CANCEL]) + 64 * int(rules[K.R_NEXT_OPEN]) + 128 * int(rules[K.R_EXIT_AND_REARM]), K._level_row(levels, blank, risk_row))
         a0, a1, a2, a3, a4, a5, a6 = (a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j])
-        slip = rules[9] if rules[8] else 0.0
-        combine = int(rules[22]) if len(rules) > 22 else 0
-        arm_stop = bool(rules[25])
-        day_cancel = bool(rules[26])
         if slots:
-            result = K._compiled_slots_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), slip, K._level_row(levels, blank, rows[5]), K._level_row(levels, blank, rows[6]), K._level_row(levels, blank, rows[7]), K._level_row(levels, blank, rows[8]), K._level_row(levels, blank, rows[9]), bool(rules[15]), bool(rules[16]), bool(rules[17]), bool(rules[18]), bool(rules[19]), bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), combine=int(rules[22]), amend_close=bool(rules[23]), completed_close=bool(rules[24]), arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, straddle=straddle, from_open=K._level_row(levels, blank, rows[23]), stop_fracs=K._level_row(levels, blank, rows[24]), target_fracs=K._level_row(levels, blank, rows[25]), next_bar=bool(rules[27]), exit_and_rearm=bool(rules[28]))
+            result = K._compiled_slots_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, K._level_row(levels, blank, rows[5]), K._level_row(levels, blank, rows[6]), K._level_row(levels, blank, rows[7]), K._level_row(levels, blank, rows[8]), K._level_row(levels, blank, rows[9]), long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days=expiry_days, straddle=straddle, from_open=K._level_row(levels, blank, rows[23]), stop_fracs=K._level_row(levels, blank, rows[24]), target_fracs=K._level_row(levels, blank, rows[25]))
         else:
-            result = K._compiled_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, int(rules[0]), bool(rules[1]), bool(rules[2]), bool(rules[3]), bool(rules[4]), bool(rules[5]), bool(rules[6]), int(rules[7]), bool(rules[8]), rules[9], bool(rules[10]), int(rules[11]), bool(rules[12]), int(rules[13]), rules[9], long_exits, short_exits, force_close, force_open, bool(rules[14]), False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), combine, arm_stop, day_cancel, expiry_days)
+            result = K._compiled_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days)
         # Negative counts carry refusals out of prange without exceptions.
         counts[j] = -int(account[2]) if account[2] else result[0]
         meta[j, 0] = result[1]

@@ -33,6 +33,113 @@ from .protection import (
 )
 from .straddle import validate_pair
 
+# Stable shared settings ABI. Float64 exactly represents the bounded integer/boolean
+# rule values; only tick is fractional. Array shape and dtype never depend on rules.
+RULES_WIDTH = 29
+R_CHASE = 0
+R_ADAPTIVE = 1
+R_REENTER = 2
+R_STALE_DROP = 3
+R_PROTECT_FLATTEN = 4
+R_NEXT_OPEN = 5
+R_EXIT_NEXT_OPEN = 6
+R_LATENCY_BARS = 7
+R_ONE_TICK = 8
+R_TICK = 9
+R_ADVERSE_FIRST = 10
+R_BRACKET_ANCHOR = 11
+R_TARGET_GAP = 12
+R_TICK_ROUND = 13
+R_CROSS_SESSION = 14
+R_MIT = 15
+R_OTO = 16
+R_AMEND_KEEP = 17
+R_RATCHET = 18
+R_STOP_SKIP = 19
+R_FLATTEN = 20
+R_BOUNDARY = 21
+R_COMBINE = 22
+R_AMEND_CLOSE = 23
+R_COMPLETED_CLOSE = 24
+R_ARM_STOP = 25
+R_DAY_CANCEL = 26
+R_NEXT_BAR = 27
+R_EXIT_AND_REARM = 28
+
+
+def rule_settings(
+    *,
+    chase: int = 1,
+    adaptive: bool = False,
+    reenter: bool = False,
+    stale_drop: bool = False,
+    protect_flatten: bool = False,
+    next_open: bool = False,
+    exit_next_open: bool | None = None,
+    latency_bars: int = 0,
+    one_tick: bool = False,
+    tick: float = 0.0,
+    adverse_first: bool = False,
+    bracket_anchor: int = 0,
+    target_gap: bool = False,
+    tick_round: int = 0,
+    cross_session: bool = False,
+    mit: bool = False,
+    oto: bool = False,
+    amend_keep: bool = False,
+    ratchet: bool = False,
+    stop_skip: bool = False,
+    flatten: int = 0,
+    boundary: int = 0,
+    combine: int = 0,
+    amend_close: bool = False,
+    completed_close: bool = False,
+    arm_stop: bool = False,
+    day_cancel: bool = False,
+    next_bar: bool = False,
+    exit_and_rearm: bool = False,
+) -> np.ndarray:
+    """Build one settings record at the Python boundary, shared by every matcher.
+
+    chase=1 matches Rules.limit_chase_bars: an unfilled limit chases after one
+    bar under the default rules. Zero would mean same-bar chasing and is not a
+    valid Rules value. Production boundaries pass their chosen chase explicitly.
+    """
+    if exit_next_open is None:
+        exit_next_open = next_open
+    settings = np.empty(RULES_WIDTH, dtype=np.float64)
+    settings[R_CHASE] = chase
+    settings[R_ADAPTIVE] = adaptive
+    settings[R_REENTER] = reenter
+    settings[R_STALE_DROP] = stale_drop
+    settings[R_PROTECT_FLATTEN] = protect_flatten
+    settings[R_NEXT_OPEN] = next_open
+    settings[R_EXIT_NEXT_OPEN] = exit_next_open
+    settings[R_LATENCY_BARS] = latency_bars
+    settings[R_ONE_TICK] = one_tick
+    settings[R_TICK] = tick
+    settings[R_ADVERSE_FIRST] = adverse_first
+    settings[R_BRACKET_ANCHOR] = bracket_anchor
+    settings[R_TARGET_GAP] = target_gap
+    settings[R_TICK_ROUND] = tick_round
+    settings[R_CROSS_SESSION] = cross_session
+    settings[R_MIT] = mit
+    settings[R_OTO] = oto
+    settings[R_AMEND_KEEP] = amend_keep
+    settings[R_RATCHET] = ratchet
+    settings[R_STOP_SKIP] = stop_skip
+    settings[R_FLATTEN] = flatten
+    settings[R_BOUNDARY] = boundary
+    settings[R_COMBINE] = combine
+    settings[R_AMEND_CLOSE] = amend_close
+    settings[R_COMPLETED_CLOSE] = completed_close
+    settings[R_ARM_STOP] = arm_stop
+    settings[R_DAY_CANCEL] = day_cancel
+    settings[R_NEXT_BAR] = next_bar
+    settings[R_EXIT_AND_REARM] = exit_and_rearm
+    return settings
+
+
 REASON_SIGNAL = 1  # market exit at the decision close (R1: the next open)
 REASON_STOP = 2  # resting stop-market hit during a bar, filled at the stop level
 REASON_STOP_GAP = 4  # resting stop already through at the bar's open, filled at the open
@@ -50,6 +157,9 @@ ERR_STOP_REPLACE_LATENCY = 11
 ERR_STRADDLE_SIDE_CANCEL = 12
 ERR_BUSY_ENTRY_DROPPED = 13  # R15b: a whole-bar busy guard would silently discard an entry
 ERR_REARM_BEFORE_CLOSE = 14  # A23: replacement fills at this close, the old close at the next open
+
+# Account refusals 9/10/11 are buffer overflow, dropped fields and callback failure.
+ACCOUNT_INVALID_SIDE = 12
 
 _SLOT_SUBMIT = 1
 _SLOT_PROTECT = 2
@@ -93,6 +203,34 @@ def _exit_for(global_exit, long_exit, short_exit, side):
     return global_exit or (side > 0 and long_exit) or (side < 0 and short_exit)
 
 
+@nb.njit(cache=True, nogil=True, inline="always")
+def _high_first(adaptive: bool, open_px: float, high: float, low: float) -> bool:
+    """Adaptive paths visit the nearer extreme first; ties visit low first."""
+    return not adaptive or abs(open_px - high) < abs(open_px - low)
+
+
+@nb.njit(cache=True, nogil=True, inline="always")
+def _day_entry_expires(day_cancel: bool, expiry: bool) -> bool:
+    """Only the cancel policy expires a pending DAY entry at its boundary."""
+    return expiry and day_cancel
+
+
+@nb.njit(cache=True, nogil=True, inline="always")
+def _cancel_entry_commands(commands: Any, pending: int) -> None:
+    """Remove queued commands belonging to the expired entry generation."""
+    for q in range(len(commands) - 1, -1, -1):
+        if commands[q][2] == pending:
+            commands.pop(q)
+
+
+@nb.njit(cache=True, nogil=True, inline="always")
+def _target_fill_price(
+    point: float, target: float, at_open: bool, gap_to_open: bool, side: int, slip: float
+) -> float:
+    """Apply the caller's target execution/slippage policy at a matched path point."""
+    return point - side * slip if slip else (point if gap_to_open and at_open else target)
+
+
 @nb.njit(cache=True, nogil=True)
 def _venue_record(
     count_only,
@@ -133,22 +271,11 @@ def _venue_column(
     stop_pts,
     target_pts,
     new_day,
-    chase,
-    adaptive,
-    reenter,
-    protect_flatten,
-    latency,
-    slip,
-    adverse_first,
-    bracket_anchor,
-    target_gap,
-    tick_round,
-    round_tick,
+    rules,
     long_exits,
     short_exits,
     force_close,
     force_open,
-    cross_session,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -160,9 +287,6 @@ def _venue_column(
     base,
     core=None,
     ioc_limits=None,
-    combine=0,
-    arm_stop=False,
-    day_cancel=False,
     expiry_days=None,
 ):
     """A16/A17 venue settlement, with a bounded-by-flight-time FIFO command list.
@@ -189,22 +313,11 @@ def _venue_column(
         stop_pts,
         target_pts,
         new_day,
-        chase,
-        adaptive,
-        reenter,
-        protect_flatten,
-        latency,
-        slip,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
+        rules,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_entry_i,
         out_exit_i,
@@ -215,9 +328,6 @@ def _venue_column(
         out_stop,
         base,
         ioc_limits,
-        combine,
-        arm_stop,
-        day_cancel,
         expiry_days,
     )
     for i in range(len(c)):
@@ -248,22 +358,11 @@ def _venue_column_advance(state, i, inputs, core=None):
         stop_pts,
         target_pts,
         new_day,
-        chase,
-        adaptive,
-        reenter,
-        protect_flatten,
-        latency,
-        slip,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
+        rules,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_entry_i,
         out_exit_i,
@@ -274,11 +373,22 @@ def _venue_column_advance(state, i, inputs, core=None):
         out_stop,
         base,
         ioc_limits,
-        combine,
-        arm_stop,
-        day_cancel,
         expiry_days,
     ) = inputs
+    chase = int(rules[R_CHASE])
+    adaptive = bool(rules[R_ADAPTIVE])
+    reenter = bool(rules[R_REENTER])
+    protect_flatten = bool(rules[R_PROTECT_FLATTEN])
+    latency = int(rules[R_LATENCY_BARS])
+    slip = rules[R_TICK] if rules[R_ONE_TICK] else 0.0
+    adverse_first = bool(rules[R_ADVERSE_FIRST])
+    bracket_anchor = int(rules[R_BRACKET_ANCHOR])
+    target_gap = bool(rules[R_TARGET_GAP])
+    tick_round = int(rules[R_TICK_ROUND])
+    round_tick = rules[R_TICK]
+    cross_session = bool(rules[R_CROSS_SESSION])
+    combine = int(rules[R_COMBINE])
+    day_cancel = bool(rules[R_DAY_CANCEL])
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
         commands,
@@ -313,12 +423,9 @@ def _venue_column_advance(state, i, inputs, core=None):
     if (
         pending >= 0
         and not np.isnan(entry_limit[pending])
-        and _optional_at(expiry_days, i, new_day[i])
-        and day_cancel
+        and _day_entry_expires(day_cancel, _optional_at(expiry_days, i, new_day[i]))
     ):
-        for q in range(len(commands) - 1, -1, -1):
-            if commands[q][2] == pending:
-                commands.pop(q)
+        _cancel_entry_commands(commands, pending)
         pending, resting, chasing, closing, busy = -1, False, False, False, False
     if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i] and not day_cancel:
         return (
@@ -394,7 +501,7 @@ def _venue_column_advance(state, i, inputs, core=None):
             commands.append((i + latency, 6 if closing else 3, d))
     if closing and pending < 0 and pos == 0 and (protection == 0 or protection == 3):
         closing = False
-    high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
+    high_first = _high_first(adaptive, o[i], h[i], lo[i])
     # Locate the first matching point. A newly filled entry has no resting protection yet.
     if pending >= 0 and resting:
         d = pending
@@ -460,7 +567,7 @@ def _venue_column_advance(state, i, inputs, core=None):
             candidate = pt - pos * slip
             if not adverse_hit and _in_market(pos, target, candidate, False):
                 reason = REASON_TARGET
-                px = candidate if slip else (pt if target_gap and m == 0 else target)
+                px = _target_fill_price(pt, target, m == 0, target_gap, pos, slip)
                 break
         if reason:
             _venue_record(
@@ -805,26 +912,11 @@ def _column(
     stop_pts,
     target_pts,
     new_day,
-    chase,
-    adaptive,
-    reenter,
-    stale_drop,
-    protect_flatten,
-    next_open,
-    exit_next_open,
-    latency_bars,
-    one_tick,
-    tick,
-    adverse_first,
-    bracket_anchor,
-    target_gap,
-    tick_round,
-    round_tick,
+    rules,
     long_exits,
     short_exits,
     force_close,
     force_open,
-    cross_session,
     count_only,
     out_entry_i,
     out_exit_i,
@@ -836,19 +928,18 @@ def _column(
     base,
     core=None,
     ioc_limits=None,
-    combine=0,
-    arm_stop=False,
-    day_cancel=False,
     expiry_days=None,
 ):
     """Simulate one column.
 
     Returns ``(n_trades, err, err_bar, final_side, final_entry_i, final_entry_px, final_stop)``.
     """
+    next_open = bool(rules[R_NEXT_OPEN])
+    latency_bars = int(rules[R_LATENCY_BARS])
+    one_tick = bool(rules[R_ONE_TICK])
 
     # R15: ONE_TICK with next-open entries stays on this scheduler, adding the tick per fill.
     if latency_bars or (one_tick and not next_open):
-        venue_slip = tick if one_tick else 0.0
         venue = _venue_driver(core)
         return venue(
             o,
@@ -863,22 +954,11 @@ def _column(
             stop_pts,
             target_pts,
             new_day,
-            chase,
-            adaptive,
-            reenter,
-            protect_flatten,
-            latency_bars,
-            venue_slip,
-            adverse_first,
-            bracket_anchor,
-            target_gap,
-            tick_round,
-            round_tick,
+            rules,
             long_exits,
             short_exits,
             force_close,
             force_open,
-            cross_session,
             count_only,
             out_entry_i,
             out_exit_i,
@@ -890,9 +970,6 @@ def _column(
             base,
             core,
             ioc_limits,
-            combine,
-            arm_stop,
-            day_cancel,
             expiry_days,
         )
     n = o.shape[0]
@@ -914,26 +991,11 @@ def _column(
         stop_pts,
         target_pts,
         new_day,
-        chase,
-        adaptive,
-        reenter,
-        stale_drop,
-        protect_flatten,
-        next_open,
-        exit_next_open,
-        latency_bars,
-        one_tick,
-        tick,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
+        rules,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_entry_i,
         out_exit_i,
@@ -944,9 +1006,6 @@ def _column(
         out_stop,
         base,
         ioc_limits,
-        combine,
-        arm_stop,
-        day_cancel,
         expiry_days,
     )
     for i in range(n):
@@ -977,26 +1036,11 @@ def _column_advance(state, i, inputs, core=None):
         stop_pts,
         target_pts,
         new_day,
-        chase,
-        adaptive,
-        reenter,
-        stale_drop,
-        protect_flatten,
-        next_open,
-        exit_next_open,
-        latency_bars,
-        one_tick,
-        tick,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
+        rules,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_entry_i,
         out_exit_i,
@@ -1007,11 +1051,25 @@ def _column_advance(state, i, inputs, core=None):
         out_stop,
         base,
         ioc_limits,
-        combine,
-        arm_stop,
-        day_cancel,
         expiry_days,
     ) = inputs
+    chase = int(rules[R_CHASE])
+    adaptive = bool(rules[R_ADAPTIVE])
+    reenter = bool(rules[R_REENTER])
+    stale_drop = bool(rules[R_STALE_DROP])
+    protect_flatten = bool(rules[R_PROTECT_FLATTEN])
+    next_open = bool(rules[R_NEXT_OPEN])
+    exit_next_open = bool(rules[R_EXIT_NEXT_OPEN])
+    one_tick = bool(rules[R_ONE_TICK])
+    tick = rules[R_TICK]
+    adverse_first = bool(rules[R_ADVERSE_FIRST])
+    bracket_anchor = int(rules[R_BRACKET_ANCHOR])
+    target_gap = bool(rules[R_TARGET_GAP])
+    tick_round = int(rules[R_TICK_ROUND])
+    round_tick = rules[R_TICK]
+    cross_session = bool(rules[R_CROSS_SESSION])
+    combine = int(rules[R_COMBINE])
+    day_cancel = bool(rules[R_DAY_CANCEL])
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
         pos,
@@ -1042,7 +1100,7 @@ def _column_advance(state, i, inputs, core=None):
     close_mask = _optional_at(force_close, i, 0)
     open_flatten = _optional_at(force_open, i, False)
     exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
-    if pend != 0 and _optional_at(expiry_days, i, new_day[i]) and day_cancel:
+    if pend != 0 and _day_entry_expires(day_cancel, _optional_at(expiry_days, i, new_day[i])):
         pend, p_chase = 0, -1
     if pend != 0 and new_day[i] and not day_cancel:
         # V2 drops the chase on a new day and leaves a DAY limit resting: not modelled
@@ -1303,9 +1361,7 @@ def _column_advance(state, i, inputs, core=None):
         reason = 0
         px = 0.0
         fill_point = 0  # path point (0=O, 1=first extreme, 2=second) that produced the fill
-        high_first = True
-        if adaptive:
-            high_first = abs(o[i] - h[i]) < abs(o[i] - lo[i])
+        high_first = _high_first(adaptive, o[i], h[i], lo[i])
         # --- sweep of bar i: resting exits set up at or before bar i-1's close ---
         # Open point: a stop already through fills at the open; a limit already through
         # fills at its own price (Nautilus quirk A5).
@@ -1313,12 +1369,14 @@ def _column_advance(state, i, inputs, core=None):
             if not np.isnan(stop) and o[i] <= stop:
                 reason, px = REASON_STOP_GAP, o[i] - slip
             elif not adverse_hit and not np.isnan(target) and o[i] >= target:
-                reason, px = REASON_TARGET, (o[i] if target_gap else target)
+                reason = REASON_TARGET
+                px = _target_fill_price(o[i], target, True, target_gap, pos, 0.0)
         else:
             if not np.isnan(stop) and o[i] >= stop:
                 reason, px = REASON_STOP_GAP, o[i] + slip
             elif not adverse_hit and not np.isnan(target) and o[i] <= target:
-                reason, px = REASON_TARGET, (o[i] if target_gap else target)
+                reason = REASON_TARGET
+                px = _target_fill_price(o[i], target, True, target_gap, pos, 0.0)
         if reason == 0:
             # Extremes: high then low, or the one nearer the open first when adaptive
             # (strictly nearer high -> high first; ties -> low first).
@@ -1816,13 +1874,46 @@ def _column_advance(state, i, inputs, core=None):
 
 
 @nb.njit(parallel=True, cache=True)
-def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts, new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, entry_trigger: np.ndarray, stop_updates: np.ndarray, target_updates: np.ndarray, be_after: np.ndarray, be_offset: np.ndarray, mit, oto, amend_keep, ratchet, stop_skip, exit_next_open, adverse_first, bracket_anchor, target_gap, tick_round, exit_long, exit_short, force_close, force_open, cross_session, entry_limit_ioc, combine, amend_close, completed_close, arm_stop, day_cancel, expiry_days, straddle, entry_from_open, stop_fraction, target_fraction, next_bar, sizing_risks, exit_and_rearm, slots):  # fmt: skip
+def _run_columns(
+    o,
+    h,
+    lo,
+    c,
+    side_sig,
+    exit_sig,
+    entry_stop,
+    entry_target,
+    entry_limit,
+    stop_pts,
+    target_pts,
+    new_day,
+    rules,
+    entry_trigger: np.ndarray,
+    stop_updates: np.ndarray,
+    target_updates: np.ndarray,
+    be_after: np.ndarray,
+    be_offset: np.ndarray,
+    exit_long,
+    exit_short,
+    force_close,
+    force_open,
+    entry_limit_ioc,
+    expiry_days,
+    straddle,
+    entry_from_open,
+    stop_fraction,
+    target_fraction,
+    sizing_risks,
+    slots,
+):
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
 
     Two passes over the same ``_column`` function (count, then fill), so the trade table is exact
     without over-allocating ``k * n`` rows.
     """
+    tick = rules[R_TICK]
+    tick_round = int(rules[R_TICK_ROUND])
 
     if tick_round:
         entry_limit = entry_limit.copy()
@@ -1838,7 +1929,6 @@ def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entr
                     entry_trigger[j, i] = _round_price(
                         entry_trigger[j, i], tick, tick_round, side_sig[j, i]
                     )
-    slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
     errs = np.zeros(k, np.int64)
@@ -1875,35 +1965,16 @@ def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entr
                 stop_pts[j],
                 target_pts[j],
                 new_day,
-                chase,
-                adaptive,
-                reenter,
-                stale_drop,
-                protect_flatten,
-                next_open,
-                exit_next_open,
-                latency_bars,
-                slot_slip,
+                rules,
                 entry_trigger[j],
                 stop_updates[j],
                 target_updates[j],
                 be_after[j],
                 be_offset[j],
-                mit,
-                oto,
-                amend_keep,
-                ratchet,
-                stop_skip,
-                adverse_first,
-                bracket_anchor,
-                target_gap,
-                tick_round,
-                tick,
                 long_column,
                 short_column,
                 close_column,
                 open_column,
-                cross_session,
                 np.bool_(True),
                 e0,
                 e0,
@@ -1915,27 +1986,15 @@ def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entr
                 np.int64(0),
                 core=None,
                 ioc_limits=ioc_column,
-                combine=combine,
-                amend_close=amend_close,
-                completed_close=completed_close,
-                arm_stop=arm_stop,
-                day_cancel=day_cancel,
                 expiry_days=expiry_days,
                 straddle=pair_column,
                 from_open=rel_column,
                 stop_fracs=sf_column,
                 target_fracs=tf_column,
-                next_bar=next_bar,
                 sizing_risks=risk_column,
-                exit_and_rearm=exit_and_rearm,
             )
         else:
-            cnt, err, eb, fs, fe, fpx, fst = _column(
-            o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
-            entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, np.bool_(True),
-            e0, e0, s0, f0, f0, s0, f0, np.int64(0), core=None, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
-        )  # fmt: skip
+            cnt, err, eb, fs, fe, fpx, fst = _column(o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j], entry_limit[j], stop_pts[j], target_pts[j], new_day, rules, long_column, short_column, close_column, open_column, np.bool_(True), e0, e0, s0, f0, f0, s0, f0, np.int64(0), core=None, ioc_limits=ioc_column, expiry_days=expiry_days)  # fmt: skip
         counts[j] = cnt
         errs[j] = err
         err_bar[j] = eb
@@ -1980,35 +2039,16 @@ def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entr
                     stop_pts[j],
                     target_pts[j],
                     new_day,
-                    chase,
-                    adaptive,
-                    reenter,
-                    stale_drop,
-                    protect_flatten,
-                    next_open,
-                    exit_next_open,
-                    latency_bars,
-                    slot_slip,
+                    rules,
                     entry_trigger[j],
                     stop_updates[j],
                     target_updates[j],
                     be_after[j],
                     be_offset[j],
-                    mit,
-                    oto,
-                    amend_keep,
-                    ratchet,
-                    stop_skip,
-                    adverse_first,
-                    bracket_anchor,
-                    target_gap,
-                    tick_round,
-                    tick,
                     long_column,
                     short_column,
                     close_column,
                     open_column,
-                    cross_session,
                     np.bool_(False),
                     entry_i,
                     exit_i,
@@ -2020,29 +2060,15 @@ def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entr
                     offsets[j],
                     core=None,
                     ioc_limits=ioc_column,
-                    combine=combine,
-                    amend_close=amend_close,
-                    completed_close=completed_close,
-                    arm_stop=arm_stop,
-                    day_cancel=day_cancel,
                     expiry_days=expiry_days,
                     straddle=pair_column,
                     from_open=rel_column,
                     stop_fracs=sf_column,
                     target_fracs=tf_column,
-                    next_bar=next_bar,
                     sizing_risks=risk_column,
-                    exit_and_rearm=exit_and_rearm,
                 )
             else:
-                _column(
-                o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
-                entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, np.bool_(False),
-                entry_i, exit_i, side, entry_px,
-                exit_px, reason,
-                stop, offsets[j], core=None, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
-            )  # fmt: skip
+                _column(o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j], entry_limit[j], stop_pts[j], target_pts[j], new_day, rules, long_column, short_column, close_column, open_column, np.bool_(False), entry_i, exit_i, side, entry_px, exit_px, reason, stop, offsets[j], core=None, ioc_limits=ioc_column, expiry_days=expiry_days)  # fmt: skip
     return (
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
         entry_i, exit_i, side, entry_px, exit_px, reason, stop,
@@ -2063,35 +2089,16 @@ def _slots_column(
     sp,
     tp,
     days,
-    chase,
-    adaptive,
-    reenter,
-    stale_drop,
-    protect_flatten,
-    next_open,
-    exit_next_open,
-    latency,
-    slip,
+    rules,
     triggers,
     su,
     tu,
     ba,
     bo,
-    mit,
-    oto,
-    amend_keep,
-    ratchet,
-    stop_skip,
-    adverse_first,
-    bracket_anchor,
-    target_gap,
-    tick_round,
-    round_tick,
     long_exits,
     short_exits,
     force_close,
     force_open,
-    cross_session,
     count_only,
     out_ei,
     out_xi,
@@ -2103,21 +2110,16 @@ def _slots_column(
     base,
     core=None,
     ioc_limits=None,
-    combine=0,
-    amend_close=False,
-    completed_close=False,
-    arm_stop=False,
-    day_cancel=False,
     expiry_days=None,
     straddle=None,
     from_open=None,
     stop_fracs=None,
     target_fracs=None,
-    next_bar=False,
     sizing_risks=None,
-    exit_and_rearm=False,
 ):
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
+    arm_stop = bool(rules[R_ARM_STOP])
+    day_cancel = bool(rules[R_DAY_CANCEL])
     if straddle is not None and np.isfinite(straddle).any():
         if arm_stop:
             raise ValueError("straddle arm_stop=next_bar composition is unproved")
@@ -2142,35 +2144,16 @@ def _slots_column(
         sp,
         tp,
         days,
-        chase,
-        adaptive,
-        reenter,
-        stale_drop,
-        protect_flatten,
-        next_open,
-        exit_next_open,
-        latency,
-        slip,
+        rules,
         triggers,
         su,
         tu,
         ba,
         bo,
-        mit,
-        oto,
-        amend_keep,
-        ratchet,
-        stop_skip,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_ei,
         out_xi,
@@ -2181,19 +2164,12 @@ def _slots_column(
         out_st,
         base,
         ioc_limits,
-        combine,
-        amend_close,
-        completed_close,
-        arm_stop,
-        day_cancel,
         expiry_days,
         straddle,
         from_open,
         stop_fracs,
         target_fracs,
-        next_bar,
         sizing_risks,
-        exit_and_rearm,
     )
     for i in range(len(c)):
         state, err, eb = _slots_column_advance(state, i, inputs, core)
@@ -2223,35 +2199,16 @@ def _slots_column_advance(state, i, inputs, core=None):
         sp,
         tp,
         days,
-        chase,
-        adaptive,
-        reenter,
-        stale_drop,
-        protect_flatten,
-        next_open,
-        exit_next_open,
-        latency,
-        slip,
+        rules,
         triggers,
         su,
         tu,
         ba,
         bo,
-        mit,
-        oto,
-        amend_keep,
-        ratchet,
-        stop_skip,
-        adverse_first,
-        bracket_anchor,
-        target_gap,
-        tick_round,
-        round_tick,
         long_exits,
         short_exits,
         force_close,
         force_open,
-        cross_session,
         count_only,
         out_ei,
         out_xi,
@@ -2262,20 +2219,40 @@ def _slots_column_advance(state, i, inputs, core=None):
         out_st,
         base,
         ioc_limits,
-        combine,
-        amend_close,
-        completed_close,
-        arm_stop,
-        day_cancel,
         expiry_days,
         straddle,
         from_open,
         stop_fracs,
         target_fracs,
-        next_bar,
         sizing_risks,
-        exit_and_rearm,
     ) = inputs
+    chase = int(rules[R_CHASE])
+    adaptive = bool(rules[R_ADAPTIVE])
+    reenter = bool(rules[R_REENTER])
+    stale_drop = bool(rules[R_STALE_DROP])
+    protect_flatten = bool(rules[R_PROTECT_FLATTEN])
+    next_open = bool(rules[R_NEXT_OPEN])
+    exit_next_open = bool(rules[R_EXIT_NEXT_OPEN])
+    latency = int(rules[R_LATENCY_BARS])
+    slip = rules[R_TICK] if rules[R_ONE_TICK] else 0.0
+    mit = bool(rules[R_MIT])
+    oto = bool(rules[R_OTO])
+    amend_keep = bool(rules[R_AMEND_KEEP])
+    ratchet = bool(rules[R_RATCHET])
+    stop_skip = bool(rules[R_STOP_SKIP])
+    adverse_first = bool(rules[R_ADVERSE_FIRST])
+    bracket_anchor = int(rules[R_BRACKET_ANCHOR])
+    target_gap = bool(rules[R_TARGET_GAP])
+    tick_round = int(rules[R_TICK_ROUND])
+    round_tick = rules[R_TICK]
+    cross_session = bool(rules[R_CROSS_SESSION])
+    combine = int(rules[R_COMBINE])
+    amend_close = bool(rules[R_AMEND_CLOSE])
+    completed_close = bool(rules[R_COMPLETED_CLOSE])
+    arm_stop = bool(rules[R_ARM_STOP])
+    day_cancel = bool(rules[R_DAY_CANCEL])
+    next_bar = bool(rules[R_NEXT_BAR])
+    exit_and_rearm = bool(rules[R_EXIT_AND_REARM])
     """Advance one bar; the batch and compiled-core drivers share this matcher."""
     (
         queue,
@@ -2310,13 +2287,10 @@ def _slots_column_advance(state, i, inputs, core=None):
     pinned, pin, prev = 0, np.nan, o[i]
     if (
         pending >= 0
-        and _optional_at(expiry_days, i, days[i])
+        and _day_entry_expires(day_cancel, _optional_at(expiry_days, i, days[i]))
         and (not np.isnan(triggers[pending]) or not np.isnan(limits[pending]))
-        and day_cancel
     ):
-        for q in range(len(queue) - 1, -1, -1):
-            if queue[q][2] == pending:
-                queue.pop(q)
+        _cancel_entry_commands(queue, pending)
         pending, resting, chasing, closing, busy = -1, False, False, False, False
     if (
         pending >= 0
@@ -2391,7 +2365,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                 and not np.isnan(stop)
                 and (lo[i] <= stop if pos > 0 else h[i] >= stop)
             )
-            high_first = not adaptive or abs(o[i] - h[i]) < abs(o[i] - lo[i])
+            high_first = _high_first(adaptive, o[i], h[i], lo[i])
             if (
                 pending >= 0
                 and resting
@@ -2540,11 +2514,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                         pos, target, pt if mit else pt - pos * slip, False
                     ):
                         reason = REASON_TARGET
-                        px = (
-                            pt - pos * slip
-                            if slip
-                            else (pt if (mit or target_gap) and m == 0 else target)
-                        )
+                        px = _target_fill_price(pt, target, m == 0, mit or target_gap, pos, slip)
                         if not mit and not slip and (m == 1 or m == 2):
                             pinned, pin = pos, px
                     if reason:
@@ -3372,7 +3342,8 @@ def _core_decision(
             else:
                 levels[block + leg, i] = d[16 + leg]
     if d[0] != -1 and d[0] != 0 and d[0] != 1:
-        raise ValueError("compiled core: side must be -1, 0, 1")
+        account[2], account[3] = ACCOUNT_INVALID_SIDE, i
+        return
     for col in (1, 12, 13, 14, 28):
         if d[col] != 0 and d[col] != 1:
             raise ValueError("compiled core: boolean decision must be 0 or 1")
@@ -3614,15 +3585,19 @@ def _normalized_columns(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
     bound = _RUN_COLUMNS_SIGNATURE.bind(*args, **kwargs)
     bound.apply_defaults()
     values = bound.arguments
+    rules = np.ascontiguousarray(values["rules"], dtype=np.float64)
+    if rules.shape != (RULES_WIDTH,):
+        raise ValueError(f"compiled Rules ABI requires exactly {RULES_WIDTH} values")
+    values["rules"] = _column_input(rules, dtype=np.float64)
     slots = values["entry_trigger"] is not None
     if slots:
         assert values["stop_updates"] is not None and values["target_updates"] is not None
         assert values["be_after"] is not None and values["be_offset"] is not None
     pair = values["straddle"]
     if pair is not None and np.isfinite(pair).any():
-        if values["arm_stop"]:
+        if values["rules"][R_ARM_STOP]:
             raise ValueError("straddle arm_stop=next_bar composition is unproved")
-        if values["day_cancel"]:
+        if values["rules"][R_DAY_CANCEL]:
             raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     if pair is not None and not slots:
         raise ValueError("straddle requires the slots scheduler")
@@ -3631,35 +3606,6 @@ def _normalized_columns(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("entry_from_open and fractional protection require the slots scheduler")
     values["slots"] = slots
-    if values["exit_next_open"] is None:
-        values["exit_next_open"] = values["next_open"]
-    for name in (
-        "adaptive",
-        "reenter",
-        "stale_drop",
-        "protect_flatten",
-        "next_open",
-        "one_tick",
-        "mit",
-        "oto",
-        "amend_keep",
-        "ratchet",
-        "stop_skip",
-        "exit_next_open",
-        "adverse_first",
-        "target_gap",
-        "cross_session",
-        "amend_close",
-        "completed_close",
-        "arm_stop",
-        "day_cancel",
-        "next_bar",
-        "exit_and_rearm",
-    ):
-        values[name] = bool(values[name])
-    for name in ("chase", "latency_bars", "bracket_anchor", "tick_round", "combine"):
-        values[name] = int(values[name])
-    values["tick"] = float(values["tick"])
     # Preserve integer and bool lanes: only prices/protection use float64.
     for name in ("o", "h", "lo", "c"):
         values[name] = _column_input(values[name], dtype=np.float64)
@@ -3710,7 +3656,37 @@ def _normalized_columns(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts, new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False, latency_bars=0, one_tick=False, tick=0.0, entry_trigger: np.ndarray | None=None, stop_updates: np.ndarray | None=None, target_updates: np.ndarray | None=None, be_after: np.ndarray | None=None, be_offset: np.ndarray | None=None, mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False, exit_next_open=None, adverse_first=False, bracket_anchor=0, target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None, entry_from_open=None, stop_fraction=None, target_fraction=None, next_bar=False, sizing_risks=None, exit_and_rearm=False) -> tuple:  # fmt: skip
+def run_columns(
+    o,
+    h,
+    lo,
+    c,
+    side_sig,
+    exit_sig,
+    entry_stop,
+    entry_target,
+    entry_limit,
+    stop_pts,
+    target_pts,
+    new_day,
+    rules,
+    entry_trigger: np.ndarray | None = None,
+    stop_updates: np.ndarray | None = None,
+    target_updates: np.ndarray | None = None,
+    be_after: np.ndarray | None = None,
+    be_offset: np.ndarray | None = None,
+    exit_long=None,
+    exit_short=None,
+    force_close=None,
+    force_open=None,
+    entry_limit_ioc=None,
+    expiry_days=None,
+    straddle=None,
+    entry_from_open=None,
+    stop_fraction=None,
+    target_fraction=None,
+    sizing_risks=None,
+) -> tuple:
     """Normalize the numeric ABI before dispatch; declarations still select scheduling."""
     return _run_columns(**_normalized_columns((), locals()))
 

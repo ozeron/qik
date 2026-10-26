@@ -5,9 +5,9 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 import pytest
+from ve_kernel_adapter import run_columns as kernel_columns
 
-from qik.vector_engine import Bar, Features, Params, Position, State, TypedDecision, strategy
-from qik.vector_engine import kernel as K
+from qik.vector_engine import Bar, Decision, Features, Params, Position, State, strategy
 from qik.vector_engine.api import SIGNAL_FIELDS
 from qik.vector_engine.compiled import (
     RULES_WIDTH,
@@ -34,9 +34,9 @@ class NoFeatures(Features):
 @strategy(state=Calls, params=Distance, features=NoFeatures)
 def record_step(
     state: Calls, params: Distance, features: NoFeatures, bar: Bar, pos: Position
-) -> TypedDecision:
+) -> Decision:
     state.calls += 1
-    return TypedDecision(
+    return Decision(
         side=1 if state.calls == 1 else 0,
         stop=bar.close - params.distance,
         target=bar.close + params.distance,
@@ -101,7 +101,7 @@ def test_shared_record_matches_batch(mode: str, rules_width: int):
     decisions = store[:, layout.rows]
     assert decisions.shape == (2, 31, len(x))
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
-    batch = K.run_columns(
+    batch = kernel_columns(
         x,
         x + 1,
         x - 1,

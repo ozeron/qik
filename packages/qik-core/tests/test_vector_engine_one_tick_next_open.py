@@ -12,6 +12,7 @@ from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from test_vector_engine import _case, _dense_case, _kernel_final, _nan_free, _ref_final, _ref_trades
+from ve_kernel_adapter import run_columns as kernel_columns
 
 from qik.vector_engine import (
     HOLD,
@@ -19,6 +20,7 @@ from qik.vector_engine import (
     Bars,
     BracketAnchor,
     Costs,
+    Decision,
     Features,
     FillModel,
     FillTiming,
@@ -32,7 +34,6 @@ from qik.vector_engine import (
     Sizing,
     State,
     TickRound,
-    TypedDecision,
     enter,
     enter_limit_ioc,
     run,
@@ -221,7 +222,7 @@ class F(Features):
 
 
 @strategy(state=S, params=P, features=F)
-def breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
+def breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> Decision:
     s.calls += 1
     if bar.i == 0:
         return enter(1, stop_points=p.distance)
@@ -277,7 +278,7 @@ def _compare(
         new_day=new_day, adaptive=adaptive, reenter=reenter, force_close=force_close,
         force_open=force_open, combine=combine, exit_long=exit_long, exit_short=exit_short,
     )  # fmt: skip
-    out = K.run_columns(
+    out = kernel_columns(
         a["o"], a["h"], a["lo"], a["c"], side[None, :], exit_[None, :], stop[None, :],
         nan[None, :], nan[None, :], (nan if stop_pts is None else stop_pts)[None, :], nan[None, :],
         new_day, 1, adaptive, reenter, False, False, True, 0, True, TICK,
@@ -387,7 +388,7 @@ def test_slot_clock_overrides_depend_on_config_not_data(overrides: dict[str, str
 
 
 @strategy(state=S, params=P, features=F)
-def ioc_breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
+def ioc_breakout(s: S, p: P, f: F, bar: Bar, pos: Position) -> Decision:
     if bar.i == 0:
         return enter_limit_ioc(1, 102.0, stop=99.0)
     return HOLD

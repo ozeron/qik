@@ -11,6 +11,7 @@ import pytest
 from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from ve_kernel_adapter import run_columns as kernel_columns
 
 from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules
 from qik.vector_engine import kernel as K
@@ -85,7 +86,7 @@ def _run_kernel(
     nan = np.full(n, np.nan)
     extra = [nan if a is None else a for a in (limit, stop_pts, target_pts)]
     day = np.zeros(n, np.bool_) if new_day is None else new_day
-    out = K.run_columns(
+    out = kernel_columns(
         arrays["o"], arrays["h"], arrays["lo"], arrays["c"],
         side[None, :], exit_[None, :], stop[None, :], target[None, :],
         extra[0][None, :], extra[1][None, :], extra[2][None, :],

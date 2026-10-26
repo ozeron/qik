@@ -56,10 +56,8 @@ from .types import (
     move_target,
     trail,
 )
-from .types import Decision as TypedDecision
 
 __all__ = [
-    "TypedDecision",
     "NAUTILUS",
     "GridResult",
     "Bar",

@@ -11,6 +11,7 @@ import pytest
 from _typed_scripts import Script, replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from ve_kernel_adapter import run_columns as kernel_columns
 from vector_engine.lifecycle_fixtures import F, lifecycle_step
 
 from qik.vector_engine import (
@@ -23,7 +24,6 @@ from qik.vector_engine import (
     Rules,
     run,
 )
-from qik.vector_engine import kernel as K
 from qik.vector_engine.api import _day_order_dates
 from qik.vector_engine.reference import simulate_column_reference
 from qik.vector_engine.testing import assert_python_jit_equal
@@ -55,7 +55,7 @@ def differential(b: Bars, sig: Script, rules: Rules) -> None:
         completed_close=rules.entry_bar_decision == "completed_close",
     )
     slots = sig.get("stop_update") is not None or sig.get("entry_stop") is not None
-    raw = K.run_columns(
+    raw = kernel_columns(
         b.open,
         b.high,
         b.low,

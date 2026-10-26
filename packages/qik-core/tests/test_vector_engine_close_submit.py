@@ -10,11 +10,13 @@ import pytest
 from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from ve_kernel_adapter import run_columns as kernel_columns
 
 from qik.vector_engine import (
     HOLD,
     Bar,
     Bars,
+    Decision,
     Features,
     FillTiming,
     Params,
@@ -22,14 +24,12 @@ from qik.vector_engine import (
     Profile,
     Rules,
     State,
-    TypedDecision,
     enter,
     exit,
     run,
     strategy,
     trail,
 )
-from qik.vector_engine import kernel as K
 from qik.vector_engine import reference as R
 from scripts.engine_test_tiers import engine_examples
 
@@ -100,7 +100,7 @@ class F(Features):
 
 
 @strategy(state=S, params=P, features=F)
-def amend(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
+def amend(s: S, p: P, f: F, bar: Bar, pos: Position) -> Decision:
     s.calls += 1
     if bar.i == 0:
         return enter(1, stop=95.0)
@@ -112,7 +112,7 @@ def amend(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
 
 
 @strategy(state=S, params=P, features=F)
-def reentry(s: S, p: P, f: F, bar: Bar, pos: Position) -> TypedDecision:
+def reentry(s: S, p: P, f: F, bar: Bar, pos: Position) -> Decision:
     s.calls += 1
     if bar.i == 0:
         return enter(1, stop=99.0)
@@ -189,7 +189,7 @@ def test_hypothesis_independent_reference(
     def col(z):
         return np.ascontiguousarray(z[None, :])
 
-    out = K.run_columns(
+    out = kernel_columns(
         bars.open,
         bars.high,
         bars.low,
@@ -252,7 +252,7 @@ def test_new_rules_dense_reference(
     monkeypatch.setattr(
         dense, "simulate_column_reference", partial(R.simulate_column_reference, **options)
     )
-    monkeypatch.setattr(K, "run_columns", partial(K.run_columns, **options))
+    monkeypatch.setattr(dense, "kernel_columns", partial(kernel_columns, **options))
     dense.test_slots_kernel_equals_independent_reference_dense(0, False, oto, entry_next, exit_next)
 
 

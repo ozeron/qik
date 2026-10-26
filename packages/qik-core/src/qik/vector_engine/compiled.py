@@ -49,10 +49,9 @@ from .api import (
 )
 from .schema import Features, Params, Scalar, State, StrategySpec
 from .straddle import PAIR_FIELDS
-from .types import Bar, Decision
-from .types import Position as AuthorPosition
+from .types import Bar, Decision, Position
 
-RULES_WIDTH = 29
+RULES_WIDTH = K.RULES_WIDTH
 
 
 def _run_columns_typed(
@@ -145,47 +144,44 @@ def _run_columns_typed(
     ends = np.r_[session_days[1:], True]
 
     tick = instrument.tick if instrument else 0.0
-    rc = np.array(
-        [
-            rules.limit_chase_bars,
-            rules.adaptive_high_low_ordering,
-            rules.reenter_on_exit_bar,
-            rules.stale_book == "nautilus",
-            rules.protect_rejected == "flatten",
-            rules.effective_entry_fill is FillTiming.NEXT_OPEN,
-            rules.effective_exit_fill is FillTiming.NEXT_OPEN,
-            rules.latency_bars,
-            rules.fill_model is FillModel.ONE_TICK,
-            tick,
-            rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
-            0
-            if rules.bracket_anchor is None
-            else (1 if rules.bracket_anchor is BracketAnchor.SIGNAL else 2),
-            rules.target_gap is TargetGap.GAP_IMPROVED,
-            tuple(TickRound).index(rules.tick_round),
-            rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
-            rules.target_order == "mit",
-            rules.protection == "oto",
-            rules.amend_rejected == "keep",
-            rules.stop_update_mode == "ratchet",
-            rules.stop_entry_in_market == "skip",
-            tuple(Flatten).index(rules.flatten),
-            # CoreContext's stable ABI is REFUSE=0, LAST_BAR_CLOSE=1,
-            # NEXT_OBSERVED=2, unlike the public enum's declaration order.
-            {
-                SessionBoundary.REFUSE: 0,
-                SessionBoundary.LAST_BAR_CLOSE: 1,
-                SessionBoundary.NEXT_OBSERVED: 2,
-            }[rules.session_boundary],
-            (rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
-            rules.amend_timing == "close_submit",
-            rules.entry_bar_decision == "completed_close",
-            rules.arm_stop == "next_bar",
-            rules.day_order_expiry == "cancel",
-            rules.order_lifetime == "next_bar",
-            rules.exit_and_rearm,
-        ],
-        float,
+    rc = K.rule_settings(
+        chase=rules.limit_chase_bars,
+        adaptive=rules.adaptive_high_low_ordering,
+        reenter=rules.reenter_on_exit_bar,
+        stale_drop=rules.stale_book == "nautilus",
+        protect_flatten=rules.protect_rejected == "flatten",
+        next_open=rules.effective_entry_fill is FillTiming.NEXT_OPEN,
+        exit_next_open=rules.effective_exit_fill is FillTiming.NEXT_OPEN,
+        latency_bars=rules.latency_bars,
+        one_tick=rules.fill_model is FillModel.ONE_TICK,
+        tick=tick,
+        adverse_first=rules.bracket_policy is BracketPolicy.ADVERSE_FIRST,
+        bracket_anchor=0
+        if rules.bracket_anchor is None
+        else 1
+        if rules.bracket_anchor is BracketAnchor.SIGNAL
+        else 2,
+        target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,
+        tick_round=tuple(TickRound).index(rules.tick_round),
+        cross_session=rules.session_boundary is SessionBoundary.NEXT_OBSERVED,
+        mit=rules.target_order == "mit",
+        oto=rules.protection == "oto",
+        amend_keep=rules.amend_rejected == "keep",
+        ratchet=rules.stop_update_mode == "ratchet",
+        stop_skip=rules.stop_entry_in_market == "skip",
+        flatten=tuple(Flatten).index(rules.flatten),
+        boundary={
+            SessionBoundary.REFUSE: 0,
+            SessionBoundary.LAST_BAR_CLOSE: 1,
+            SessionBoundary.NEXT_OBSERVED: 2,
+        }[rules.session_boundary],
+        combine=(rules.stop_combine == "tighter") + 2 * (rules.target_combine == "tighter"),
+        amend_close=rules.amend_timing == "close_submit",
+        completed_close=rules.entry_bar_decision == "completed_close",
+        arm_stop=rules.arm_stop == "next_bar",
+        day_cancel=rules.day_order_expiry == "cancel",
+        next_bar=rules.order_lifetime == "next_bar",
+        exit_and_rearm=rules.exit_and_rearm,
     )
     assert len(rc) == RULES_WIDTH, "compiled Rules builder/reader width mismatch"
     pv = instrument.point_value if instrument else 1.0
@@ -257,7 +253,11 @@ def _run_columns_typed(
             expiry_days,
             pair_declared,
         )
-        counts, meta = raw[0], raw[1]
+        counts = raw[0]
+        # Scan the whole batch before touching any potentially incomplete row.
+        if np.any(counts == -K.ACCOUNT_INVALID_SIDE):
+            raise ValueError("compiled core: side must be -1, 0, 1")
+        meta = raw[1]
         configs = [
             _Config(
                 int(counts[p]),
@@ -762,7 +762,7 @@ def _record_run(
 
 @typing_overload
 def run[S: State, P: Params, F: Features](
-    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
+    step: Callable[[S, P, F, Bar, Position], Decision],
     bars: Bars,
     *,
     grid: None = None,
@@ -780,7 +780,7 @@ def run[S: State, P: Params, F: Features](
 
 @typing_overload
 def run[S: State, P: Params, F: Features](
-    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
+    step: Callable[[S, P, F, Bar, Position], Decision],
     bars: Bars,
     *,
     grid: Mapping[str, Sequence[Scalar]],
@@ -798,7 +798,7 @@ def run[S: State, P: Params, F: Features](
 
 @typing_overload
 def run[S: State, P: Params, F: Features](
-    step: Callable[[S, P, F, Bar, AuthorPosition], Decision],
+    step: Callable[[S, P, F, Bar, Position], Decision],
     bars: Bars,
     *,
     grid: Mapping[str, Sequence[Scalar]] | None,

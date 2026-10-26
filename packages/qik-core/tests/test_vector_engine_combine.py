@@ -18,6 +18,7 @@ from qik.vector_engine import (
     Bars,
     Compliance,
     Costs,
+    Decision,
     Features,
     FillTiming,
     Instrument,
@@ -26,7 +27,6 @@ from qik.vector_engine import (
     Profile,
     Rules,
     State,
-    TypedDecision,
     enter,
     run,
     strategy,
@@ -173,7 +173,7 @@ class F(Features):
 
 
 @strategy(state=S, params=C, features=F)
-def combined(s: S, p: C, f: F, bar: Bar, pos: Position) -> TypedDecision:
+def combined(s: S, p: C, f: F, bar: Bar, pos: Position) -> Decision:
     s.calls += 1
     if bar.i == 0:
         return enter(1, stop=105.0, stop_points=p.distance)

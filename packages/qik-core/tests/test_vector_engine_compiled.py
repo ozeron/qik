@@ -12,6 +12,7 @@ from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from test_vector_engine import _case, _dense_case
+from ve_kernel_adapter import run_columns as kernel_columns
 
 from qik.vector_engine import (
     Bar,
@@ -26,7 +27,6 @@ from qik.vector_engine import (
     run,
     strategy,
 )
-from qik.vector_engine import kernel as K
 from qik.vector_engine.api import SIGNAL_FIELDS
 from qik.vector_engine.compiled import (
     RULES_WIDTH,
@@ -43,7 +43,7 @@ from qik.vector_engine.testing import (
     replay_step,
 )
 
-_BATCH = K.run_columns
+_BATCH = kernel_columns
 # Stateless typed records: numba refuses zero-width records (same byte as run).
 _EMPTY = np.zeros(1, dtype=[("_empty", "i1")]).view(np.recarray)
 
@@ -342,14 +342,17 @@ def test_public_last_close_flatten_needs_no_calendar():
 )
 @pytest.mark.final
 def test_replay_original_hypothesis_corpus(monkeypatch, slots, entry_clock, exit_clock):
+    import test_vector_engine as base
     from test_vector_engine import test_kernel_equals_reference
 
-    monkeypatch.setattr(K, "run_columns", compare)
+    monkeypatch.setattr(base, "kernel_columns", compare)
     test_kernel_equals_reference(next_open=entry_clock, exit_next_open=exit_clock, slots=slots)
 
 
 @pytest.mark.final
 def test_replay_original_dense_corpora(monkeypatch):
+    import test_vector_engine as base
+    import test_vector_engine_slots as slots_module
     from test_vector_engine import (
         test_kernel_equals_reference_dense_both_stale_modes,
         test_kernel_equals_reference_dense_limit_entries,
@@ -357,7 +360,8 @@ def test_replay_original_dense_corpora(monkeypatch):
     from test_vector_engine_slots import test_slots_kernel_equals_independent_reference_dense
     from test_vector_engine_venue import test_venue_kernel_equals_independent_reference_dense
 
-    monkeypatch.setattr(K, "run_columns", compare)
+    monkeypatch.setattr(base, "kernel_columns", compare)
+    monkeypatch.setattr(slots_module, "kernel_columns", compare)
     for entry_clock, exit_clock in ((False, False), (True, True), (True, False), (False, True)):
         test_kernel_equals_reference_dense_both_stale_modes(entry_clock, exit_clock)
     test_kernel_equals_reference_dense_limit_entries()

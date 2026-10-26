@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from _typed_scripts import infinite_stop_update_step, replay, script, stop_update_step
+from ve_kernel_adapter import run_columns as kernel_columns
 
 from qik.vector_engine import (
     Bars,
@@ -310,7 +311,7 @@ def test_slots_kernel_equals_independent_reference_dense(
         def col(a):
             return np.ascontiguousarray(a[None, :])
 
-        out = K.run_columns(
+        out = kernel_columns(
             o,
             h,
             lo,
