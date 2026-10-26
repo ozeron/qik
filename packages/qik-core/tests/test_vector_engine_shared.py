@@ -1,51 +1,59 @@
-"""Fully bound record strategies use the shared simple, venue and slot matchers."""
+"""Shared typed record strategies use the shared simple, venue and slot matchers."""
 
 from __future__ import annotations
-
-import importlib
-import sys
 
 import numba as nb
 import numpy as np
 import pytest
 
-from qik.vector_engine import Decision
+from qik.vector_engine import Bar, Features, Params, Position, State, TypedDecision, strategy
 from qik.vector_engine import kernel as K
 from qik.vector_engine.api import SIGNAL_FIELDS
-from qik.vector_engine.bound import write_bound_module
-from qik.vector_engine.compiled import RULES_WIDTH, _Buffers, _layout
+from qik.vector_engine.compiled import (
+    RULES_WIDTH,
+    _Buffers,
+    _layout,
+    _python_module,
+    _python_runner,
+)
+from qik.vector_engine.fixed import runner as fixed_runner
 
 
-@nb.njit(cache=True)
-def record_step(state, params, features, bar, pos):
+class Calls(State):
+    calls: int = 0
+
+
+class Distance(Params):
+    distance: float = 2.0
+
+
+class NoFeatures(Features):
+    pass
+
+
+@strategy(state=Calls, params=Distance, features=NoFeatures)
+def record_step(
+    state: Calls, params: Distance, features: NoFeatures, bar: Bar, pos: Position
+) -> TypedDecision:
     state.calls += 1
-    return Decision(
+    return TypedDecision(
         side=1 if state.calls == 1 else 0,
-        stop=bar.close - params[0],
-        target=bar.close + params[0],
+        stop=bar.close - params.distance,
+        target=bar.close + params.distance,
     )
-
-
-@pytest.fixture(scope="module")
-def bound_runner(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("bound_record")
-    sys.path.insert(0, str(directory))
-    name = "bound_record_test"
-    write_bound_module(directory / f"{name}.py", __name__, "record_step")
-    try:
-        yield importlib.import_module(name)
-    finally:
-        sys.path.remove(str(directory))
-        sys.modules.pop(name, None)
 
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
 @pytest.mark.parametrize("rules_width", [22, 25, 26, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1])
-def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
-    module = bound_runner
+def test_shared_record_matches_batch(mode: str, rules_width: int):
+    runner = (
+        _python_runner(_python_module(record_step))
+        if nb.config.DISABLE_JIT
+        else fixed_runner(record_step).run
+    )
     x = np.array([100.0, 101.0, 102.0, 100.0])
-    states = np.zeros(2, dtype=[("calls", "i8")]).view(np.recarray)
-    params = np.array([[2.0], [3.0]])
+    states = Calls.new(2)
+    params = Distance.from_grid({"distance": [2.0, 3.0]})
     rules = np.zeros(rules_width)
     rules[0] = 1
     rules[7] = int(mode == "venue")
@@ -57,7 +65,7 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
     args = (
         states,
         params,
-        np.zeros((len(x), 1)),
+        (np.full(len(x), -1, np.int64),),
         x,
         x + 1,
         x - 1,
@@ -76,14 +84,19 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         blank,
         np.full((12, 0), np.nan),
         layout.risk_row,
+        None,
+        np.empty((0, 2, 0), np.int8),
+        np.empty(0, np.bool_),
+        np.empty(0, np.bool_),
+        False,
     )
     if rules_width != RULES_WIDTH:
         with pytest.raises(
             ValueError, match=f"compiled Rules ABI requires exactly {RULES_WIDTH} values"
         ):
-            module.run(*args)
+            runner(*args)
         return
-    raw = module.run(*args)
+    raw = runner(*args)
     # Every field stored: the decision rows are the store rows in Signals order.
     decisions = store[:, layout.rows]
     assert decisions.shape == (2, 31, len(x))
@@ -117,4 +130,7 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         for q in range(7):
             np.testing.assert_array_equal(trades[q][j, :count], batch[q + 8][start:end])
     if not nb.config.DISABLE_JIT:
-        assert not any(item.library.has_dynamic_globals for item in module.run.overloads.values())
+        assert not any(
+            item.library.has_dynamic_globals
+            for item in fixed_runner(record_step).engine.invoke.overloads.values()
+        )

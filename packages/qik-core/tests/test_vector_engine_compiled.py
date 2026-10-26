@@ -28,7 +28,13 @@ from qik.vector_engine import (
 )
 from qik.vector_engine import kernel as K
 from qik.vector_engine.api import SIGNAL_FIELDS
-from qik.vector_engine.compiled import RULES_WIDTH, _bound, _Buffers, _layout
+from qik.vector_engine.compiled import (
+    RULES_WIDTH,
+    _Buffers,
+    _layout,
+    _python_module,
+    _python_runner,
+)
 from qik.vector_engine.testing import (
     ReplayParams,
     ReplayState,
@@ -48,7 +54,7 @@ def rows(matrix: np.ndarray) -> list[tuple[float, ...]]:
 
 
 def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
-    """One recorded column through the strategy-bound runner of typed replay_step."""
+    """One recorded column through the shared fixed-ABI runner of typed replay_step."""
     features = replay_features(decisions)
     clock = np.full(len(c), -1, np.int64)
     # Every field stored, as the batch path stores them; rounding and the sizing risk row
@@ -56,7 +62,14 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
     everything = frozenset(range(len(SIGNAL_FIELDS)))
     layout = _layout(everything, everything, bool(rc[13]), bool(slots and rc[8] and rc[5]))
     store, trades = _Buffers().take(1, layout.nrows, len(c), 2 * len(c))
-    raw = _bound(replay_step).run(
+    from qik.vector_engine.fixed import runner as fixed_runner
+
+    runner = (
+        _python_runner(_python_module(replay_step))
+        if nb.config.DISABLE_JIT
+        else fixed_runner(replay_step).run
+    )
+    raw = runner(
         _EMPTY,
         _EMPTY,
         (clock, *features),

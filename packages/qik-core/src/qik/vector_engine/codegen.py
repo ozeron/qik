@@ -1,8 +1,4 @@
-"""Internal source binding for Phase 2.2; generated modules own their disk cache.
-
-Emit the shared matcher source, never a separately maintained matching algorithm.
-The strategy is a module global throughout the call graph, not a callback argument.
-"""
+"""Generate the shared compiled matcher and the undecorated Python oracle."""
 
 from __future__ import annotations
 
@@ -12,26 +8,32 @@ import importlib
 import inspect
 import textwrap
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from . import account, compiled, kernel, protection, straddle, types
 
 
-def write_bound_module(
-    destination: Path, strategy_module: str, strategy_name: str, *, records: bool = False
-) -> None:
-    """Write an importable internal runner for ``step(state, params, feats, bar, pos)``.
+def write_python_module(destination: Path, strategy_module: str, strategy_name: str) -> None:
+    """Emit an undecorated matcher for the independent Python execution mode."""
+    _write_module(destination, strategy_module, strategy_name)
 
-    ``run`` has the prototype _run ABI without its first callback argument. State
-    is a structured array with one independent record per parameter row. This is
-    a code-generation primitive, not the public strategy decorator or Result API.
-    Regenerate when engine or strategy source changes, before importing the module.
-    records=True transports typed features with an int64 clock and appends final
-    copied state rows to the raw output. The prototype ABI stays unchanged otherwise.
-    """
-    if not all(part.isidentifier() for part in strategy_module.split(".")):
+
+def write_fixed_module(destination: Path) -> None:
+    """Emit the same matcher with a strategy-independent callback boundary."""
+    _write_module(destination, None, None)
+
+
+def _write_module(
+    destination: Path,
+    strategy_module: str | None,
+    strategy_name: str | None,
+) -> None:
+    callback = strategy_module is None
+    if strategy_module is not None and not all(
+        part.isidentifier() for part in strategy_module.split(".")
+    ):
         raise ValueError("strategy_module must be an importable module name")
-    if not strategy_name.isidentifier():
+    if strategy_name is not None and not strategy_name.isidentifier():
         raise ValueError("strategy_name must be an identifier")
 
     def source(function: Any) -> ast.FunctionDef:
@@ -59,28 +61,15 @@ def write_bound_module(
 
     adapter = ast.parse(_ADAPTER_SOURCE).body[0]
     assert isinstance(adapter, ast.FunctionDef)
-    adapter.name = "_bound_step"
-    if records:
-        # Keep the clock int64 and each named feature's dtype through the ABI.
-        class RecordFeatures(ast.NodeTransformer):
-            def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
-                if isinstance(node.value, ast.Name) and node.value.id == "feats":
-                    return ast.parse("feats[0][i]", mode="eval").body
-                return cast(ast.expr, self.generic_visit(node))
+    adapter.name = "_python_step"
 
-            def visit_Name(self, node: ast.Name) -> ast.expr:
-                if node.id == "CompiledBar":
-                    return ast.Name("Bar", ast.Load())
-                return node
-
-        RecordFeatures().visit(adapter)
-        for node in ast.walk(adapter):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "_strategy"
-            ):
-                node.args[2] = ast.parse("_features_type(*feats[1:])", mode="eval").body
+    for node in ast.walk(adapter):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_strategy"
+        ):
+            node.args[2] = ast.parse("_features_type(*feats[1:])", mode="eval").body
 
     decision = source(kernel._core_decision)
     for node in ast.walk(decision):
@@ -89,9 +78,43 @@ def write_bound_module(
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "step"
         ):
-            node.func = ast.Name("_bound_step", ast.Load())
+            node.func = ast.Name("_python_step", ast.Load())
 
-    functions: list[ast.stmt] = [adapter, decision]
+    if callback:
+        # The matcher remains identical; only the call boundary is indirect.
+        for node in ast.walk(decision):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_python_step"
+            ):
+                node.func = ast.Attribute(ast.Name("core", ast.Load()), "step", ast.Load())
+    if callback:
+
+        class CallbackStatus(ast.NodeTransformer):
+            def visit_Expr(self, node: ast.Expr) -> ast.stmt | list[ast.stmt]:
+                call = node.value
+                if (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "step"
+                ):
+                    call.args = [
+                        ast.parse("np.int64(core.feats.ctypes.data)", mode="eval").body,
+                        ast.Name("i", ast.Load()),
+                    ]
+                    return [
+                        ast.Expr(call),
+                        ast.If(
+                            test=ast.parse("core.account[2] != 0", mode="eval").body,
+                            body=[ast.Return()],
+                            orelse=[],
+                        ),
+                    ]
+                return node
+
+        CallbackStatus().visit(decision)
+    functions: list[ast.stmt] = [decision] if callback else [adapter, decision]
     for name in (
         "_venue_column_advance",
         "_column_advance",
@@ -110,17 +133,49 @@ def write_bound_module(
         if isinstance(node, ast.Attribute) and node.attr.startswith("_compiled_"):
             node.attr = node.attr.replace("_compiled_", "_")
     BindGlobals().visit(runner)
-    if records:
-        for node in runner.body:
-            if isinstance(node, ast.Return):
-                assert isinstance(node.value, ast.Tuple)
-                node.value.elts.append(ast.Name("init_state", ast.Load()))
+    for node in runner.body:
+        if isinstance(node, ast.Return):
+            assert isinstance(node.value, ast.Tuple)
+            node.value.elts.append(ast.Name("init_state", ast.Load()))
+    if callback:
+        runner.args.args.insert(0, ast.arg(arg="step"))
+        for node in ast.walk(runner):
+            if isinstance(node, ast.Name) and node.id == "_no_callback":
+                node.id = "step"
+    if callback:
+        # The context owns no storage; all pointed-to arrays live through run.
+        # Build once per column after its view and decision buffers are allocated.
+        for node in ast.walk(runner):
+            if isinstance(node, ast.For):
+                for index, statement in enumerate(node.body):
+                    if isinstance(statement, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == "core"
+                        for target in statement.targets
+                    ):
+                        setup = ast.parse("""
+context = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
+                    feats[0].ctypes.data, feats[1].ctypes.data,
+                    o.ctypes.data, h.ctypes.data, lo.ctypes.data, c.ctypes.data,
+                    volume.ctypes.data, view.ctypes.data, decision.ctypes.data, n, account.ctypes.data], dtype=np.int64)
+""").body[0]
+                        node.body.insert(index, setup)
+                        assert isinstance(statement.value, ast.Call)
+                        statement.value.args[3] = ast.Name("context", ast.Load())
+                        break
     functions.append(runner)
-    strategy = importlib.import_module(strategy_module)
+    strategy = None if callback else importlib.import_module(strategy_module)
     fingerprint = hashlib.sha256(
         "\n".join(
             inspect.getsource(module)
-            for module in (kernel, compiled, protection, account, straddle, types, strategy)
+            for module in (
+                kernel,
+                compiled,
+                protection,
+                account,
+                straddle,
+                types,
+                *((strategy,) if strategy is not None else ()),
+            )
         ).encode()
     ).hexdigest()
     imports = ", ".join(
@@ -134,19 +189,22 @@ def write_bound_module(
         )
     )
     header = (
-        "# Generated by qik.vector_engine.bound; regenerate before importing.\n"
+        "# Generated by qik.vector_engine.codegen; regenerate before importing.\n"
         f"# Engine and strategy source: {fingerprint}\n"
-        f"from {strategy_module} import {strategy_name} as _strategy\n"
-        f"from qik.vector_engine.kernel import ({imports})\n"
-        "from qik.vector_engine.compiled import RULES_WIDTH, CompiledBar, Position\n"
+        + ("" if callback else f"from {strategy_module} import {strategy_name} as _strategy\n")
+        + f"from qik.vector_engine.kernel import ({imports})\n"
+        "from qik.vector_engine.compiled import RULES_WIDTH\n"
         "_no_callback = None\n"
     )
-    if records:
+    if not callback:
         header += (
             "from qik.vector_engine.types import Bar, Position\n"
             "_features_type = _strategy.__strategy__.features\n"
-            "_strategy = nb.njit(cache=True)(_strategy)\n"
         )
+    if not callback:
+        for function in functions:
+            if isinstance(function, ast.FunctionDef):
+                function.decorator_list = []
     text = (
         header
         + ast.unparse(ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[])))
@@ -158,8 +216,8 @@ def write_bound_module(
 
 # Scheduler and typed Decision transport; matcher bodies come from kernel above.
 _ADAPTER_SOURCE = """@nb.njit(cache=True)
-def _bound_step(state, params, i, feats, o, h, lo, c, v, view, out):
-    bar = CompiledBar(i, int(feats[i, 0]), o, h, lo, c, v)
+def _python_step(state, params, i, feats, o, h, lo, c, v, view, out):
+    bar = Bar(i, feats[0][i], o, h, lo, c, v)
     pos = Position(int(view[0]), view[1], int(view[2]), view[3], view[4], view[5], int(view[6]), view[7], int(view[8]), view[9], -1 if np.isnan(view[10]) else int(view[10]), view[11], view[12], view[13])
     decision = _strategy(state, params, feats, bar, pos)
     out[0] = decision[0]

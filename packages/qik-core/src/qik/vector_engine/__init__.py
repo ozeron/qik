@@ -23,7 +23,7 @@ from .api import (
     TickRound,
     require_nautilus,
 )
-from .compiled import NAUTILUS, CompiledBar, GridResult, run
+from .compiled import NAUTILUS, GridResult, run
 from .grid import grid
 from .htf import htf, htf_align
 from .kernel import (
@@ -104,7 +104,6 @@ __all__ = [
     "grid",
     "require_nautilus",
     "run",
-    "CompiledBar",
     "Position",
     "V_SIDE",
     "V_QTY",

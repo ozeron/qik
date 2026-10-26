@@ -6,10 +6,7 @@ The default declaration supports all fields and therefore chooses the slots body
 
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import os
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import accumulate
@@ -521,6 +518,10 @@ def _matched_result(
 ) -> EngineResult:
     """Validate and account one matched config through the existing API, without rematching."""
     cnt, meta = config.count, config.meta
+    if cnt == -11:
+        raise RuntimeError(
+            "fixed-ABI strategy callback raised; run refused (use jit=False for the original exception)"
+        )
     if cnt == -3:
         raise ValueError("straddle arm_stop=next_bar composition is unproved")
     if cnt == -4:
@@ -595,36 +596,6 @@ def _matched_result(
     return result
 
 
-# Numeric time is UTC epoch nanoseconds; no pandas objects cross the compiled boundary.
-
-
-class CompiledBar(NamedTuple):
-    i: int
-    ts: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-
-
-class Position(NamedTuple):
-    side: int
-    qty: float
-    entry_i: int
-    entry_px: float
-    stop: float
-    target: float
-    working_side: int
-    working_level: float
-    last_exit_i: int
-    last_exit_px: float
-    last_exit_reason: int
-    equity: float
-    working_long: float = np.nan
-    working_short: float = np.nan
-
-
 NAUTILUS = Rules()
 
 
@@ -654,17 +625,17 @@ class GridResult[S: State]:
 
 # Sources and schema classes are immutable during a process; a new process still
 # regenerates the content-addressed module and validates its complete disk identity.
-_bound_modules: dict[tuple[Any, ...], Any] = {}
+_python_modules: dict[tuple[Any, ...], Any] = {}
 
 
-def _bound(step: Any) -> Any:
-    from .bound import write_bound_module
+def _python_module(step: Any) -> Any:
+    from .codegen import write_python_module
 
     schema: StrategySpec = step.__strategy__
     directory = Path(os.environ.get("QIK_VECTOR_CACHE", Path.home() / ".cache/qik/vector_engine"))
     key = (step, schema.state, schema.params, schema.features, True, directory.resolve())
-    if key in _bound_modules:
-        return _bound_modules[key]
+    if key in _python_modules:
+        return _python_modules[key]
     module_name, name = step.__module__, step.__name__
     if module_name == "__main__" or "<locals>" in step.__qualname__:
         raise ValueError("strategy must be defined at module scope in an importable module")
@@ -672,25 +643,15 @@ def _bound(step: Any) -> Any:
     # Generate to a process-owned draft, then publish at a content-addressed path.
     draft = directory / f"draft_{os.getpid()}_{name}.py"
     try:
-        write_bound_module(draft, module_name, name, records=True)
-        source = draft.read_bytes()
+        write_python_module(draft, module_name, name)
+        source = draft.read_text()
     finally:
         draft.unlink(missing_ok=True)
-    digest = hashlib.sha256(source).hexdigest()[:24]
-    bound_name = f"_qik_bound_{digest}"
-    path = directory / f"{bound_name}.py"
-    if not path.exists():
-        temp = directory / f"{bound_name}.{os.getpid()}.tmp"
-        temp.write_bytes(source)
-        temp.replace(path)
-    if bound_name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(bound_name, path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[bound_name] = module
-        spec.loader.exec_module(module)
-    _bound_modules[key] = sys.modules[bound_name]
-    return _bound_modules[key]
+    from .fixed import _load
+
+    module = _load(source, directory, "python")
+    _python_modules[key] = module
+    return module
 
 
 def _python_runner(module: Any) -> Callable[..., Any]:
@@ -741,9 +702,9 @@ def _record_run(
     if isinstance(supplied, Mapping):
         if unknown := set(supplied).difference(names):
             raise ValueError(f"unknown features: {sorted(unknown)}")
-        values = spec.features(*(np.ascontiguousarray(supplied[n]) for n in names))
+        values = spec.features(*(supplied[n] for n in names))
     else:
-        values = spec.features(*(np.ascontiguousarray(getattr(supplied, n)) for n in names))
+        values = spec.features(*(getattr(supplied, n) for n in names))
     clock = (
         np.full(len(bars), -1, np.int64) if bars.index is None else bars.index.as_unit("ns").asi8
     )
@@ -760,10 +721,14 @@ def _record_run(
         if params.dtype.names
         else np.zeros(len(params), dtype=[("_empty", "i1")]).view(np.recarray)
     )
-    module = _bound(step)
-    runner = module.run if jit or getattr(nb.config, "DISABLE_JIT") else _python_runner(module)
     final: list[np.recarray] = []
     try:
+        if jit and not getattr(nb.config, "DISABLE_JIT"):
+            from .fixed import runner as fixed_runner
+
+            runner = fixed_runner(step).run
+        else:
+            runner = _python_runner(_python_module(step))
         results = _run_columns_typed(
             internal_states,
             internal_params,
@@ -864,7 +829,10 @@ def run(
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
 ) -> Result[State] | GridResult[State]:
-    """Execute a typed strategy through the cacheable, strategy-bound shared engine.
+    """Execute a typed strategy through the shared fixed-ABI engine.
+
+    Python execution (``jit=False`` or NUMBA_DISABLE_JIT=1) uses the
+    undecorated Python matcher as an independent execution oracle.
 
     No grid returns Result[S]; an explicit grid (including {}) returns GridResult[S].
     """
