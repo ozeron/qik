@@ -102,8 +102,12 @@ def test_permute_bars_keeps_bar_population_and_validity() -> None:
     assert (out.volume == raw.volume).all()
     assert (out.high >= out[["open", "close", "low"]].max(axis=1) - 1e-9).all()
     assert (out.low <= out[["open", "close", "high"]].min(axis=1) + 1e-9).all()
-    shape = lambda f: np.sort(np.round(np.log(f.close / f.open).to_numpy(), 10))  # noqa: E731
-    assert np.array_equal(shape(out), shape(raw))
+    # The invariant is "same multiset of bar shapes", not "same rounded digits". Comparing at 10
+    # decimals used to pass only by luck: x86_64 and arm64 libm disagree in the last bits of
+    # log(close/open), and with 7,800 bars one value lands on a rounding boundary and fails on the
+    # other platform (runner, 2026-10-26). 1e-12 keeps the invariant sharp at ~1e-3 magnitudes.
+    shape = lambda f: np.sort(np.log(f.close / f.open).to_numpy())  # noqa: E731
+    assert np.allclose(shape(out), shape(raw), rtol=0, atol=1e-12)
     assert not np.allclose(out.close.to_numpy(), raw.close.to_numpy())
 
 
