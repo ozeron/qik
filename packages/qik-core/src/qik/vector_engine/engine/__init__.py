@@ -27,16 +27,25 @@ The protection has to survive Numba's fallbacks, not just its first choice: a re
 checkout (a ``.run`` worktree, site-packages) makes the in-tree ``__pycache__`` unwritable,
 and Numba then moves on to its user-wide locator, whose stamp is ``[mtime, size]`` again.
 So engine files get a content-stamped twin of *every* locator Numba can pick, tried in
-Numba's own order, and a function no locator can cache is compiled without a disk cache
-rather than stamped by mtime. A ``NUMBA_CACHE_LOCATOR_CLASSES`` override replaces that list
-entirely, so it is refused at import.
+Numba's own order, and a function no locator can cache is saved into a directory private to
+the process under a stamp no other process can reproduce, so its entry is never read back:
+neither an mtime stamp nor a ``PermissionError`` on the first save (a dispatcher created
+after this module imported never saw an import-time sweep). A
+``NUMBA_CACHE_LOCATOR_CLASSES`` override replaces that list entirely, so it is refused at
+import -- from ``os.environ`` as well as from ``numba.config``, which only snapshots the
+environment when numba imports.
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import inspect
+import os
+import secrets
+import shutil
 import sys
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from types import ModuleType
@@ -74,7 +83,8 @@ _LOCATOR_NAMES = (
     "ZipCacheLocator",
 )
 _content_variants: tuple[Any, ...] = ()
-_uncached: set[int] = set()  # id(py_func) of engine functions no locator could cache
+# (directory, stamp) for engine files no locator can cache; created on first use, per process.
+_throwaway: tuple[str, str] | None = None
 
 
 def fingerprint(*extra: Any) -> str:
@@ -116,6 +126,18 @@ def _digest() -> str:
     return _engine_digest
 
 
+def _configured_locator_classes(config: Any) -> str:
+    """``NUMBA_CACHE_LOCATOR_CLASSES`` if it is set, from the environment or numba's snapshot.
+
+    ``numba.config`` is populated from the environment when numba imports, so a caller that
+    imports numba, sets the variable and only then imports the engine leaves the snapshot
+    empty -- and a later ``numba.core.config.reload_config()`` (or any reload) would hand Numba
+    the override this guard never saw. Read both, so the refusal does not depend on import
+    order.
+    """
+    return os.environ.get("NUMBA_CACHE_LOCATOR_CLASSES") or str(config.CACHE_LOCATOR_CLASSES or "")
+
+
 def _install_cache_locator() -> None:
     """Key Numba's disk cache for this package by ``fingerprint()`` instead of file mtime.
 
@@ -132,7 +154,7 @@ def _install_cache_locator() -> None:
     # ``NUMBA_CACHE_LOCATOR_CLASSES`` replaces ``CacheImpl._locator_classes`` outright, so the
     # engine's locator is never consulted and Numba may answer an engine file from an
     # mtime-stamped entry. Refuse rather than serve stale machine code.
-    configured: str = config.CACHE_LOCATOR_CLASSES  # ty: ignore[unresolved-attribute]
+    configured = _configured_locator_classes(config)
     if configured:
         raise RuntimeError(
             "qik.vector_engine.engine keys its Numba disk cache by engine content, but "
@@ -183,10 +205,10 @@ class EngineCacheLocator:
             locator = variant.from_function(py_func, py_file)
             if locator is not None:
                 return locator
-        # Nowhere is writable (read-only tree and no usable user-wide cache). Compiling without
-        # a cache is correct and slower; an mtime-stamped entry is neither. ``_disable_uncached``
-        # switches these dispatchers' caches off as soon as the package has imported.
-        return _UncachedLocator(py_func, py_file)
+        # Nowhere is writable (read-only tree and no usable user-wide cache). An mtime-stamped
+        # entry is not an option; a throwaway entry no other process can read is, and it needs
+        # no sweep of the dispatchers that exist at import.
+        return _ThrowawayLocator(py_func, py_file)
 
 
 def _content_locator(base: Any) -> Any:
@@ -202,45 +224,52 @@ def _content_locator(base: Any) -> Any:
     return ContentLocator
 
 
-class _UncachedLocator:
-    """Placeholder locator for an engine file no locator can cache.
+def _throwaway_cache() -> tuple[str, str]:
+    """A writable directory and a stamp no other process can reproduce.
+
+    The fallback exists for a machine where neither the tree nor the user-wide cache is
+    writable, so this must not fail -- and it must not leave anything a later process can
+    read. ``mkdtemp`` gives the process a directory of its own, removed at exit, and the stamp
+    carries the engine fingerprint, the pid and a random token, so an index written here can
+    only ever be compared against itself. Numba compares the recorded stamp with the one the
+    locator returns and treats a mismatch as an empty index: a save is a harmless write, a
+    read by any other process is a miss. Within this process the source is the same source, so
+    a hit is the machine code just compiled, never an older engine's.
+    """
+    global _throwaway
+    if _throwaway is None:
+        directory = tempfile.mkdtemp(prefix="qik-engine-cache-")
+        atexit.register(shutil.rmtree, directory, True)
+        _throwaway = (directory, f"{fingerprint()}-{os.getpid()}-{secrets.token_hex(8)}")
+    return _throwaway
+
+
+class _ThrowawayLocator:
+    """Stand-in locator for an engine file no locator can cache.
 
     Numba builds a ``Cache`` per ``cache=True`` dispatcher and needs a locator object to do
-    it. ``_disable_uncached`` turns those caches off right after import, so this path is never
-    read or written: the functions compile on every run instead. Raising in ``from_function``
-    would fail the import itself, which a read-only filesystem does not warrant.
+    it, asking for the cache path and the source stamp there and then. Raising in
+    ``from_function`` would fail the import itself, which a read-only filesystem does not
+    warrant. Saving to ``_throwaway_cache()`` instead costs a write into the process's own
+    temporary directory and can never answer a later process. This is why nothing has to
+    sweep the dispatchers that exist after import: one created later behaves the same.
     """
 
     def __init__(self, py_func: Any, py_file: str) -> None:
-        self._py_file = py_file
         self._lineno = py_func.__code__.co_firstlineno
-        self._cache_path = str(_ENGINE_DIR / "__pycache__")
-        _uncached.add(id(py_func))
 
     def ensure_cache_path(self) -> None:
-        raise PermissionError(f"engine module {self._py_file} has no writable Numba cache")
+        """Re-create the throwaway directory if a forked child's exit removed it."""
+        os.makedirs(_throwaway_cache()[0], exist_ok=True)
 
     def get_cache_path(self) -> str:
-        return self._cache_path
+        return _throwaway_cache()[0]
 
     def get_source_stamp(self) -> str:
-        return fingerprint()
+        return _throwaway_cache()[1]
 
     def get_disambiguator(self) -> str:
         return str(self._lineno)
-
-
-def _disable_uncached() -> None:
-    """Compile the engine functions that found no writable cache without a disk cache."""
-    if not _uncached:
-        return
-    from numba.core.dispatcher import Dispatcher
-
-    for module in ENGINE_MODULES:
-        for value in vars(module).values():
-            if isinstance(value, Dispatcher) and id(value.py_func) in _uncached:
-                value._cache.disable()
-    _uncached.clear()
 
 
 _install_cache_locator()  # noqa: E402  (before the first ``cache=True`` dispatcher exists)
@@ -258,8 +287,6 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     slots,
     batch,
 )
-
-_disable_uncached()  # noqa: E402  (their caches exist only once the modules above have imported)
 
 
 def imports(names: Iterable[str]) -> list[str]:
