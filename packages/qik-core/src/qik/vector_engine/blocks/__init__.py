@@ -1,4 +1,4 @@
-"""Small causal entry/stop/exit blocks composed inside ``step(BarView)``.
+"""Small causal entry/stop/exit blocks composed inside typed ``step``.
 
 No block imports a project, computes fills or guesses position state. Each is
 admitted by equivalence to at least two named cores; see the Blocks documentation.

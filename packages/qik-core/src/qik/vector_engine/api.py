@@ -1,13 +1,5 @@
 """High-level API of the vector engine: validated inputs in, one trade table out.
 
-    bars = Bars(open, high, low, close, index=ts)
-    sig = Signals(entry_side, exit, stop=levels, target=levels)      # (n,) or (n, k) arrays
-    res = simulate(bars, sig, instrument=Instrument(tick=0.25, point_value=50.0),
-                   costs=Costs(commission_per_side=2.5, slippage_ticks=1),
-                   sizing=Sizing(risk_fraction=0.01), initial_cash=100_000)
-    res.trades        # one row per closed trade, all k configs, column ``config``
-    res.summary()     # one row per config: qik.metrics headline stats
-
 Defaults never round or clip inputs; explicit repro rounding is opt-in. Inputs the engine cannot
 execute the way Nautilus would (levels off the tick grid, a stop at or through the entry close,
 non-finite prices, inconsistent OHLC) raise ``ValueError`` naming the config and the bar.
@@ -29,6 +21,7 @@ from . import account as A
 from . import kernel as K
 from . import sizing as S
 from ._checks import is_int
+from ._columns import DecisionColumns
 from .sizing import Sizing
 from .straddle import PAIR_FIELDS, validate_pair
 
@@ -50,10 +43,8 @@ __all__ = [
     "Profile",
     "Result",
     "Rules",
-    "Signals",
     "Sizing",
     "require_nautilus",
-    "simulate",
 ]
 
 REASON_NAMES = {
@@ -215,7 +206,7 @@ class Rules:
     adaptive_high_low_ordering: bool = False  # Nautilus venue flag of the same name
     reenter_on_exit_bar: bool = True  # may a new entry follow an exit on the same bar's close
     stale_book: Literal["error", "nautilus"] = "error"
-    limit_chase_bars: int = 1  # LimitThenMarket.chase_after_bars for Signals.entry_limit (A15)
+    limit_chase_bars: int = 1  # LimitThenMarket.chase_after_bars for Decision.entry_limit (A15)
     # a limit entry's stop at or through its fill bar's close: "error", or "flatten" as V2 does
     protect_rejected: Literal["error", "flatten"] = "error"
     profile: Profile = Profile.NAUTILUS
@@ -435,69 +426,7 @@ def _as_2d(a: Any, n: int, dtype: Any, name: str) -> np.ndarray:
     return arr
 
 
-@dataclass(frozen=True)
-class Signals:
-    """What the strategy decides, one column per config.
-
-    ``entry_side[i]`` (+1 long, -1 short, 0 none) is a market entry decided at bar ``i``'s close,
-    taken only when flat. ``exit[i]`` decides a market exit there while in a position. Markets fill
-    at that close by default, or the next open under repro-only R1. ``stop[i]`` and
-    ``target[i]`` are absolute price levels placed with the entry decided on bar ``i`` (NaN = none): a
-    resting stop-market and a resting limit, live from bar ``i + 1``, cancelling each other (R1:
-    live during that bar after the entry open, with point offsets measured from that open).
-
-    ``entry_limit[i]`` turns that entry into the book's ``LimitThenMarket``: a resting limit at that
-    price, chased with a market order at the close ``Rules.limit_chase_bars`` bars later if still
-    unfilled (A15). ``stop_points`` / ``target_points`` give a level as a distance from the entry
-    instead (``Stop.points``): from the limit price when the limit fills, from the fill otherwise.
-    Each leg is either a level or points, never both. A limit entry needs a stop (V2 sends no
-    protection without one) and ``Bars.index`` (a limit still working when the New York date
-    changes is refused).
-
-    ``entry_stop`` is a DAY stop-market entry (A18). ``stop_update`` / ``target_update`` amend
-    existing legs at this close (A19); NaN keeps the level. ``breakeven_after_points`` and
-    ``breakeven_offset_points`` are fixed at entry and request a one-shot stop amendment (A19b).
-
-    ``entry_from_open[i]`` makes this entry's stop triggers (``entry_stop``, or a pair's
-    ``entry_stop_long`` / ``entry_stop_short``) signed offsets from the next bar's open,
-    resolved by the engine at that open. ``stop_fraction`` / ``target_fraction`` place
-    protection at ``fill * (1 - side * f)`` / ``fill * (1 + side * f)`` from the actual fill.
-    """
-
-    entry_side: np.ndarray
-    exit: np.ndarray
-    stop: np.ndarray | None = None
-    target: np.ndarray | None = None
-    entry_limit: np.ndarray | None = None
-    stop_points: np.ndarray | None = None
-    target_points: np.ndarray | None = None
-    entry_stop: np.ndarray | None = None
-    stop_update: np.ndarray | None = None
-    target_update: np.ndarray | None = None
-    breakeven_after_points: np.ndarray | None = None
-    breakeven_offset_points: np.ndarray | None = None
-    flatten: np.ndarray | None = None
-    exit_long: np.ndarray | None = None
-    exit_short: np.ndarray | None = None
-    entry_limit_ioc: np.ndarray | None = None
-    entry_stop_long: np.ndarray | None = None
-    entry_limit_ioc_long: np.ndarray | None = None
-    stop_long: np.ndarray | None = None
-    target_long: np.ndarray | None = None
-    stop_points_long: np.ndarray | None = None
-    target_points_long: np.ndarray | None = None
-    entry_stop_short: np.ndarray | None = None
-    entry_limit_ioc_short: np.ndarray | None = None
-    stop_short: np.ndarray | None = None
-    target_short: np.ndarray | None = None
-    stop_points_short: np.ndarray | None = None
-    target_points_short: np.ndarray | None = None
-    entry_from_open: np.ndarray | None = None
-    stop_fraction: np.ndarray | None = None
-    target_fraction: np.ndarray | None = None
-
-
-SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(Signals))
+SIGNAL_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(DecisionColumns))
 
 
 @dataclass
@@ -577,31 +506,9 @@ def _check_tick(levels: np.ndarray, rows: np.ndarray, tick: float, name: str) ->
         )
 
 
-def simulate(
-    bars: Bars,
-    signals: Signals,
-    *,
-    instrument: Instrument | None = None,
-    rules: Rules = Rules(),
-    costs: Costs | None = None,
-    sizing: Sizing[int] | Sizing[float] | None = None,
-    initial_cash: float | None = None,
-) -> Result:
-    """Run every config under the selected execution profile."""
-    return _simulate(
-        bars,
-        signals,
-        instrument=instrument,
-        rules=rules,
-        costs=costs,
-        sizing=sizing,
-        initial_cash=initial_cash,
-    )
-
-
 def _simulate(
     bars: Bars,
-    signals: Signals,
+    signals: DecisionColumns,
     *,
     instrument: Instrument | None = None,
     rules: Rules = Rules(),

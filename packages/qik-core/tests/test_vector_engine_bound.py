@@ -9,6 +9,7 @@ import numba as nb
 import numpy as np
 import pytest
 
+from qik.vector_engine import Decision
 from qik.vector_engine import kernel as K
 from qik.vector_engine.bound import write_bound_module
 from qik.vector_engine.compiled import RULES_WIDTH
@@ -17,22 +18,10 @@ from qik.vector_engine.compiled import RULES_WIDTH
 @nb.njit(cache=True)
 def record_step(state, params, features, bar, pos):
     state.calls += 1
-    return (
-        1 if state.calls == 1 else 0,
-        0,
-        bar.close - params[0],
-        bar.close + params[0],
-        np.nan,
-        np.nan,
-        np.nan,
-        np.nan,
-        np.nan,
-        np.nan,
-        np.nan,
-        np.nan,
-        0,
-        0,
-        0,
+    return Decision(
+        side=1 if state.calls == 1 else 0,
+        stop=bar.close - params[0],
+        target=bar.close + params[0],
     )
 
 

@@ -3419,7 +3419,7 @@ def _core_decision(
     core.levels[5, i] = _round_price(trigger, core.tick, core.rounding, d[0])
     core.levels[23, i], core.levels[24, i], core.levels[25, i] = d[28], d[29], d[30]
     core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])
-    # Match simulate's boundary transformation on the current decision, without future signals.
+    # Match shared validation boundary transformation on the current decision, without future signals.
     if core.boundary == 1 and core.ends[i] and core.exit_next_open:
         core.force_close[i] |= int(core.exits[i]) | (2 * int(d[13])) | (4 * int(d[14]))
         core.exits[i], core.long_exits[i], core.short_exits[i] = False, False, False

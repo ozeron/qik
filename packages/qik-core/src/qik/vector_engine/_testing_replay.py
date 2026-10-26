@@ -7,7 +7,8 @@ from typing import NoReturn
 
 import numpy as np
 
-from .api import Bars, Costs, Instrument, Result, Rules, Signals, Sizing, _simulate
+from ._columns import DecisionColumns
+from .api import Bars, Costs, Instrument, Result, Rules, Sizing
 from .compiled import NAUTILUS, run
 from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, strategy
 from .types import Bar, Decision, Position
@@ -174,7 +175,7 @@ class _Validated(Exception):
     """Raised in place of matching once the array path's input checks pass."""
 
 
-def _validate_like_simulate(
+def _validate_recorded_columns(
     features: ReplayFeatures,
     bars: Bars,
     signal_fields: Sequence[str],
@@ -191,7 +192,7 @@ def _validate_like_simulate(
     so a column with two refusals would otherwise report the matcher's one.
     """
     declared = set(signal_fields)
-    signals = Signals(
+    signals = DecisionColumns(
         features.side.astype(np.int8),
         features.exit,
         **{name: getattr(features, name) for name in Decision._fields[2:] if name in declared},
@@ -201,9 +202,8 @@ def _validate_like_simulate(
         raise _Validated
 
     try:
-        _simulate(
+        signals.evaluate(
             bars,
-            signals,
             rules=rules,
             instrument=instrument,
             costs=costs,
@@ -237,7 +237,7 @@ def replay_decisions(
     """
     features = replay_features(decisions)
     if len(decisions) == len(bars):
-        _validate_like_simulate(
+        _validate_recorded_columns(
             features,
             bars,
             signal_fields,

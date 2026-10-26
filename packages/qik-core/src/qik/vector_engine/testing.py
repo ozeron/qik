@@ -133,7 +133,7 @@ def capture_decisions(
         grid=run_kwargs.pop("grid", None),
         features=run_kwargs.pop("features", None),
         jit=run_kwargs.pop("jit", True),
-        _capture_signals=captured,
+        _capture_columns=captured,
         **run_kwargs,
     )
     tapes = tuple(
@@ -285,7 +285,7 @@ def assert_causal(step: Callable[..., Any], bars: Bars, n: int, **kw: Any) -> No
                     grid=config,
                     features=values,
                     jit=jit,
-                    _capture_signals=captured,
+                    _capture_columns=captured,
                     **kw,
                 )
             except ValueError as error:

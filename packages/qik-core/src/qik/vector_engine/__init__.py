@@ -1,6 +1,6 @@
 """Vector engine: Nautilus-compatible bar execution, vectorized across configs.
 
-Contract and assumptions: ``docs/vector-engine.md``. Entry point: ``simulate``.
+Contract and assumptions: ``docs/vector-engine.md``. Entry point: ``run``.
 """
 
 from .api import (
@@ -18,17 +18,13 @@ from .api import (
     Result,
     Rules,
     SessionBoundary,
-    Signals,
     Sizing,
     TargetGap,
     TickRound,
     require_nautilus,
-    simulate,
 )
 from .compiled import NAUTILUS, CompiledBar, GridResult, run
-from .core import BarView, Core, check_causal, signals_from_core
-from .core import Decision as LegacyDecision
-from .grid import grid, stack
+from .grid import grid
 from .htf import htf, htf_align
 from .kernel import (
     V_ENTRY_I,
@@ -64,7 +60,6 @@ from .types import Decision as TypedDecision
 
 __all__ = [
     "TypedDecision",
-    "LegacyDecision",
     "NAUTILUS",
     "GridResult",
     "Bar",
@@ -88,12 +83,10 @@ __all__ = [
     "flatten",
     "htf",
     "htf_align",
-    "BarView",
     "Bars",
     "BracketAnchor",
     "BracketPolicy",
     "Compliance",
-    "Core",
     "Costs",
     "Decision",
     "Instrument",
@@ -105,15 +98,11 @@ __all__ = [
     "Profile",
     "Result",
     "Rules",
-    "Signals",
     "TargetGap",
     "TickRound",
     "Sizing",
-    "check_causal",
     "grid",
     "require_nautilus",
-    "signals_from_core",
-    "simulate",
     "run",
     "CompiledBar",
     "Position",
@@ -129,5 +118,4 @@ __all__ = [
     "V_LAST_EXIT_PX",
     "V_LAST_EXIT_REASON",
     "V_EQUITY",
-    "stack",
 ]

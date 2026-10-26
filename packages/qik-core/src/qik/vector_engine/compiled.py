@@ -10,10 +10,9 @@ import hashlib
 import importlib.util
 import os
 import sys
-import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from itertools import accumulate, product
+from itertools import accumulate
 from pathlib import Path
 from types import FunctionType
 from typing import Any, NamedTuple, cast, get_type_hints
@@ -23,10 +22,9 @@ import numba as nb
 import numpy as np
 import pandas as pd
 from numba.core.errors import NumbaError
-from numba.extending import overload
-from numba.typed import List
 
 from . import kernel as K
+from ._columns import DecisionColumns
 from .api import (
     ONE_TICK_SLOTS,
     SIGNAL_FIELDS,
@@ -40,7 +38,6 @@ from .api import (
     Instrument,
     Rules,
     SessionBoundary,
-    Signals,
     Sizing,
     TargetGap,
     TickRound,
@@ -48,13 +45,11 @@ from .api import (
     _new_york_days,
     _one_tick_clock_slots,
     _raise_kernel_error,
-    _simulate,
     _sizing_error,
 )
 from .api import (
     Result as EngineResult,
 )
-from .core import Core
 from .schema import Features, Params, Scalar, State, StrategySpec
 from .straddle import PAIR_FIELDS
 from .types import Bar, Decision
@@ -62,271 +57,8 @@ from .types import Position as AuthorPosition
 
 RULES_WIDTH = 29
 
-_legacy_warning_sites: set[tuple[str, int]] = set()
 
-
-def _initial_core_state(init_state: Any, cores: Any, j: int | np.integer[Any]) -> Any:
-    return init_state.copy() if cores is None else cores[j]
-
-
-@overload(_initial_core_state)
-def _initial_core_state_type(init_state, cores, j):
-    # A class instance and an array must never enter the same Numba phi node.
-    if isinstance(cores, nb.types.NoneType):
-
-        def array_state(init_state, cores, j):
-            return init_state.copy()
-
-        return array_state
-
-    def class_state(init_state, cores, j):
-        return cores[j]
-
-    return class_state
-
-
-@nb.njit(parallel=True, cache=False)
-def _run(
-    step,
-    init_state,
-    params_grid,
-    feats,
-    o,
-    h,
-    lo,
-    c,
-    volume,
-    days,
-    ends,
-    rules,
-    economic,
-    initial_cash,
-    slots,
-    cores=None,
-    masks=None,
-    session_days=None,
-    expiry_days=None,
-    pair_declared=False,
-):
-    if len(rules) != RULES_WIDTH:
-        raise ValueError(f"compiled Rules ABI requires exactly {RULES_WIDTH} values")
-    if pair_declared and not slots:
-        raise ValueError("straddle requires the slots scheduler")
-    k, n = len(params_grid), len(c)
-    # A bar can close existing protection and a new same-bar bracket: at most two trades.
-    width = 2 * n
-    counts = np.empty(k, np.int64)
-    meta = np.empty((k, 8))
-    a0s, a1s = np.empty((k, width), np.int64), np.empty((k, width), np.int64)
-    a2s, a5s = np.empty((k, width), np.int8), np.empty((k, width), np.int8)
-    a3s, a4s, a6s = np.empty((k, width)), np.empty((k, width)), np.empty((k, width))
-    sides_all, exits_all = np.zeros((k, n), np.int8), np.zeros((k, n), np.bool_)
-    levels_all = np.full((k, 26, n), np.nan)
-    bools_all = np.zeros((k, 3, n), np.bool_)
-    decisions_all = np.full((k, 31, n), np.nan)
-    sizing_risks_all = np.full((k, n), np.nan)
-    for column in nb.prange(k):  # ty: ignore[not-iterable]  (Numba ships prange as a class)
-        j = np.int64(column)
-        sides, exits, levels = sides_all[j], exits_all[j], levels_all[j]
-        long_exits, short_exits = bools_all[j, 1], bools_all[j, 2]
-        force_close, force_open = np.zeros(n, np.int8), np.zeros(n, np.bool_)
-        if masks is not None:
-            force_close[:] = masks[j, 0]
-            force_open[:] = masks[j, 1]
-        view = np.full(14, np.nan)
-        view[K.V_LAST_EXIT_I] = -1
-        decision = np.empty(31)
-        # seen trades, equity, refusal code, sizing refusal bar and sizing error code
-        account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0])
-        core = K.CoreContext(
-            step,
-            _initial_core_state(init_state, cores, j),
-            params_grid[j],
-            feats,
-            volume,
-            view,
-            decision,
-            sides,
-            exits,
-            levels,
-            long_exits,
-            short_exits,
-            force_close,
-            force_open,
-            days if session_days is None else session_days,
-            ends,
-            economic,
-            account,
-            int(rules[20]),
-            int(rules[21]),
-            rules[9],
-            int(rules[13]),
-            decisions_all[j],
-            bool(rules[6]),
-            int(rules[22])
-            + 4 * int(rules[16])
-            + 8 * int(rules[8])
-            + 16 * int(rules[25])
-            + 32 * int(rules[26])
-            + 64 * int(rules[5])
-            + 128 * int(rules[28]),
-            sizing_risks_all[j],
-        )
-        a0, a1, a2, a3, a4, a5, a6 = a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j]
-        slip = rules[9] if rules[8] else 0.0
-        combine = int(rules[22]) if len(rules) > 22 else 0
-        arm_stop = bool(rules[25])
-        day_cancel = bool(rules[26])
-        if slots:
-            result = K._compiled_slots_column(
-                o,
-                h,
-                lo,
-                c,
-                sides,
-                exits,
-                levels[0],
-                levels[1],
-                levels[2],
-                levels[3],
-                levels[4],
-                days,
-                int(rules[0]),
-                bool(rules[1]),
-                bool(rules[2]),
-                bool(rules[3]),
-                bool(rules[4]),
-                bool(rules[5]),
-                bool(rules[6]),
-                int(rules[7]),
-                slip,
-                levels[5],
-                levels[6],
-                levels[7],
-                levels[8],
-                levels[9],
-                bool(rules[15]),
-                bool(rules[16]),
-                bool(rules[17]),
-                bool(rules[18]),
-                bool(rules[19]),
-                bool(rules[10]),
-                int(rules[11]),
-                bool(rules[12]),
-                int(rules[13]),
-                rules[9],
-                long_exits,
-                short_exits,
-                force_close,
-                force_open,
-                bool(rules[14]),
-                False,
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                0,
-                core,
-                levels[10],
-                combine=int(rules[22]),
-                amend_close=bool(rules[23]),
-                completed_close=bool(rules[24]),
-                arm_stop=arm_stop,
-                day_cancel=day_cancel,
-                expiry_days=expiry_days,
-                straddle=levels[11:23],
-                from_open=levels[23],
-                stop_fracs=levels[24],
-                target_fracs=levels[25],
-                next_bar=bool(rules[27]),
-                exit_and_rearm=bool(rules[28]),
-            )
-        else:
-            result = K._compiled_column(
-                o,
-                h,
-                lo,
-                c,
-                sides,
-                exits,
-                levels[0],
-                levels[1],
-                levels[2],
-                levels[3],
-                levels[4],
-                days,
-                int(rules[0]),
-                bool(rules[1]),
-                bool(rules[2]),
-                bool(rules[3]),
-                bool(rules[4]),
-                bool(rules[5]),
-                bool(rules[6]),
-                int(rules[7]),
-                bool(rules[8]),
-                rules[9],
-                bool(rules[10]),
-                int(rules[11]),
-                bool(rules[12]),
-                int(rules[13]),
-                rules[9],
-                long_exits,
-                short_exits,
-                force_close,
-                force_open,
-                bool(rules[14]),
-                False,
-                a0,
-                a1,
-                a2,
-                a3,
-                a4,
-                a5,
-                a6,
-                0,
-                core,
-                levels[10],
-                combine,
-                arm_stop,
-                day_cancel,
-                expiry_days,
-            )
-        # Negative counts carry sizing refusals out of prange without exceptions.
-        counts[j] = -int(account[2]) if account[2] else result[0]
-        meta[j, 0] = result[1]
-        meta[j, 1] = result[2]
-        meta[j, 2] = result[3]
-        meta[j, 3] = result[4]
-        meta[j, 4] = result[5]
-        meta[j, 5] = result[6]
-        meta[j, 6] = account[3]
-        meta[j, 7] = account[4]
-        # Preserve original decisions rather than the boundary-transformed engine masks.
-        bools_all[j, 0] = force_open
-    return (
-        counts,
-        meta,
-        a0s,
-        a1s,
-        a2s,
-        a3s,
-        a4s,
-        a5s,
-        a6s,
-        sides_all,
-        exits_all,
-        levels_all,
-        bools_all,
-        sizing_risks_all,
-        decisions_all,
-    )
-
-
-def _run_arrays(
-    step: Callable[..., None] | None,
+def _run_columns_typed(
     init_state: np.ndarray,
     params_grid: np.ndarray,
     feats: Any,
@@ -338,9 +70,8 @@ def _run_arrays(
     *,
     initial_cash: float | None = None,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
-    _cores: Any = None,
     cash_accumulation: str = "batch",
-    _capture_signals: list[Signals] | None = None,
+    _capture_columns: list[DecisionColumns] | None = None,
     _bound_runner: Any = None,
     _final_states: list[np.recarray] | None = None,
 ) -> list[EngineResult]:
@@ -354,19 +85,7 @@ def _run_arrays(
     fields = set(signal_fields)
     if not fields <= set(SIGNAL_FIELDS):
         raise ValueError("unknown signal_fields")
-    if _bound_runner is None:
-        state, params = (
-            np.ascontiguousarray(x, dtype=np.float64) for x in (init_state, params_grid)
-        )
-        features = np.ascontiguousarray(feats)
-    else:
-        state, params, features = init_state, params_grid, feats
-    if _bound_runner is None and (
-        state.ndim != 1 or params.ndim != 2 or features.ndim != 2 or len(params) == 0
-    ):
-        raise ValueError("run needs 1D state, nonempty 2D params, 2D features")
-    if _bound_runner is None and len(features) != len(bars):
-        raise ValueError("features must have one row per bar")
+    state, params, features = init_state, params_grid, feats
     pair_declared = bool(fields & set(PAIR_FIELDS))
     slots = (
         rules.exit_and_rearm
@@ -493,10 +212,7 @@ def _run_arrays(
             sizing.min_qty_policy == "clamp" if sizing else False,
         ]
     )
-    runner: Any = _run if _bound_runner is None else _bound_runner
-    callback_args = (step,) if _bound_runner is None else ()
-    raw = runner(
-        *callback_args,
+    raw = _bound_runner(
         state,
         params,
         features,
@@ -511,7 +227,7 @@ def _run_arrays(
         economic,
         float(initial_cash) if initial_cash is not None else np.nan,
         slots,
-        _cores,
+        None,
         None,
         session_days,
         _day_order_dates(bars) if rules.day_order_expiry == "cancel" else None,
@@ -541,7 +257,7 @@ def _run_arrays(
             raise ValueError("straddle ONE_TICK IOC execution is unproved")
         # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
         # refusal first, retaining complete terminal captures for causality checks.
-        if meta[j, 0] and (_capture_signals is None or np.isnan(decisions[j, 0]).any()):
+        if meta[j, 0] and (_capture_columns is None or np.isnan(decisions[j, 0]).any()):
             bar = int(meta[j, 1])
             next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
             price = float(bars.open[bar] if next_open else bars.close[bar])
@@ -549,7 +265,7 @@ def _run_arrays(
         if cnt < 0:
             _sizing_error(int(meta[j, 7]), j, int(meta[j, 6]))
         # Validation and accounting use the existing API; the matcher is not run again.
-        sig = Signals(
+        sig = DecisionColumns(
             decisions[j, 0].astype(np.int8),
             decisions[j, 1].astype(bool),
             **{
@@ -570,8 +286,8 @@ def _run_arrays(
             )
             if active:
                 raise ValueError(f"core emitted undeclared field {name}")
-        if _capture_signals is not None:
-            _capture_signals.append(sig)
+        if _capture_columns is not None:
+            _capture_columns.append(sig)
         values = (
             np.array([cnt]),
             np.array([0, cnt]),
@@ -585,9 +301,8 @@ def _run_arrays(
             return _values
 
         results.append(
-            _simulate(
+            sig.evaluate(
                 bars,
-                sig,
                 rules=rules,
                 instrument=instrument,
                 costs=costs,
@@ -634,176 +349,6 @@ class Position(NamedTuple):
     working_long: float = np.nan
     working_short: float = np.nan
 
-
-def _decision_ioc(decision: Any) -> float:
-    """Read the optional IOC field from either numeric decision ABI."""
-    return decision[15] if len(decision) > 15 else np.nan
-
-
-@overload(_decision_ioc)
-def _decision_ioc_type(decision: Any) -> Callable[[Any], float] | None:
-    if not isinstance(decision, nb.types.BaseTuple):
-        return None
-    # Numba type-checks both arms of a conditional index before folding len().
-    # Select an implementation before indexing a legacy 15-field tuple.
-    if len(decision) > 15:
-
-        def with_ioc(decision: Any) -> float:
-            return decision[15]
-
-        return with_ioc
-
-    def without_ioc(decision: Any) -> float:
-        return np.nan
-
-    return without_ioc
-
-
-_ABSENT_PAIR = (np.nan,) * 12
-
-
-def _decision_pair(decision: tuple[float, ...]) -> tuple[float, ...]:
-    return tuple(decision[16:28]) if len(decision) > 16 else _ABSENT_PAIR
-
-
-@overload(_decision_pair)
-def _decision_pair_type(decision):
-    if isinstance(decision, nb.types.BaseTuple) and len(decision) > 16:
-
-        def with_pair(decision):
-            return decision[16:28]
-
-        return with_pair
-
-    def without_pair(decision):
-        return _ABSENT_PAIR
-
-    return without_pair
-
-
-_ABSENT_TAIL = (0.0, np.nan, np.nan)
-
-
-def _decision_tail(decision: tuple[float, ...]) -> tuple[float, ...]:
-    """Open-relative flag and fill fractions; legacy 15/16/28-field records lack them."""
-    if len(decision) <= 28:
-        return _ABSENT_TAIL
-    return (1.0 if decision[28] else 0.0, float(decision[29]), float(decision[30]))
-
-
-@overload(_decision_tail)
-def _decision_tail_type(decision):
-    if isinstance(decision, nb.types.BaseTuple) and len(decision) > 28:
-
-        def with_tail(decision):
-            return (1.0 if decision[28] else 0.0, float(decision[29]), float(decision[30]))
-
-        return with_tail
-
-    def without_tail(decision):
-        return _ABSENT_TAIL
-
-    return without_tail
-
-
-@nb.njit(cache=False)
-def _jitclass_step(instance, params, i, feats, o, h, lo, c, v, view, out):
-    bar = CompiledBar(i, int(feats[i, 0]), o, h, lo, c, v)
-    pos = Position(
-        int(view[0]),
-        view[1],
-        int(view[2]),
-        view[3],
-        view[4],
-        view[5],
-        int(view[6]),
-        view[7],
-        int(view[8]),
-        view[9],
-        -1 if np.isnan(view[10]) else int(view[10]),
-        view[11],
-        view[12],
-        view[13],
-    )
-    decision = instance.step(bar, pos)
-    out[0] = decision[0]
-    out[1] = decision[1]
-    out[2] = decision[2]
-    out[3] = decision[3]
-    out[4] = decision[4]
-    out[5] = decision[5]
-    out[6] = decision[6]
-    out[7] = decision[7]
-    out[8] = decision[8]
-    out[9] = decision[9]
-    out[10] = decision[10]
-    out[11] = decision[11]
-    out[12] = decision[12]
-    out[13] = decision[13]
-    out[14] = decision[14]
-    out[15] = _decision_ioc(decision)
-    pair = _decision_pair(decision)
-    for q in range(12):
-        out[16 + q] = pair[q]
-    tail = _decision_tail(decision)
-    for q in range(3):
-        out[28 + q] = tail[q]
-
-
-def _run_jitclass(
-    CoreClass: Any,
-    bars: Bars,
-    *,
-    grid: dict[str, Sequence[Any]] | None = None,
-    features: dict[str, np.ndarray] | None = None,
-    rules: Rules = Rules(),
-    instrument: Instrument | None = None,
-    costs: Costs | None = None,
-    sizing: Sizing[int] | Sizing[float] | None = None,
-    initial_cash: float | None = None,
-    signal_fields: Sequence[str] = SIGNAL_FIELDS,
-    cash_accumulation: str = "batch",
-) -> list[EngineResult]:
-    """Instantiate one core per Cartesian grid row and call step(bar, pos) in prange.
-
-    CoreClass is a jitclass (or a plain class with NUMBA_DISABLE_JIT=1). Constructors
-    receive grid parameters and immutable feature arrays as named arguments. step
-    returns a numeric NamedTuple in Decision/SIGNAL_FIELDS order; legacy 15/16/28-field
-    records remain accepted by the adapter.
-    """
-    axes = {} if grid is None else grid
-    supplied = {} if features is None else features
-    if set(axes) & set(supplied):
-        raise ValueError("grid and features names overlap")
-    rows = list(product(*axes.values()))
-    if not rows:
-        raise ValueError("grid axes must be nonempty")
-    for name, feature in supplied.items():
-        if not isinstance(feature, np.ndarray) or feature.ndim == 0 or len(feature) != len(bars):
-            raise ValueError(f"feature {name} must be an array with one row per bar")
-    instances = [CoreClass(**dict(zip(axes, row, strict=True)), **supplied) for row in rows]
-    cores = instances if getattr(nb.config, "DISABLE_JIT") else List(instances)
-    clock = np.full((len(bars), 1), -1, dtype=np.int64)
-    if bars.index is not None:
-        clock[:, 0] = bars.index.as_unit("ns").asi8
-    return _run_arrays(
-        _jitclass_step,
-        np.empty(0),
-        np.zeros((len(rows), 0)),
-        clock,
-        bars,
-        rules=rules,
-        instrument=instrument,
-        costs=costs,
-        sizing=sizing,
-        initial_cash=initial_cash,
-        signal_fields=signal_fields,
-        _cores=cores,
-        cash_accumulation=cash_accumulation,
-    )
-
-
-# Public record/function API. The jitclass prototype remains private.
 
 NAUTILUS = Rules()
 
@@ -898,7 +443,7 @@ def _record_run(
     grid: Mapping[str, Sequence[Scalar]] | None,
     features: Features | Mapping[str, np.ndarray] | None,
     jit: bool,
-    _capture_signals: list[Signals] | None = None,
+    _capture_columns: list[DecisionColumns] | None = None,
     **kwargs: Any,
 ) -> Result[Any] | GridResult[Any]:
     spec: StrategySpec = step.__strategy__
@@ -934,15 +479,14 @@ def _record_run(
     runner = module.run if jit or getattr(nb.config, "DISABLE_JIT") else _python_runner(module)
     final: list[np.recarray] = []
     try:
-        results = _run_arrays(
-            None,
+        results = _run_columns_typed(
             internal_states,
             internal_params,
             (clock, *(getattr(values, name) for name in names)),
             bars,
             _bound_runner=runner,
             _final_states=final,
-            _capture_signals=_capture_signals,
+            _capture_columns=_capture_columns,
             **kwargs,
         )
     except NumbaError as error:
@@ -1020,42 +564,6 @@ def run[S: State, P: Params, F: Features](
 ) -> Result[S] | GridResult[S]: ...
 
 
-@typing_overload
-def run(
-    step: Signals | Callable[..., Core],
-    bars: Bars,
-    *,
-    grid: None = None,
-    features: Features | Mapping[str, np.ndarray] | None = None,
-    rules: Rules = NAUTILUS,
-    instrument: Instrument | None = None,
-    costs: Costs | None = None,
-    sizing: Sizing[int] | Sizing[float] | None = None,
-    initial_cash: float | None = None,
-    jit: bool = True,
-    signal_fields: Sequence[str] = SIGNAL_FIELDS,
-    cash_accumulation: str = "batch",
-) -> Result[State]: ...
-
-
-@typing_overload
-def run(
-    step: Callable[..., Core],
-    bars: Bars,
-    *,
-    grid: Mapping[str, Sequence[Scalar]],
-    features: Features | Mapping[str, np.ndarray] | None = None,
-    rules: Rules = NAUTILUS,
-    instrument: Instrument | None = None,
-    costs: Costs | None = None,
-    sizing: Sizing[int] | Sizing[float] | None = None,
-    initial_cash: float | None = None,
-    jit: bool = True,
-    signal_fields: Sequence[str] = SIGNAL_FIELDS,
-    cash_accumulation: str = "batch",
-) -> list[Result[State]]: ...
-
-
 def run(
     step: object,
     bars: Bars,
@@ -1070,12 +578,10 @@ def run(
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
-) -> Result[State] | GridResult[State] | list[Result[State]]:
+) -> Result[State] | GridResult[State]:
     """Execute a typed strategy through the cacheable, strategy-bound shared engine.
 
     No grid returns Result[S]; an explicit grid (including {}) returns GridResult[S].
-    Legacy stateless Core classes and Signals remain supported with one deprecation
-    warning per source call site per process.
     """
     kwargs: dict[str, Any] = dict(
         rules=rules, instrument=instrument, costs=costs, sizing=sizing, initial_cash=initial_cash
@@ -1091,65 +597,4 @@ def run(
             cash_accumulation=cash_accumulation,
             **kwargs,
         )
-    caller = sys._getframe(1)
-    warning_site = (caller.f_code.co_filename, caller.f_lineno)
-    del caller
-    # Numba/pandas can invalidate Python's warning registry by changing filters.
-    # Keep the public once-per-call-site contract independent of those changes.
-    if warning_site not in _legacy_warning_sites:
-        warnings.warn(
-            "Core/Signals API is deprecated; use @strategy and run",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        _legacy_warning_sites.add(warning_site)
-    if hasattr(step, "class_type"):
-        return _run_jitclass(
-            step,
-            bars,
-            grid=None if grid is None else dict(grid),
-            features=cast(dict[str, np.ndarray] | None, features),
-            signal_fields=signal_fields,
-            cash_accumulation=cash_accumulation,
-            **kwargs,
-        )
-    from .core import Decision as LegacyDecision
-    from .core import signals_from_core
-
-    if isinstance(step, Signals):
-        if grid is not None or features is not None:
-            raise ValueError("Signals already contains configurations; grid/features are invalid")
-        # Signals and the bound driver share kernel advance functions. Keep the
-        # array ABI here to preserve per-column optional-field dispatch exactly.
-        from .api import simulate
-
-        return simulate(bars, step, **kwargs)
-    axes = {} if grid is None else grid
-    supplied = {} if features is None else dict(cast(Mapping[str, np.ndarray], features))
-    rows = list(product(*axes.values()))
-    if not rows:
-        raise ValueError("grid axes must be nonempty")
-    results = []
-    from .api import simulate
-
-    for row in rows:
-        config: dict[str, object] = dict(zip(axes, row, strict=True))
-        config.update(supplied)
-
-        class LegacyView:
-            def __init__(self, instance: Any) -> None:
-                self.instance = instance
-
-            def step(self, bar: Any) -> LegacyDecision:
-                decision = self.instance.step(bar)
-                if isinstance(decision, tuple):
-                    if len(decision) not in (15, 16, 28, len(Decision._fields)):
-                        raise ValueError("Decision ABI requires 15, 16, 28 or 31 fields")
-                    return LegacyDecision(*decision)
-                return decision
-
-        def make(config=config):
-            return LegacyView(cast(Callable[..., Core], step)(**config))
-
-        results.append(simulate(bars, signals_from_core(make, bars), **kwargs))
-    return results[0] if grid is None else results
+    raise TypeError("run requires a @strategy-decorated function")
