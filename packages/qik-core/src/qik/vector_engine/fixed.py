@@ -20,6 +20,7 @@ import numpy as np
 from numba.extending import intrinsic
 from numba.typed import List
 
+from . import engine
 from .codegen import _ADAPTER_SOURCE, write_fixed_module
 from .schema import BoolArray, FloatArray, IntArray, StrategySpec
 
@@ -124,19 +125,12 @@ account = nb.carray(_pointer(ctx[12]), 6, dtype=np.float64)
         ast.Return(),
     ]
     text = ast.unparse(ast.fix_missing_locations(callback_tree))
-    # The source identity includes schema layouts and strategy/helper module source,
-    # just as bound source generation does, but never enters the engine identity.
+    # The callback identity carries the strategy source on top of the engine identity:
+    # schema/transport definitions and every engine module are already in the latter.
     import importlib
-    import inspect
 
     strategy_module = importlib.import_module(step.__module__)
-    from . import compiled, types
-
-    identity = hashlib.sha256(
-        "\n".join(
-            inspect.getsource(module) for module in (strategy_module, types, compiled)
-        ).encode()
-    ).hexdigest()
+    identity = engine.fingerprint(strategy_module)
     return (
         f"# Strategy source: {identity}\n"
         f"# Schemas: {spec.state.dtype.descr!r}, {spec.params.dtype.descr!r}, {hints!r}\n"
