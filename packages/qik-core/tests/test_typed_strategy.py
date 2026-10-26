@@ -203,6 +203,7 @@ np.save(__import__('sys').argv[1], np.asarray(helper_probe()))
         np.testing.assert_array_equal(np.load(target), np.asarray(helper_probe()))
 
 
+@pytest.mark.requires_tool("ty")
 def test_author_typing_gate(tmp_path):
     good = """from qik.vector_engine import State, Params, Features, FloatArray, strategy
 from qik.vector_engine.types import Bar, Position, Decision, enter
