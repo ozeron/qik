@@ -33,9 +33,10 @@ from qik.vector_engine import (
 )
 from qik.vector_engine import protection as P
 from qik.vector_engine import reference as R
+from scripts.engine_test_tiers import engine_examples
 
 
-@settings(max_examples=500, deadline=None)
+@settings(max_examples=engine_examples(500), deadline=None)
 @given(
     side=st.sampled_from([-1, 1]),
     fill=st.floats(10, 1000, allow_nan=False),

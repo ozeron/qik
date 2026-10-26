@@ -104,4 +104,5 @@ def test_bound_record_matches_batch(bound_runner, mode: str, rules_width: int):
         np.testing.assert_array_equal(raw[1][j, :2], [batch[2][j], batch[3][j]])
         for q in range(7):
             np.testing.assert_array_equal(raw[q + 2][j, :count], batch[q + 8][start:end])
-    assert not any(item.library.has_dynamic_globals for item in module.run.overloads.values())
+    if not nb.config.DISABLE_JIT:
+        assert not any(item.library.has_dynamic_globals for item in module.run.overloads.values())

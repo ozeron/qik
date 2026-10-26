@@ -220,14 +220,14 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
         sides, exits, levels = (sides_all[j], exits_all[j], levels_all[j])
         long_exits, short_exits = (bools_all[j, 1], bools_all[j, 2])
         force_close, force_open = (np.zeros(n, np.int8), np.zeros(n, np.bool_))
-        if masks is not None:
+        if masks is not None and len(masks) > 0:
             force_close[:] = masks[j, 0]
             force_open[:] = masks[j, 1]
         view = np.full(14, np.nan)
         view[K.V_LAST_EXIT_I] = -1
         decision = np.empty(31)
         account = np.array([0.0, initial_cash, 0.0, -1.0, 0.0])
-        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None else session_days, ends, economic, account, int(rules[20]), int(rules[21]), rules[9], int(rules[13]), decisions_all[j], bool(rules[6]), int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]) + 16 * int(rules[25]) + 32 * int(rules[26]) + 64 * int(rules[5]) + 128 * int(rules[28]), sizing_risks_all[j])
+        core = K.CoreContext(_no_callback, init_state[j], params_grid[j], feats, volume, view, decision, sides, exits, levels, long_exits, short_exits, force_close, force_open, days if session_days is None or len(session_days) == 0 else session_days, ends, economic, account, int(rules[20]), int(rules[21]), rules[9], int(rules[13]), decisions_all[j], bool(rules[6]), int(rules[22]) + 4 * int(rules[16]) + 8 * int(rules[8]) + 16 * int(rules[25]) + 32 * int(rules[26]) + 64 * int(rules[5]) + 128 * int(rules[28]), sizing_risks_all[j])
         a0, a1, a2, a3, a4, a5, a6 = (a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j])
         slip = rules[9] if rules[8] else 0.0
         combine = int(rules[22]) if len(rules) > 22 else 0

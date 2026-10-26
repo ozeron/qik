@@ -14,6 +14,7 @@ from qik.vector_engine import Bars, Costs, Instrument
 from qik.vector_engine import account as A
 from qik.vector_engine import protection as P
 from qik.vector_engine import reference as R
+from scripts.engine_test_tiers import engine_examples
 
 finite = st.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False)
 prices = st.one_of(finite, st.just(math.nan))
@@ -27,7 +28,7 @@ def exact(actual: float, expected: float) -> None:
         assert np.float64(actual).tobytes() == np.float64(expected).tobytes()
 
 
-@settings(max_examples=400, deadline=None)
+@settings(max_examples=engine_examples(400), deadline=None)
 @given(
     side=st.sampled_from([-1, 1]),
     anchor=finite,
@@ -54,7 +55,7 @@ def test_rounding_ties_and_anchor_gaps(mode, side, value):
         exact(P._anchor(anchor, 100.0, 105.0, 99.0), R._anchor(anchor, 100.0, 105.0, 99.0))
 
 
-@settings(max_examples=300, deadline=None)
+@settings(max_examples=engine_examples(300), deadline=None)
 @given(
     side=st.sampled_from([-1, 1]),
     stop=prices,
@@ -80,7 +81,7 @@ def test_fill_then_protect_independent(side, stop, target, close, flatten, count
         assert all(np.all(a == -999.0) for a in arrays)
 
 
-@settings(max_examples=400, deadline=None)
+@settings(max_examples=engine_examples(400), deadline=None)
 @given(
     mode=st.integers(0, 2),
     amount=positive,
@@ -95,7 +96,7 @@ def test_quantity_independent(mode, amount, cap, equity, risk, lot, minimum):
     exact(A.quantity(*args), R.quantity_reference(*args))
 
 
-@settings(max_examples=400, deadline=None)
+@settings(max_examples=engine_examples(400), deadline=None)
 @given(
     entry=prices,
     exit=prices,

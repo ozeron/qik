@@ -67,8 +67,8 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
         slots,
         None,
         masks,
-        None,
-        expiry_days,
+        np.empty(0, np.bool_),
+        np.empty(0, np.bool_) if expiry_days is None else expiry_days,
         False,
     )
     return raw[:-1]  # drop the final (empty) state rows
@@ -184,7 +184,7 @@ def compare(*args, **kwargs):
     anchor=st.integers(0, 2),
     gap=st.booleans(),
 )
-@settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(deadline=None, suppress_health_check=[HealthCheck.too_slow])
 def test_stateless_replay_hypothesis(
     case, slots, next_open, exit_next_open, latency, one_tick, adverse, rounding, anchor, gap
 ):
@@ -260,6 +260,20 @@ def test_stateless_replay_dense():
             )
 
 
+def test_stateless_replay_seeded_bulk():
+    from _engine_cases import COUNT, SEED, bulk_cases, coverage
+
+    cases = bulk_cases()
+    assert coverage(cases)["cases"] == COUNT
+    check = test_stateless_replay_hypothesis.hypothesis.inner_test
+    for index, case in enumerate(cases):
+        try:
+            check(**case)
+        except Exception as error:
+            error.add_note(f"bulk replay seed={SEED}, case_index={index}")
+            raise
+
+
 def test_public_replay_runner_is_field_exact():
     c = np.array([100.0, 100.0, 101.0])
     bars = Bars(c, c + 1, c - 1, c)
@@ -300,6 +314,7 @@ def test_public_last_close_flatten_needs_no_calendar():
 @pytest.mark.parametrize(
     "entry_clock,exit_clock", [(False, False), (True, True), (True, False), (False, True)]
 )
+@pytest.mark.final
 def test_replay_original_hypothesis_corpus(monkeypatch, slots, entry_clock, exit_clock):
     from test_vector_engine import test_kernel_equals_reference
 
@@ -307,6 +322,7 @@ def test_replay_original_hypothesis_corpus(monkeypatch, slots, entry_clock, exit
     test_kernel_equals_reference(next_open=entry_clock, exit_next_open=exit_clock, slots=slots)
 
 
+@pytest.mark.final
 def test_replay_original_dense_corpora(monkeypatch):
     from test_vector_engine import (
         test_kernel_equals_reference_dense_both_stale_modes,

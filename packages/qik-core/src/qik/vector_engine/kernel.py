@@ -10,6 +10,9 @@ All inputs are float64 / int8 / bool arrays with one row per column (config) and
 from __future__ import annotations
 
 from collections import namedtuple
+from functools import wraps
+from inspect import signature
+from typing import Any
 
 import numba as nb
 import numpy as np
@@ -1812,20 +1815,7 @@ def _column_advance(state, i, inputs, core=None):
 
 
 @nb.njit(parallel=True, cache=True)
-def run_columns(
-    o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts,
-    new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False,
-    latency_bars=0, one_tick=False, tick=0.0,
-    entry_trigger: np.ndarray | None = None, stop_updates: np.ndarray | None = None,
-    target_updates: np.ndarray | None = None, be_after: np.ndarray | None = None,
-    be_offset: np.ndarray | None = None,
-    mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False,
-    exit_next_open=None, adverse_first=False, bracket_anchor=0,
-    target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None,
-    entry_from_open=None, stop_fraction=None, target_fraction=None, next_bar=False,
-    sizing_risks=None,
-    exit_and_rearm=False,
-):  # fmt: skip
+def _run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts, new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open, latency_bars, one_tick, tick, entry_trigger: np.ndarray, stop_updates: np.ndarray, target_updates: np.ndarray, be_after: np.ndarray, be_offset: np.ndarray, mit, oto, amend_keep, ratchet, stop_skip, exit_next_open, adverse_first, bracket_anchor, target_gap, tick_round, exit_long, exit_short, force_close, force_open, cross_session, entry_limit_ioc, combine, amend_close, completed_close, arm_stop, day_cancel, expiry_days, straddle, entry_from_open, stop_fraction, target_fraction, next_bar, sizing_risks, exit_and_rearm, slots):  # fmt: skip
     """All columns in parallel. Signal arrays have shape ``(k, n)``; prices and ``new_day`` (the
     bar starts a New York date) shape ``(n,)``.
 
@@ -1833,11 +1823,6 @@ def run_columns(
     without over-allocating ``k * n`` rows.
     """
 
-    # Keep absent masks as None so Numba removes their checks from each bar.
-    exit_next_open = next_open if exit_next_open is None else exit_next_open
-    if entry_trigger is not None:
-        assert stop_updates is not None and target_updates is not None
-        assert be_after is not None and be_offset is not None
     if tick_round:
         entry_limit = entry_limit.copy()
         for j in range(side_sig.shape[0]):
@@ -1845,24 +1830,13 @@ def run_columns(
                 entry_limit[j, i] = _round_price(
                     entry_limit[j, i], tick, tick_round, -side_sig[j, i]
                 )
-        if entry_trigger is not None:
+        if slots:
             entry_trigger = entry_trigger.copy()
             for j in range(side_sig.shape[0]):
                 for i in range(side_sig.shape[1]):
                     entry_trigger[j, i] = _round_price(
                         entry_trigger[j, i], tick, tick_round, side_sig[j, i]
                     )
-    if straddle is not None and np.isfinite(straddle).any():
-        if arm_stop:
-            raise ValueError("straddle arm_stop=next_bar composition is unproved")
-        if day_cancel:
-            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
-    if straddle is not None and entry_trigger is None:
-        raise ValueError("straddle requires the slots scheduler")
-    if entry_trigger is None and (
-        entry_from_open is not None or stop_fraction is not None or target_fraction is not None
-    ):
-        raise ValueError("entry_from_open and fractional protection require the slots scheduler")
     slot_slip = tick if one_tick else 0.0
     k = side_sig.shape[0]
     counts = np.zeros(k, np.int64)
@@ -1877,22 +1851,16 @@ def run_columns(
     f0 = np.empty(0, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]  (numba ships prange as a class)
         pair_column = _straddle_column(straddle, j)
-        risk_column = None if sizing_risks is None else sizing_risks[j]
-        rel_column = None if entry_from_open is None else entry_from_open[j]
-        sf_column = None if stop_fraction is None else stop_fraction[j]
-        tf_column = None if target_fraction is None else target_fraction[j]
-        ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
-        long_column = None if exit_long is None else exit_long[j]
-        short_column = None if exit_short is None else exit_short[j]
-        close_column = None if force_close is None else force_close[j]
-        open_column = None if force_open is None else force_open[j]
-        if (
-            entry_trigger is not None
-            and stop_updates is not None
-            and target_updates is not None
-            and be_after is not None
-            and be_offset is not None
-        ):
+        risk_column = _optional_column(sizing_risks, j)
+        rel_column = _optional_column(entry_from_open, j)
+        sf_column = _optional_column(stop_fraction, j)
+        tf_column = _optional_column(target_fraction, j)
+        ioc_column = _optional_column(entry_limit_ioc, j)
+        long_column = _optional_column(exit_long, j)
+        short_column = _optional_column(exit_short, j)
+        close_column = _optional_column(force_close, j)
+        open_column = _optional_column(force_open, j)
+        if slots:
             cnt, err, eb, fs, fe, fpx, fst = _slots_column(
                 o,
                 h,
@@ -1935,7 +1903,7 @@ def run_columns(
                 close_column,
                 open_column,
                 cross_session,
-                True,
+                np.bool_(True),
                 e0,
                 e0,
                 s0,
@@ -1943,7 +1911,8 @@ def run_columns(
                 f0,
                 s0,
                 f0,
-                0,
+                np.int64(0),
+                core=None,
                 ioc_limits=ioc_column,
                 combine=combine,
                 amend_close=amend_close,
@@ -1963,8 +1932,8 @@ def run_columns(
             cnt, err, eb, fs, fe, fpx, fst = _column(
             o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
             entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, True,
-            e0, e0, s0, f0, f0, s0, f0, 0, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
+            adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, np.bool_(True),
+            e0, e0, s0, f0, f0, s0, f0, np.int64(0), core=None, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
         )  # fmt: skip
         counts[j] = cnt
         errs[j] = err
@@ -1986,23 +1955,17 @@ def run_columns(
     stop = np.empty(total, np.float64)
     for j in nb.prange(k):  # ty: ignore[not-iterable]
         pair_column = _straddle_column(straddle, j)
-        risk_column = None if sizing_risks is None else sizing_risks[j]
-        rel_column = None if entry_from_open is None else entry_from_open[j]
-        sf_column = None if stop_fraction is None else stop_fraction[j]
-        tf_column = None if target_fraction is None else target_fraction[j]
-        ioc_column = None if entry_limit_ioc is None else entry_limit_ioc[j]
-        long_column = None if exit_long is None else exit_long[j]
-        short_column = None if exit_short is None else exit_short[j]
-        close_column = None if force_close is None else force_close[j]
-        open_column = None if force_open is None else force_open[j]
+        risk_column = _optional_column(sizing_risks, j)
+        rel_column = _optional_column(entry_from_open, j)
+        sf_column = _optional_column(stop_fraction, j)
+        tf_column = _optional_column(target_fraction, j)
+        ioc_column = _optional_column(entry_limit_ioc, j)
+        long_column = _optional_column(exit_long, j)
+        short_column = _optional_column(exit_short, j)
+        close_column = _optional_column(force_close, j)
+        open_column = _optional_column(force_open, j)
         if errs[j] == 0:
-            if (
-                entry_trigger is not None
-                and stop_updates is not None
-                and target_updates is not None
-                and be_after is not None
-                and be_offset is not None
-            ):
+            if slots:
                 _slots_column(
                     o,
                     h,
@@ -2045,7 +2008,7 @@ def run_columns(
                     close_column,
                     open_column,
                     cross_session,
-                    False,
+                    np.bool_(False),
                     entry_i,
                     exit_i,
                     side,
@@ -2054,6 +2017,7 @@ def run_columns(
                     reason,
                     stop,
                     offsets[j],
+                    core=None,
                     ioc_limits=ioc_column,
                     combine=combine,
                     amend_close=amend_close,
@@ -2073,10 +2037,10 @@ def run_columns(
                 _column(
                 o, h, lo, c, side_sig[j], exit_sig[j], entry_stop[j], entry_target[j],
                 entry_limit[j], stop_pts[j], target_pts[j], new_day, chase,
-                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, False,
+                adaptive, reenter, stale_drop, protect_flatten, next_open, exit_next_open, latency_bars, one_tick, tick, adverse_first, bracket_anchor, target_gap, tick_round, tick, long_column, short_column, close_column, open_column, cross_session, np.bool_(False),
                 entry_i, exit_i, side, entry_px,
                 exit_px, reason,
-                stop, offsets[j], ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
+                stop, offsets[j], core=None, ioc_limits=ioc_column, arm_stop=arm_stop, day_cancel=day_cancel, expiry_days=expiry_days, combine=combine,
             )  # fmt: skip
     return (
         counts, offsets, errs, err_bar, final_side, final_entry, final_px, final_stop,
@@ -2411,7 +2375,10 @@ def _slots_column_advance(state, i, inputs, core=None):
         pos, pending, live, resting, chasing, closing = 0, -1, False, False, False, False
     for phase in range(2):
         if phase == 0 and not (
-            next_open or exit_next_open or ioc_limits is not None or _has_pairs(straddle)
+            next_open
+            or exit_next_open
+            or (ioc_limits is not None and len(ioc_limits) > 0)
+            or _has_pairs(straddle)
         ):
             continue
         ci = o[i] if phase == 0 else c[i]
@@ -3437,7 +3404,7 @@ def _core_decision(
 
 @nb.njit(cache=True, inline="never")
 def _straddle_column(pair, j):
-    if pair is None:
+    if pair is None or pair.shape[2] == 0:
         return np.empty((12, 0))
     return pair[j]
 
@@ -3495,13 +3462,13 @@ def _open_in_market(triggers, pair, sides, d, opening):
 
 @nb.njit(cache=True)
 def _store_risk(buffer, i, risk):
-    if buffer is not None:
+    if buffer is not None and len(buffer) > 0:
         buffer[i] = risk
 
 
 @nb.njit(cache=True)
 def _optional_at(a, i, default):
-    if a is None:
+    if a is None or len(a) == 0:
         return default
     return a[i]
 
@@ -3536,3 +3503,151 @@ def _venue_driver_type(core):
         return _compiled_venue_column
 
     return generic
+
+
+# Host boundary: defaults, missing buffers and flag literals do not identify a new
+# matcher. Select the scheduler from declarations before replacing missing arrays.
+_EMPTY_BOOL_COLUMNS = np.empty((1, 0), np.bool_)
+_EMPTY_INT8_COLUMNS = np.empty((1, 0), np.int8)
+_EMPTY_FLOAT_COLUMNS = np.empty((1, 0), np.float64)
+_EMPTY_RISK_COLUMNS = np.empty((1, 0), np.float64)
+_EMPTY_DAYS = np.empty(0, np.bool_)
+_EMPTY_PAIRS = np.empty((1, 12, 0), np.float64)
+for _empty_input in (
+    _EMPTY_BOOL_COLUMNS,
+    _EMPTY_INT8_COLUMNS,
+    _EMPTY_FLOAT_COLUMNS,
+    _EMPTY_DAYS,
+    _EMPTY_PAIRS,
+):
+    _empty_input.flags.writeable = False
+
+
+def _column_input(value: np.ndarray, dtype: Any) -> np.ndarray:
+    """Use a read-only view to unify mutability without copying an aligned input."""
+    array = np.ascontiguousarray(value, dtype=dtype)
+    if array.flags.writeable:
+        array = array.view()
+        array.flags.writeable = False
+    return array
+
+
+@nb.njit(cache=True)
+def _optional_column(array, j):
+    return array[0] if array.shape[1] == 0 else array[j]
+
+
+def _normalized_columns(args: tuple, kwargs: dict[str, Any]) -> dict[str, Any]:
+    bound = _RUN_COLUMNS_SIGNATURE.bind(*args, **kwargs)
+    bound.apply_defaults()
+    values = bound.arguments
+    slots = values["entry_trigger"] is not None
+    if slots:
+        assert values["stop_updates"] is not None and values["target_updates"] is not None
+        assert values["be_after"] is not None and values["be_offset"] is not None
+    pair = values["straddle"]
+    if pair is not None and np.isfinite(pair).any():
+        if values["arm_stop"]:
+            raise ValueError("straddle arm_stop=next_bar composition is unproved")
+        if values["day_cancel"]:
+            raise ValueError("straddle day_order_expiry=cancel composition is unproved")
+    if pair is not None and not slots:
+        raise ValueError("straddle requires the slots scheduler")
+    if not slots and any(
+        values[name] is not None for name in ("entry_from_open", "stop_fraction", "target_fraction")
+    ):
+        raise ValueError("entry_from_open and fractional protection require the slots scheduler")
+    values["slots"] = slots
+    if values["exit_next_open"] is None:
+        values["exit_next_open"] = values["next_open"]
+    for name in (
+        "adaptive",
+        "reenter",
+        "stale_drop",
+        "protect_flatten",
+        "next_open",
+        "one_tick",
+        "mit",
+        "oto",
+        "amend_keep",
+        "ratchet",
+        "stop_skip",
+        "exit_next_open",
+        "adverse_first",
+        "target_gap",
+        "cross_session",
+        "amend_close",
+        "completed_close",
+        "arm_stop",
+        "day_cancel",
+        "next_bar",
+        "exit_and_rearm",
+    ):
+        values[name] = bool(values[name])
+    for name in ("chase", "latency_bars", "bracket_anchor", "tick_round", "combine"):
+        values[name] = int(values[name])
+    values["tick"] = float(values["tick"])
+    # Preserve integer and bool lanes: only prices/protection use float64.
+    for name in ("o", "h", "lo", "c"):
+        values[name] = _column_input(values[name], dtype=np.float64)
+    values["new_day"] = _column_input(values["new_day"], dtype=np.bool_)
+    values["side_sig"] = _column_input(values["side_sig"], dtype=np.int8)
+    for name in (
+        "exit_sig",
+        "exit_long",
+        "exit_short",
+        "force_open",
+        "entry_from_open",
+    ):
+        value = values[name]
+        values[name] = (
+            _EMPTY_BOOL_COLUMNS if value is None else _column_input(value, dtype=np.bool_)
+        )
+    value = values["force_close"]
+    values["force_close"] = (
+        _EMPTY_INT8_COLUMNS if value is None else _column_input(value, dtype=np.int8)
+    )
+    for name in (
+        "entry_stop",
+        "entry_target",
+        "entry_limit",
+        "stop_pts",
+        "target_pts",
+        "entry_trigger",
+        "stop_updates",
+        "target_updates",
+        "be_after",
+        "be_offset",
+        "stop_fraction",
+        "target_fraction",
+        "entry_limit_ioc",
+    ):
+        value = values[name]
+        values[name] = (
+            _EMPTY_FLOAT_COLUMNS if value is None else _column_input(value, dtype=np.float64)
+        )
+    # This one buffer is output storage, so keep its writeable lane separate.
+    value = values["sizing_risks"]
+    values["sizing_risks"] = (
+        _EMPTY_RISK_COLUMNS if value is None else np.ascontiguousarray(value, dtype=np.float64)
+    )
+    value = values["expiry_days"]
+    values["expiry_days"] = _EMPTY_DAYS if value is None else _column_input(value, dtype=np.bool_)
+    values["straddle"] = _EMPTY_PAIRS if pair is None else _column_input(pair, dtype=np.float64)
+    return values
+
+
+def run_columns(o, h, lo, c, side_sig, exit_sig, entry_stop, entry_target, entry_limit, stop_pts, target_pts, new_day, chase, adaptive, reenter, stale_drop, protect_flatten, next_open=False, latency_bars=0, one_tick=False, tick=0.0, entry_trigger: np.ndarray | None=None, stop_updates: np.ndarray | None=None, target_updates: np.ndarray | None=None, be_after: np.ndarray | None=None, be_offset: np.ndarray | None=None, mit=False, oto=False, amend_keep=False, ratchet=False, stop_skip=False, exit_next_open=None, adverse_first=False, bracket_anchor=0, target_gap=False, tick_round=0, exit_long=None, exit_short=None, force_close=None, force_open=None, cross_session=False, entry_limit_ioc=None, combine=0, amend_close=False, completed_close=False, arm_stop=False, day_cancel=False, expiry_days=None, straddle=None, entry_from_open=None, stop_fraction=None, target_fraction=None, next_bar=False, sizing_risks=None, exit_and_rearm=False) -> tuple:  # fmt: skip
+    """Normalize the numeric ABI before dispatch; declarations still select scheduling."""
+    return _run_columns(**_normalized_columns((), locals()))
+
+
+@wraps(run_columns)
+def _python_run_columns(*args: Any, **kwargs: Any) -> tuple:
+    runner = getattr(_run_columns, "py_func", _run_columns)
+    return runner(**_normalized_columns(args, kwargs))
+
+
+setattr(run_columns, "py_func", _python_run_columns)
+
+_RUN_COLUMNS_SIGNATURE = signature(run_columns)

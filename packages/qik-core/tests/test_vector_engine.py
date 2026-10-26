@@ -15,6 +15,7 @@ from hypothesis import strategies as st
 from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules
 from qik.vector_engine import kernel as K
 from qik.vector_engine.reference import simulate_column_reference
+from scripts.engine_test_tiers import engine_examples
 
 TICK = 0.25
 
@@ -148,7 +149,9 @@ def _kernel_final(final: tuple) -> tuple:
 @pytest.mark.parametrize("slots", [False, True])
 @pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
-@settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=engine_examples(1500), deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
 @given(
     case=_case(),
     adverse_first=st.booleans(),
@@ -257,7 +260,7 @@ def _dense_case(rng: np.random.Generator):
     return dict(o=o, h=h, lo=lo, c=c), side, exit_, stop, target
 
 
-@settings(max_examples=300, deadline=None)
+@settings(max_examples=engine_examples(300), deadline=None)
 @given(
     st.lists(
         st.tuples(st.integers(90, 110), st.sampled_from([-1, 0, 1]), st.booleans()),

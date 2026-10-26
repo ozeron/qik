@@ -228,9 +228,9 @@ def _run_columns_typed(
         float(initial_cash) if initial_cash is not None else np.nan,
         slots,
         None,
-        None,
-        session_days,
-        _day_order_dates(bars) if rules.day_order_expiry == "cancel" else None,
+        np.empty((0, 2, 0), np.int8),
+        np.ascontiguousarray(session_days, dtype=np.bool_),
+        _day_order_dates(bars) if rules.day_order_expiry == "cancel" else np.empty(0, np.bool_),
         pair_declared,
     )
     if _bound_runner is not None:
@@ -377,13 +377,22 @@ class GridResult[S: State]:
         return cast(S, self.states[i])
 
 
+# Sources and schema classes are immutable during a process; a new process still
+# regenerates the content-addressed module and validates its complete disk identity.
+_bound_modules: dict[tuple[Any, ...], Any] = {}
+
+
 def _bound(step: Any) -> Any:
     from .bound import write_bound_module
 
+    schema: StrategySpec = step.__strategy__
+    directory = Path(os.environ.get("QIK_VECTOR_CACHE", Path.home() / ".cache/qik/vector_engine"))
+    key = (step, schema.state, schema.params, schema.features, True, directory.resolve())
+    if key in _bound_modules:
+        return _bound_modules[key]
     module_name, name = step.__module__, step.__name__
     if module_name == "__main__" or "<locals>" in step.__qualname__:
         raise ValueError("strategy must be defined at module scope in an importable module")
-    directory = Path(os.environ.get("QIK_VECTOR_CACHE", Path.home() / ".cache/qik/vector_engine"))
     directory.mkdir(parents=True, exist_ok=True)
     # Generate to a process-owned draft, then publish at a content-addressed path.
     draft = directory / f"draft_{os.getpid()}_{name}.py"
@@ -392,8 +401,8 @@ def _bound(step: Any) -> Any:
         source = draft.read_bytes()
     finally:
         draft.unlink(missing_ok=True)
-    key = hashlib.sha256(source).hexdigest()[:24]
-    bound_name = f"_qik_bound_{key}"
+    digest = hashlib.sha256(source).hexdigest()[:24]
+    bound_name = f"_qik_bound_{digest}"
     path = directory / f"{bound_name}.py"
     if not path.exists():
         temp = directory / f"{bound_name}.{os.getpid()}.tmp"
@@ -405,7 +414,8 @@ def _bound(step: Any) -> Any:
         module = importlib.util.module_from_spec(spec)
         sys.modules[bound_name] = module
         spec.loader.exec_module(module)
-    return sys.modules[bound_name]
+    _bound_modules[key] = sys.modules[bound_name]
+    return _bound_modules[key]
 
 
 def _python_runner(module: Any) -> Callable[..., Any]:

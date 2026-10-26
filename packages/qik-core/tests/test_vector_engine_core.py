@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numba as nb
 import numpy as np
 import pandas as pd
 import pytest
@@ -149,7 +150,8 @@ def test_decision_and_driver_validation() -> None:
         replay_features([Decision(side=2)])
     with pytest.raises(ValueError, match="side must be -1, 0, 1"):
         run(every5_side2, _bars(), jit=False)
-    with pytest.raises(TypeError, match="compilation failed"):
+    message = "not subscriptable" if nb.config.DISABLE_JIT else "compilation failed"
+    with pytest.raises(TypeError, match=message):
         run(not_a_decision, _bars())
 
 

@@ -31,6 +31,7 @@ from qik.vector_engine import (
 )
 from qik.vector_engine import kernel as K
 from qik.vector_engine import reference as R
+from scripts.engine_test_tiers import engine_examples
 
 RULES = Rules(
     profile=Profile.REPRO,
@@ -146,7 +147,7 @@ def test_callback_observes_completed_close_once(jit: bool) -> None:
     assert blocked.trades.entry_i.tolist() == [1]
 
 
-@settings(max_examples=200, deadline=None, derandomize=True)
+@settings(max_examples=engine_examples(200), deadline=None, derandomize=True)
 @given(
     side=st.sampled_from([-1, 1]),
     gap=st.integers(96, 102),

@@ -40,6 +40,7 @@ from qik.vector_engine import (
 )
 from qik.vector_engine import kernel as K
 from qik.vector_engine.reference import simulate_column_reference
+from scripts.engine_test_tiers import engine_examples
 
 TICK = 0.25
 NAN = math.nan
@@ -302,7 +303,9 @@ def _compare(
 
 
 @pytest.mark.parametrize("exit_next_open", [False, True])
-@settings(max_examples=1500, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@settings(
+    max_examples=engine_examples(1500), deadline=None, suppress_health_check=[HealthCheck.too_slow]
+)
 @given(
     case=_case(),
     bracket_anchor=st.integers(0, 2),
