@@ -621,13 +621,21 @@ def _matched_result(
         raise ValueError("straddle ONE_TICK IOC execution is unproved")
     rows = config.layout.rows
 
-    def decision(q: int) -> np.ndarray:
+    def decision(q: int, dtype: Any = None) -> np.ndarray:
         if config.sparse:
-            row = np.full(len(bars), 0.0 if q in (0, 1, 12, 13, 14, 28) else np.nan)
+            # Side/flag validation consumes integer/bool columns directly; avoid
+            # an n-bar float temporary immediately discarded by astype.
+            row = np.full(
+                len(bars),
+                0.0 if q in (0, 1, 12, 13, 14, 28) else np.nan,
+                dtype=np.float64 if dtype is None else dtype,
+            )
             if rows[q] >= 0:
                 row[config.ev_bar[: config.ev_count]] = config.ev_val[: config.ev_count, rows[q]]
             return row
         row = config.levels[rows[q]]
+        if dtype is not None:
+            return row.astype(dtype)
         # Buffers are reused by the next batch: captured columns own their arrays.
         return row.copy() if captured is not None else row
 
@@ -648,10 +656,10 @@ def _matched_result(
         else int(meta[8])
     )
     sig = DecisionColumns(
-        decision(0).astype(np.int8),
-        decision(1).astype(bool),
+        decision(0, np.int8),
+        decision(1, np.bool_),
         **{
-            name: decision(q).astype(bool) if name in _BOOL_FIELDS else decision(q)
+            name: decision(q, np.bool_) if name in _BOOL_FIELDS else decision(q)
             for q, name in enumerate(SIGNAL_FIELDS)
             if q >= 2
             and name in fields
