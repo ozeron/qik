@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import numba as nb
 import numpy as np
+from numba.extending import overload
 
 from qik.vector_engine.protection import ERR_NONE, REASON_TARGET, _in_market, levels
 
@@ -57,6 +58,30 @@ F_ADAPTIVE, F_ADVERSE_FIRST, F_REENTER, F_STALE_DROP, F_TARGET_GAP = 1, 2, 4, 8,
 # where venue and slots accept it and apply A10/A11 (ERR 4, or an immediate target trade).
 C_REFUSE_IN_MARKET = 1 << 8
 COMPAT_SINGLE = C_REFUSE_IN_MARKET
+
+
+def _has_lane(a):
+    """A lane carries values: an absent (None or zero-length) column reads as its default."""
+    return a is not None and len(a) > 0
+
+
+@overload(_has_lane, inline="always")
+def _has_lane_type(a):
+    if isinstance(a, nb.types.NoneType):
+        return lambda a: False
+    return lambda a: len(a) > 0
+
+
+def _lane_at(a, i, default):
+    """``a[i]`` for a lane that ``_has_lane`` accepted; the default for an absent (None) one."""
+    return default if a is None else a[i]
+
+
+@overload(_lane_at, inline="always")
+def _lane_at_type(a, i, default):
+    if isinstance(a, nb.types.NoneType):
+        return lambda a, i, default: default
+    return lambda a, i, default: a[i]
 
 
 @nb.njit(cache=True, nogil=True)
@@ -131,7 +156,7 @@ def _put_trade(
 
 
 @nb.njit(cache=True, nogil=True)
-def _sweep(oi, hi, li, pos, sx, tx, stop, target, adaptive, adverse_first, target_gap):
+def _sweep(oi, hi, li, pos, stop, target, adaptive, adverse_first, target_gap):
     """First touch of a resting stop or target on one bar, along the path O, e1, e2, C.
 
     Returns ``(reason, px, point, high_first)``: reason 0 is no fill; ``point`` is the path point
@@ -140,39 +165,44 @@ def _sweep(oi, hi, li, pos, sx, tx, stop, target, adaptive, adverse_first, targe
     at the open under target-gap. Adverse-first suppresses a target on a bar whose extreme
     reaches the stop. The extremes: high then low, or the one nearer the open first when
     adaptive (strictly nearer high first; ties low first).
+
+    Exact on the levels, not on the loop's sentinels: an absent level (NaN) never fills, whatever
+    the bar holds, infinities included.
     """
     high_first = (not adaptive) or abs(oi - hi) < abs(oi - li)
+    has_stop = not np.isnan(stop)
+    has_target = not np.isnan(target)
     if pos > 0:
-        adverse_hit = adverse_first and li <= sx
-        if oi <= sx:
+        adverse_hit = adverse_first and has_stop and li <= stop
+        if has_stop and oi <= stop:
             return REASON_STOP_GAP, oi, 0, high_first
-        if not adverse_hit and oi >= tx:
+        if not adverse_hit and has_target and oi >= target:
             return REASON_TARGET, (oi if target_gap else target), 0, high_first
         if high_first:
-            if not adverse_hit and hi >= tx:
+            if not adverse_hit and has_target and hi >= target:
                 return REASON_TARGET, target, 1, high_first
-            if li <= sx:
+            if has_stop and li <= stop:
                 return REASON_STOP, stop, 2, high_first
         else:
-            if li <= sx:
+            if has_stop and li <= stop:
                 return REASON_STOP, stop, 1, high_first
-            if not adverse_hit and hi >= tx:
+            if not adverse_hit and has_target and hi >= target:
                 return REASON_TARGET, target, 2, high_first
     else:
-        adverse_hit = adverse_first and hi >= sx
-        if oi >= sx:
+        adverse_hit = adverse_first and has_stop and hi >= stop
+        if has_stop and oi >= stop:
             return REASON_STOP_GAP, oi, 0, high_first
-        if not adverse_hit and oi <= tx:
+        if not adverse_hit and has_target and oi <= target:
             return REASON_TARGET, (oi if target_gap else target), 0, high_first
         if high_first:
-            if hi >= sx:
+            if has_stop and hi >= stop:
                 return REASON_STOP, stop, 1, high_first
-            if not adverse_hit and li <= tx:
+            if not adverse_hit and has_target and li <= target:
                 return REASON_TARGET, target, 2, high_first
         else:
-            if not adverse_hit and li <= tx:
+            if not adverse_hit and has_target and li <= target:
                 return REASON_TARGET, target, 1, high_first
-            if hi >= sx:
+            if has_stop and hi >= stop:
                 return REASON_STOP, stop, 2, high_first
     return 0, 0.0, 0, high_first
 
@@ -236,13 +266,13 @@ def _book_loop(
     tick_round = int(rules[R_TICK_ROUND])
     combine = int(rules[R_COMBINE])
     # Absent columns (zero length) read as their default; decided once, not per bar.
-    has_exit = exit_sig.shape[0] > 0
-    has_long = long_exits.shape[0] > 0
-    has_short = short_exits.shape[0] > 0
-    has_es = entry_stop.shape[0] > 0
-    has_et = entry_target.shape[0] > 0
-    has_sp = stop_pts.shape[0] > 0
-    has_tp = target_pts.shape[0] > 0
+    has_exit = _has_lane(exit_sig)
+    has_long = _has_lane(long_exits)
+    has_short = _has_lane(short_exits)
+    has_es = _has_lane(entry_stop)
+    has_et = _has_lane(entry_target)
+    has_sp = _has_lane(stop_pts)
+    has_tp = _has_lane(target_pts)
 
     pos, cnt, ei, ep = 0, 0, -1, 0.0
     stop, target = np.nan, np.nan  # the published levels
@@ -260,7 +290,7 @@ def _book_loop(
                 touched = (oi >= sx) | (h[i] >= sx) | (oi <= tx) | (lo[i] <= tx)
             if touched:
                 reason, px, point, high_first = _sweep(
-                    oi, h[i], lo[i], pos, sx, tx, stop, target, adaptive, adverse_first, target_gap
+                    oi, h[i], lo[i], pos, stop, target, adaptive, adverse_first, target_gap
                 )
                 if reason != 0:
                     _put_trade(
@@ -279,11 +309,11 @@ def _book_loop(
                     exited = True
         # --- decisions at bar i's close (the strategy callback goes here) ---
         if pos != 0:
-            sig = exit_sig[i] if has_exit else False
+            sig = _lane_at(exit_sig, i, False) if has_exit else False
             if pos > 0:
-                sig = sig or (long_exits[i] if has_long else False)
+                sig = sig or (_lane_at(long_exits, i, False) if has_long else False)
             else:
-                sig = sig or (short_exits[i] if has_short else False)
+                sig = sig or (_lane_at(short_exits, i, False) if has_short else False)
             if sig:
                 _put_trade(
                     count_only, base + cnt, ei, i, pos, ep, c[i], REASON_SIGNAL, stop,
@@ -299,10 +329,10 @@ def _book_loop(
             st, tg = levels(
                 s,
                 ci,
-                entry_stop[i] if has_es else np.nan,
-                entry_target[i] if has_et else np.nan,
-                stop_pts[i] if has_sp else np.nan,
-                target_pts[i] if has_tp else np.nan,
+                _lane_at(entry_stop, i, np.nan) if has_es else np.nan,
+                _lane_at(entry_target, i, np.nan) if has_et else np.nan,
+                _lane_at(stop_pts, i, np.nan) if has_sp else np.nan,
+                _lane_at(target_pts, i, np.nan) if has_tp else np.nan,
                 tick,
                 tick_round,
                 combine=combine,
