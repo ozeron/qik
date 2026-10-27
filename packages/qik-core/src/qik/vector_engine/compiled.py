@@ -776,7 +776,7 @@ def _python_module(step: Any) -> Any:
 def _python_runner(module: Any) -> Callable[..., Any]:
     # Rebind every shared helper in a private namespace. No dispatcher or global
     # config is mutated: jit=False and JIT runs can coexist in one process.
-    from . import account, protection
+    from . import account, engine, protection
     from . import sizing as sizing_module
 
     namespace = dict(vars(account))
@@ -784,6 +784,8 @@ def _python_runner(module: Any) -> Callable[..., Any]:
     namespace.update(vars(sizing_module))
     namespace.update(vars(K))
     namespace.update(vars(module))
+    # Split-engine helpers must use the same private Python globals as the facade.
+    engine_modules = tuple(part.__name__ for part in engine.ENGINE_MODULES)
     originals = {name: getattr(value, "py_func", value) for name, value in namespace.items()}
     for name, value in originals.items():
         if name == "_strategy":
@@ -794,6 +796,7 @@ def _python_runner(module: Any) -> Callable[..., Any]:
             sizing_module.__name__,
             account.__name__,
             protection.__name__,
+            *engine_modules,
         ):
             namespace[name] = FunctionType(
                 value.__code__, namespace, value.__name__, value.__defaults__, value.__closure__
