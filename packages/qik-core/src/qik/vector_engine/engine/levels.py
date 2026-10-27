@@ -4,6 +4,16 @@ from __future__ import annotations
 
 import numba as nb
 
+
+@nb.njit(cache=True)
+def _any_in(arr, lo, hi):
+    """Any true value in a nonnegative half-open interval, clipped at the end."""
+    for i in range(lo, min(hi, len(arr))):
+        if arr[i]:
+            return True
+    return False
+
+
 # (stored fields, declared fields, transformed legs, own levels 2/5, block row, own row).
 
 
@@ -48,6 +58,7 @@ def _optional_column(array, j):
 
 
 __all__ = [
+    "_any_in",
     "_layout_context",
     "_level_row",
     "_optional_at",

@@ -24,11 +24,22 @@ def validate_pair(
     next_open: bool = False,
 ) -> bool:
     """Validate before an order can be sent, including from a compiled strategy."""
-    if np.isnan(pair).all():
+    all_nan = True
+    for value in pair:
+        if not np.isnan(value):
+            all_nan = False
+            break
+    if all_nan:
         return False
-    if np.isinf(pair).any() or np.any(pair <= 0):
-        raise ValueError("straddle levels must be finite and positive or NaN")
-    if side or commands or np.isfinite(legacy).any():
+    for value in pair:
+        if np.isinf(value) or value <= 0:
+            raise ValueError("straddle levels must be finite and positive or NaN")
+    legacy_finite = False
+    for value in legacy:
+        if np.isfinite(value):
+            legacy_finite = True
+            break
+    if side or commands or legacy_finite:
         raise ValueError(
             "straddle cannot share a decision with single entry, protection or commands"
         )

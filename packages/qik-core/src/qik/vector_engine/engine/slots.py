@@ -84,7 +84,7 @@ from .fills import (
     _target_fill_price,
     _venue_record,
 )
-from .levels import _optional_at, _store_risk
+from .levels import _any_in, _optional_at, _store_risk
 from .pairs import (
     _has_pairs,
     _lifetime_crosses,
@@ -141,7 +141,13 @@ def _slots_column(
     """A18-A20: queued commands retain their entry generation and requested amendment price."""
     arm_stop = bool(rules[R_ARM_STOP])
     day_cancel = bool(rules[R_DAY_CANCEL])
-    if straddle is not None and np.isfinite(straddle).any():
+    has_straddle = False
+    if straddle is not None:
+        for value in straddle.flat:
+            if np.isfinite(value):
+                has_straddle = True
+                break
+    if has_straddle:
         if arm_stop:
             raise ValueError("straddle arm_stop=next_bar composition is unproved")
         if day_cancel:
@@ -934,7 +940,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                     if due >= len(c) or (
                         not cross_session
                         and not (next_bar and _stop_pair(straddle, i, core))
-                        and np.any(days[i + 1 : due + 1])
+                        and _any_in(days, i + 1, due + 1)
                     ):
                         error = ERR_NEXT_OPEN_SESSION_END
                 queue.append(
@@ -1011,7 +1017,7 @@ def _slots_column_advance(state, i, inputs, core=None):
                     if due >= len(c) or (
                         not cross_session
                         and not (next_bar and _stop_pair(straddle, d, core))
-                        and np.any(days[d + 1 : due + 1])
+                        and _any_in(days, d + 1, due + 1)
                     ):
                         error = ERR_NEXT_OPEN_SESSION_END
                         continue

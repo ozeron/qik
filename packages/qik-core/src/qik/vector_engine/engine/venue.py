@@ -50,7 +50,7 @@ from .fills import (
     _target_fill_price,
     _venue_record,
 )
-from .levels import _optional_at
+from .levels import _any_in, _optional_at
 
 
 @nb.njit(cache=True, nogil=True)
@@ -562,7 +562,7 @@ def _venue_column_advance(state, i, inputs, core=None):
         pending = i
         if not np.isnan(_level_at(core, ioc_limits, i, 10)):
             due = i + latency + 1
-            if due >= len(c) or (not cross_session and np.any(new_day[i + 1 : due + 1])):
+            if due >= len(c) or (not cross_session and _any_in(new_day, i + 1, due + 1)):
                 return state, ERR_NEXT_OPEN_SESSION_END, i
             commands.append((due, 7, i))
         else:
