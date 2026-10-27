@@ -1,7 +1,7 @@
 """Numba engine entry point: the matchers live in ``engine/``, re-exported here.
 
 ``qik.vector_engine.engine`` maps the modules (codes -> fills/levels/pairs -> decision ->
-venue -> single/slots -> batch). This facade keeps the historic import surface
+venue -> book -> single/slots -> batch). This facade keeps the historic import surface
 ``qik.vector_engine.kernel.<name>`` used by ``api``, ``compiled``, ``codegen``, ``fixed``,
 ``reference`` and the tests: every name below is the same object its module defines.
 """
@@ -33,6 +33,48 @@ from .engine.batch import (
     _python_run_columns,
     _run_columns,
     run_columns,
+)
+from .engine.book import (
+    C_IN_MARKET_MASK,
+    C_IN_MARKET_SHIFT,
+    C_NEW_DAY_MASK,
+    C_NEW_DAY_SHIFT,
+    CAP,
+    COMPAT_SINGLE,
+    ERR_RING_OVERFLOW,
+    F_ADAPTIVE,
+    F_ADVERSE_FIRST,
+    F_CROSS_SESSION,
+    F_DAY_CANCEL,
+    F_EXIT_NEXT_OPEN,
+    F_NEXT_OPEN,
+    F_ONE_TICK,
+    F_PROTECT_FLATTEN,
+    F_REENTER,
+    F_STALE_DROP,
+    F_TARGET_GAP,
+    IN_MARKET_REFUSE,
+    K_OPEN_ENTRY,
+    K_OPEN_EXIT,
+    NEW_DAY_REFUSE,
+    RING_FULL,
+    _book_loop,
+    _exit_flags,
+    _has_lane,
+    _held_ident,
+    _held_level,
+    _held_side,
+    _lane_at,
+    _put_trade,
+    _ring_compact,
+    _ring_pop,
+    _ring_push,
+    _routes_here,
+    _rule_flags,
+    _scratch_at,
+    _stop_sentinel,
+    _sweep,
+    _target_sentinel,
 )
 from .engine.codes import (
     _SLOT_AMEND_STOP,
@@ -112,7 +154,7 @@ from .engine.codes import (
     CoreContext,
     rule_settings,
 )
-from .engine.decision import _core_decision
+from .engine.decision import _core_decision, _core_decision_rare
 from .engine.events import (
     _close_at,
     _current_flag,
@@ -167,7 +209,7 @@ from .engine.pairs import (
     _stop_pair,
     _straddle_column,
 )
-from .engine.single import ColumnState, _column, _column_advance, _compiled_column
+from .engine.single import _column, _compiled_column
 from .engine.slots import SlotsState, _compiled_slots_column, _slots_column, _slots_column_advance
 from .engine.venue import (
     VenueState,
@@ -196,7 +238,6 @@ __all__ = [
     "_any_in",
     "ACCOUNT_INVALID_SIDE",
     "Any",
-    "ColumnState",
     "CoreContext",
     "ERR_AMEND_NO_ORDER",
     "ERR_AMEND_REJECTED",
@@ -284,13 +325,13 @@ __all__ = [
     "_anchor",
     "_cancel_entry_commands",
     "_column",
-    "_column_advance",
     "_column_input",
     "_compiled_column",
     "_compiled_slots_column",
     "_compiled_venue_column",
     "_contracts_for",
     "_core_decision",
+    "_core_decision_rare",
     "_day_entry_expires",
     "_empty_input",
     "_exit_for",
@@ -366,4 +407,44 @@ __all__ = [
     "_remember_generation",
     "_side_at",
     "_side_at_type",
+    "CAP",
+    "COMPAT_SINGLE",
+    "C_IN_MARKET_MASK",
+    "C_IN_MARKET_SHIFT",
+    "C_NEW_DAY_MASK",
+    "C_NEW_DAY_SHIFT",
+    "ERR_RING_OVERFLOW",
+    "F_ADAPTIVE",
+    "F_ADVERSE_FIRST",
+    "F_CROSS_SESSION",
+    "F_DAY_CANCEL",
+    "F_EXIT_NEXT_OPEN",
+    "F_NEXT_OPEN",
+    "F_ONE_TICK",
+    "F_PROTECT_FLATTEN",
+    "F_REENTER",
+    "F_STALE_DROP",
+    "F_TARGET_GAP",
+    "IN_MARKET_REFUSE",
+    "K_OPEN_ENTRY",
+    "K_OPEN_EXIT",
+    "NEW_DAY_REFUSE",
+    "RING_FULL",
+    "_book_loop",
+    "_exit_flags",
+    "_has_lane",
+    "_held_ident",
+    "_held_level",
+    "_held_side",
+    "_lane_at",
+    "_put_trade",
+    "_ring_compact",
+    "_ring_pop",
+    "_ring_push",
+    "_routes_here",
+    "_rule_flags",
+    "_scratch_at",
+    "_stop_sentinel",
+    "_sweep",
+    "_target_sentinel",
 ]

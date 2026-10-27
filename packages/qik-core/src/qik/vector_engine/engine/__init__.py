@@ -10,12 +10,14 @@ there is no cycle):
     pairs     straddle pair legs: pair reads, resting/level lookups, lifetime triggers
     decision  _core_decision: the strategy callback into the level store and account
     venue     the venue settlement matcher (command queue, protection, fills)
-    single    the single-order matcher and its dispatcher
+    book      the unified single-route loop (single-matcher plan, stage 2): rule bits, the
+              transition ring, the three callback sites
+    single    the single-order entry: route to ``venue`` or to ``book``
     slots     the slots matcher (trigger/stop/target updates, straddle legs)
-    book      the unified matcher (single-matcher plan, stage 2; not routed to yet)
     batch     run_columns, the parallel column runner and its Python-boundary ABI
 
-``venue``/``single``/``slots`` all sit on ``decision``; ``batch`` runs all three.
+``venue``/``book``/``slots`` all sit on ``decision``; ``batch`` runs all three. ``legacy/`` holds
+the matchers a stage has replaced, kept as differential oracles: nothing here imports them.
 ``qik.vector_engine.kernel`` re-exports every name for compatibility.
 
 The matchers cache to disk (``cache=True``) and Numba keys a cache entry by the source
@@ -64,9 +66,9 @@ _ENGINE_MODULE_NAMES = (
     "pairs",
     "decision",
     "venue",
+    "book",
     "single",
     "slots",
-    "book",
     "batch",
 )
 # Legacy matchers (differential oracles; production never imports them). They are still engine
@@ -320,9 +322,9 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     pairs,
     decision,
     venue,
+    book,
     single,
     slots,
-    book,
     batch,
 )
 

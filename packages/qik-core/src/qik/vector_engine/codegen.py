@@ -56,8 +56,7 @@ class _EventCommands(ast.NodeTransformer):
         if (
             isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name)
-            and node.value.func.id
-            in ("_column_advance", "_slots_column_advance", "_venue_column_advance")
+            and node.value.func.id in ("_slots_column_advance", "_venue_column_advance")
         ):
             return [node, *ast.parse("if core.account[2]:\n    break").body]
         if isinstance(target, ast.Tuple) and self.command_value(node.value):
@@ -400,29 +399,31 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
     functions: list[ast.stmt] = [decision] if callback else [adapter, decision]
     if field_writer is not None:
         functions.insert(0, field_writer)
-    if callback:
-        # The basic scheduler publishes at three distinct points. Share the two
-        # limit-fill/chase paths instead of expanding the publisher three times;
-        # the ordinary per-bar path stays inline.
-        rare_decision = copy.deepcopy(decision)
-        rare_decision.name = "_limit_core_decision"
-        for decorator in rare_decision.decorator_list:
-            assert isinstance(decorator, ast.Call)
-            for keyword in decorator.keywords:
-                if keyword.arg == "inline":
-                    keyword.value = ast.Constant("never")
-            decorator.keywords += [
-                ast.keyword("no_cpython_wrapper", ast.Constant(True)),
-                ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
-            ]
-        functions.append(rare_decision)
-    for module, name in (
-        (engine.venue, "_venue_column_advance"),
-        (engine.single, "_column_advance"),
-        (engine.slots, "_slots_column_advance"),
-        (engine.venue, "_venue_column"),
-        (engine.single, "_column"),
-        (engine.slots, "_slots_column"),
+    # The book loop publishes at three points: the per-bar site calls ``_core_decision``, the
+    # two rare ones (a chase cancellation, a resting entry's fill) ``_core_decision_rare``. The
+    # fixed module outlines the rare name so the publisher is expanded once, not three times;
+    # the undecorated Python module simply binds it to its own copy.
+    rare_decision = copy.deepcopy(decision)
+    rare_decision.name = "_core_decision_rare"
+    for decorator in rare_decision.decorator_list:
+        assert isinstance(decorator, ast.Call)
+        for keyword in decorator.keywords:
+            if keyword.arg == "inline":
+                keyword.value = ast.Constant("never")
+        decorator.keywords += [
+            ast.keyword("no_cpython_wrapper", ast.Constant(True)),
+            ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
+        ]
+    functions.append(rare_decision)
+    # (matcher, whether it still reads decisions by the name-keyed event rewrites). The book loop
+    # owns its callback sites and retained-row reads, so it is emitted as written.
+    for module, name, event_rewrites in (
+        (engine.venue, "_venue_column_advance", True),
+        (engine.book, "_book_loop", False),
+        (engine.slots, "_slots_column_advance", True),
+        (engine.venue, "_venue_column", True),
+        (engine.single, "_column", False),
+        (engine.slots, "_slots_column", True),
     ):
         node = source(getattr(module, name))
         BindGlobals().visit(node)
@@ -435,27 +436,9 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                     ast.keyword("no_cpython_wrapper", ast.Constant(True)),
                     ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
                 ]
-            _EventCommands().visit(node)
-            _EventAccess().visit(node)
-            if name == "_column_advance":
-                calls = [
-                    call
-                    for call in ast.walk(node)
-                    if isinstance(call, ast.Call)
-                    and isinstance(call.func, ast.Name)
-                    and call.func.id == "_core_decision"
-                ]
-                for call in calls:
-                    # The common path supplies a conditional working level;
-                    # both earlier limit paths supply an already settled level.
-                    if not isinstance(call.args[12], ast.IfExp):
-                        assert isinstance(call.func, ast.Name)
-                        call.func.id = "_limit_core_decision"
-                        call.args[11] = ast.Call(
-                            ast.Attribute(ast.Name("nb", ast.Load()), "int64", ast.Load()),
-                            [call.args[11]],
-                            [],
-                        )
+            if event_rewrites:
+                _EventCommands().visit(node)
+                _EventAccess().visit(node)
         functions.append(node)
     runner = ast.parse(_RUNNER_SOURCE).body[0]
     assert isinstance(runner, ast.FunctionDef)

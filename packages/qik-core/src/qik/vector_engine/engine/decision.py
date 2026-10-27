@@ -282,4 +282,9 @@ def _core_decision(
             core.ev_val[event, row] = levels[row, at]
 
 
-__all__ = ["_core_decision"]
+# The rare publication sites of ``book._book_loop`` (a chase cancellation, a resting entry's fill)
+# call this name. Here it is the same inlined function; the generated fixed module binds it to an
+# outlined copy (``codegen``), so the publisher is expanded once per loop and shared by the rest.
+_core_decision_rare = _core_decision
+
+__all__ = ["_core_decision", "_core_decision_rare"]
