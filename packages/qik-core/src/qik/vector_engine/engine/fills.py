@@ -63,6 +63,32 @@ def _target_fill_price(
     return point - side * slip if slip else (point if gap_to_open and at_open else target)
 
 
+@nb.njit(cache=True, nogil=True)
+def _venue_record(
+    count_only,
+    k,
+    ei,
+    i,
+    side,
+    ep,
+    px,
+    why,
+    stop,
+    out_entry_i,
+    out_exit_i,
+    out_side,
+    out_entry_px,
+    out_exit_px,
+    out_reason,
+    out_stop,
+):
+    # The bound: a compiled run's buffer may be smaller than the count; it then reruns.
+    if not count_only and k < len(out_entry_i):
+        out_entry_i[k], out_exit_i[k], out_side[k] = ei, i, side
+        out_entry_px[k], out_exit_px[k] = ep, px
+        out_reason[k], out_stop[k] = why, stop
+
+
 __all__ = [
     "_cancel_entry_commands",
     "_day_entry_expires",
@@ -71,4 +97,5 @@ __all__ = [
     "_high_first",
     "_no_reversal",
     "_target_fill_price",
+    "_venue_record",
 ]

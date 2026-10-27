@@ -81,6 +81,7 @@ from .fills import (
     _force_for,
     _high_first,
     _target_fill_price,
+    _venue_record,
 )
 from .levels import _optional_at, _store_risk
 from .pairs import (
@@ -92,7 +93,6 @@ from .pairs import (
     _pair_rests,
     _stop_pair,
 )
-from .venue import _venue_record
 
 
 @nb.njit(cache=True, nogil=True)

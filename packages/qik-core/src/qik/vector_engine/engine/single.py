@@ -51,9 +51,10 @@ from .fills import (
     _high_first,
     _no_reversal,
     _target_fill_price,
+    _venue_record,
 )
 from .levels import _optional_at
-from .venue import _venue_driver, _venue_record
+from .venue import _venue_driver
 
 
 @nb.njit(cache=True, nogil=True)
