@@ -234,14 +234,30 @@ def _throwaway_cache() -> tuple[str, str]:
     only ever be compared against itself. Numba compares the recorded stamp with the one the
     locator returns and treats a mismatch as an empty index: a save is a harmless write, a
     read by any other process is a miss. Within this process the source is the same source, so
-    a hit is the machine code just compiled, never an older engine's.
+    a hit is the machine code just compiled, never an older engine's. Reloading engine
+    modules inside a running process is not supported (``fingerprint`` is fixed per process).
+    A forked child forgets the parent's directory and makes its own; only the creating
+    process removes a directory, so a child's exit cannot pull it from under the parent.
     """
     global _throwaway
     if _throwaway is None:
         directory = tempfile.mkdtemp(prefix="qik-engine-cache-")
-        atexit.register(shutil.rmtree, directory, True)
+        atexit.register(_remove_throwaway, directory, os.getpid())
         _throwaway = (directory, f"{fingerprint()}-{os.getpid()}-{secrets.token_hex(8)}")
     return _throwaway
+
+
+def _remove_throwaway(directory: str, owner: int) -> None:
+    if os.getpid() == owner:
+        shutil.rmtree(directory, True)
+
+
+def _forget_throwaway() -> None:
+    global _throwaway
+    _throwaway = None
+
+
+os.register_at_fork(after_in_child=_forget_throwaway)
 
 
 class _ThrowawayLocator:
