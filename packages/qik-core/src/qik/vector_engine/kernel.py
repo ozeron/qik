@@ -139,6 +139,8 @@ from .engine.fills import (
     _high_first,
     _no_reversal,
     _target_fill_price,
+    _venue_peek,
+    _venue_unrecord,
 )
 from .engine.levels import (
     _any_in,
@@ -322,7 +324,9 @@ __all__ = [
     "_venue_column_advance",
     "_venue_driver",
     "_venue_driver_type",
+    "_venue_peek",
     "_venue_record",
+    "_venue_unrecord",
     "annotations",
     "fill_cost",
     "levels",
