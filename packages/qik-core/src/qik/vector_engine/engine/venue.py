@@ -48,7 +48,9 @@ from .fills import (
     _force_for,
     _high_first,
     _target_fill_price,
+    _venue_peek,
     _venue_record,
+    _venue_unrecord,
 )
 from .levels import _any_in, _optional_at
 
@@ -203,6 +205,7 @@ def _venue_column_advance(state, i, inputs, core=None):
         rejected_stop,
         cnt,
     ) = state
+    start_cnt = cnt  # the refusal below returns ``state``, whose count excludes this bar's exit
     ci = c[i]
     long_exit_i = _flag_at(core, long_exits, i, 13)
     short_exit_i = _flag_at(core, short_exits, i, 14)
@@ -215,6 +218,9 @@ def _venue_column_advance(state, i, inputs, core=None):
         pos if pos else (_side_at(core, side_sig, pending) if pending >= 0 else 0),
     )
     exited = False
+    # The target/stop exit below writes its row before the bar can still refuse (ERR 6 at the
+    # re-entry IOC); keep what it overwrites so the refusal can put it back.
+    prior = (np.int64(0), np.int64(0), np.int64(0), 0.0, 0.0, np.int64(0), 0.0)
     busy = pending >= 0
     if (
         pending >= 0
@@ -371,6 +377,17 @@ def _venue_column_advance(state, i, inputs, core=None):
                 px = _target_fill_price(pt, target, m == 0, target_gap, pos, slip)
                 break
         if reason:
+            prior = _venue_peek(
+                count_only,
+                base + cnt,
+                out_entry_i,
+                out_exit_i,
+                out_side,
+                out_entry_px,
+                out_exit_px,
+                out_reason,
+                out_stop,
+            )
             _venue_record(
                 count_only,
                 base + cnt,
@@ -563,6 +580,19 @@ def _venue_column_advance(state, i, inputs, core=None):
         if not np.isnan(_level_at(core, ioc_limits, i, 10)):
             due = i + latency + 1
             if due >= len(c) or (not cross_session and _any_in(new_day, i + 1, due + 1)):
+                if exited:
+                    _venue_unrecord(
+                        count_only,
+                        base + start_cnt,
+                        prior,
+                        out_entry_i,
+                        out_exit_i,
+                        out_side,
+                        out_entry_px,
+                        out_exit_px,
+                        out_reason,
+                        out_stop,
+                    )
                 return state, ERR_NEXT_OPEN_SESSION_END, i
             commands.append((due, 7, i))
         else:
