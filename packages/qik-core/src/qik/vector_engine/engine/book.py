@@ -464,12 +464,11 @@ def _book_loop(
     # levels and distances it will trade with are cold and live in ``rec``.
     pend, p_lim, p_chase = zero, 0.0, unset
     rec = np.full(4, np.nan)  # stop, target, stop points, target points of the working entry
-    # Transition ring: next-open staging. A close enqueues, the next open settles in FIFO order.
     ring = np.empty((4, CAP), np.int64)  # due bar, kind, decision bar, decision identity
     qmask, qhead, qtail = zero, zero, zero
     err, eb = ERR_NONE, -1
     for i in range(n):
-        at = _scratch_at(core, i)  # where this bar's published decision is read
+        at = _scratch_at(core, i)
         s = 0
         if core is None:
             # Dense columns hold every decision already: a bar with nothing to do is skipped.
@@ -651,14 +650,13 @@ def _book_loop(
                 )  # fmt: skip
                 if core.account[2] != 0:
                     break
-            # Whatever site published it, the close decision is read back from the scratch.
             s = int(side_sig[at])
             xg, xl, xs = _exit_flags(
                 exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short
             )
             cmask = _close_at(core, force_close, i)
             if pos == 0 and pend == 0 and qmask == 0 and s == 0:
-                continue  # the strategy has observed the bar; there is nothing to act on
+                continue
         if cmask & 8:
             if pos != 0 or pend != 0:
                 err, eb = ERR_NEXT_OPEN_SESSION_END, i
