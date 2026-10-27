@@ -204,7 +204,7 @@ def _run_columns_typed(
             sizing.lot_step if sizing else 1.0,
             sizing.min_qty if sizing else 1.0,
             sizing.min_qty_policy == "clamp" if sizing else False,
-            0.0,  # set per launch: the projected-overflow stop (first launch of a batch only)
+            0.0,  # set per launch: the projected-overflow stop (the run's first launch only)
         ]
     )
     k, n = len(params), len(bars)
@@ -382,9 +382,9 @@ def _run_columns_typed(
     while lo < k:
         # Per-config bytes; _event_budget inverts the sparse part for overflow reruns.
         width = (
-            (compact.nrows * 8 + 16) * event_capacity
+            _event_row_bytes(compact.nrows) * event_capacity
             + (8 * n if own_risk else 0)
-            + capacity * 42
+            + capacity * _TRADE_ROW_BYTES
             + (0 if _event_storage else (compact.nrows * 8 + 6) * n)
         )
         hi = min(k, lo + max(nb.get_num_threads(), _BATCH_BYTES // width))
@@ -435,6 +435,14 @@ def _run_columns_typed(
 
 # Batches bound peak memory by bars x batch, not bars x configs.
 _BATCH_BYTES = 256 << 20
+# Bytes a config needs per trade row (the seven trade columns), shared by the batch-size
+# choice and the event budget so the two cannot drift.
+_TRADE_ROW_BYTES = 42
+
+
+def _event_row_bytes(nrows: int) -> int:
+    """Bytes a config needs per sparse event row (level values, bar index and mask)."""
+    return nrows * 8 + 16
 
 
 def _initial_event_capacity(n: int) -> int:
@@ -444,8 +452,8 @@ def _initial_event_capacity(n: int) -> int:
 
 def _event_budget(m: int, nrows: int, trade_capacity: int, risk_bars: int) -> int:
     """Event rows per config that fit a batch of ``m`` in _BATCH_BYTES (the batch-size bytes)."""
-    spare = _BATCH_BYTES // m - 8 * risk_bars - 42 * trade_capacity
-    return max(0, spare) // (nrows * 8 + 16)
+    spare = _BATCH_BYTES // m - 8 * risk_bars - _TRADE_ROW_BYTES * trade_capacity
+    return max(0, spare) // _event_row_bytes(nrows)
 
 
 def _grow_event_capacity(

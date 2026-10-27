@@ -152,7 +152,7 @@ def _core_decision(
     if len(core.ev_count):
         if mask:
             event, capacity, n = core.ev_count[0], len(core.ev_bar), len(core.volume)
-            # A batch's first launch (economic[9]) stops once an eighth-full buffer,
+            # The run's first launch (economic[9]) stops once an eighth-full buffer,
             # a sixty-fourth into the tape, projects past twice its capacity: the
             # whole batch reruns anyway, sized from the rate observed here.
             if event == capacity or (
