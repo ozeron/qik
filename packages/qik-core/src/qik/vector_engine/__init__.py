@@ -3,7 +3,11 @@
 Contract and assumptions: ``docs/vector-engine.md``. Entry point: ``run``.
 """
 
-from .api import (
+from ._numba_patches import apply as _apply_numba_patches
+
+_apply_numba_patches()
+
+from .api import (  # noqa: E402
     Bars,
     BracketAnchor,
     BracketPolicy,
@@ -23,10 +27,10 @@ from .api import (
     TickRound,
     require_nautilus,
 )
-from .compiled import NAUTILUS, GridResult, run
-from .grid import grid
-from .htf import htf, htf_align
-from .kernel import (
+from .compiled import NAUTILUS, GridResult, run  # noqa: E402
+from .grid import grid  # noqa: E402
+from .htf import htf, htf_align  # noqa: E402
+from .kernel import (  # noqa: E402
     V_ENTRY_I,
     V_ENTRY_PX,
     V_EQUITY,
@@ -40,8 +44,17 @@ from .kernel import (
     V_WORK_LEVEL,
     V_WORK_SIDE,
 )
-from .schema import BoolArray, Features, FloatArray, IntArray, Params, State, StrategySpec, strategy
-from .types import (
+from .schema import (  # noqa: E402
+    BoolArray,
+    Features,
+    FloatArray,
+    IntArray,
+    Params,
+    State,
+    StrategySpec,
+    strategy,
+)
+from .types import (  # noqa: E402
     HOLD,
     Bar,
     Decision,
