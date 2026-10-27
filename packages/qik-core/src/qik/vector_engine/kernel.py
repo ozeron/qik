@@ -141,6 +141,7 @@ from .engine.fills import (
     _target_fill_price,
 )
 from .engine.levels import (
+    _any_in,
     _layout_context,
     _level_row,
     _optional_at,
@@ -190,6 +191,7 @@ from .straddle import validate_pair
 
 # The historic kernel surface, re-exported by name; the code lives in engine/.
 __all__ = [
+    "_any_in",
     "ACCOUNT_INVALID_SIDE",
     "Any",
     "ColumnState",
