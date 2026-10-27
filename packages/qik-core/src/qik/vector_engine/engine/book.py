@@ -453,16 +453,19 @@ def _book_loop(
     has_open = _has_lane(force_open)
     has_expiry = _has_lane(expiry_days)
 
-    pos, cnt, ei, ep = 0, 0, -1, 0.0
+    # Loop-carried scalars start as int64, not as literals: a literal initial value makes Numba
+    # compile a second copy of every outlined callee they are passed to.
+    zero, unset = 0, (-1)
+    pos, cnt, ei, ep = zero, zero, unset, 0.0
     stop, target = np.nan, np.nan  # the published levels
     sx, tx = -np.inf, np.inf  # sentinel copies the sweep gate reads
     # A working limit entry: its side (0 none), level and chase bar are hot; the protection
     # levels and distances it will trade with are cold and live in ``rec``.
-    pend, p_lim, p_chase = 0, 0.0, -1
+    pend, p_lim, p_chase = zero, 0.0, unset
     rec = np.full(4, np.nan)  # stop, target, stop points, target points of the working entry
     # Transition ring: next-open staging. A close enqueues, the next open settles in FIFO order.
     ring = np.empty((4, CAP), np.int64)  # due bar, kind, decision bar, decision identity
-    qmask, qhead, qtail = 0, 0, 0
+    qmask, qhead, qtail = zero, zero, zero
     err, eb = ERR_NONE, -1
     for i in range(n):
         at = _scratch_at(core, i)  # where this bar's published decision is read
@@ -491,7 +494,7 @@ def _book_loop(
         ci = c[i]
         if pend != 0:
             if day_cancel and (_lane_at(expiry_days, i, False) if has_expiry else new_day[i]):
-                pend, p_chase = 0, -1
+                pend, p_chase = zero, unset
             if pend != 0 and new_day[i] and not day_cancel and refuse_new_day:
                 err, eb = ERR_PENDING_NEW_DAY, i
                 break
@@ -504,7 +507,7 @@ def _book_loop(
                     out_reason, out_stop,
                 )  # fmt: skip
                 cnt += 1
-            pos, pend, qmask, qhead, qtail, exited = 0, 0, 0, 0, 0, True
+            pos, pend, qmask, qhead, qtail, exited = zero, zero, zero, zero, zero, True
         while qmask != 0:
             ready, qmask, qhead = _ring_pop(ring, qmask, qhead, qtail, i)
             if ready < 0:
@@ -517,7 +520,7 @@ def _book_loop(
                     out_reason, out_stop,
                 )  # fmt: skip
                 cnt += 1
-                pos = 0
+                pos = zero
                 exited = True
                 continue
             held = ring[3, ready]
@@ -572,7 +575,7 @@ def _book_loop(
             # A chase is a close command: an exit on this bar flattens instead of chasing.
             if filled or (i == p_chase and not (xg or (pend > 0 and xl) or (pend < 0 and xs))):
                 side = pend
-                pend = 0
+                pend = zero
                 px = p_lim if filled else ci
                 st, tg = levels(
                     side,
@@ -590,7 +593,7 @@ def _book_loop(
                     # The resting entry has printed, but its callback protection is a close
                     # command: the strategy observes the position before the legs are accepted.
                     _core_decision_rare(
-                        core, i, oi, h[i], lo[i], ci, side, i, px, np.nan, np.nan, np.int64(0),
+                        core, i, oi, h[i], lo[i], ci, side, i, px, np.nan, np.nan, pend,
                         np.nan, st, cnt, out_entry_i, out_exit_i, out_side, out_entry_px,
                         out_exit_px, out_reason, out_stop,
                     )  # fmt: skip
@@ -635,7 +638,7 @@ def _book_loop(
                         if _no_reversal(oi, e1, e2, ci, point, pos):
                             pin_side = pos
                             pin = px
-                    pos = 0
+                    pos = zero
                     exited = True
         # --- decisions at bar i's close ---
         if core is not None:
@@ -670,7 +673,7 @@ def _book_loop(
                         out_reason, out_stop,
                     )  # fmt: skip
                     cnt += 1
-                pos, pend = 0, 0
+                pos, pend = zero, zero
                 continue
         if oflat:
             continue
@@ -694,9 +697,9 @@ def _book_loop(
                 out_reason, out_stop,
             )  # fmt: skip
             cnt += 1
-            pos = 0
+            pos = zero
             exited = True
-            pend = 0
+            pend = zero
         if next_open or not np.isnan(_lane_at(ioc_limits, at, np.nan) if has_ioc else np.nan):
             # R1 decisions remain at the close; stage only actionable orders. At the following
             # open a market exit executes before a replacement entry and before the price sweep.
@@ -718,7 +721,7 @@ def _book_loop(
                     break
             continue
         if exit_now and not exit_next_open:
-            pend = 0  # an exit also cancels a working entry
+            pend = zero  # an exit also cancels a working entry
         if pos == 0 and pend == 0 and not busy and s != 0 and (reenter or not exited):
             lim = _lane_at(entry_limit, at, np.nan) if has_limit else np.nan
             es = _lane_at(entry_stop, at, np.nan) if has_es else np.nan
