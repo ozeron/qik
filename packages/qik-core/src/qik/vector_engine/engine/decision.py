@@ -152,7 +152,12 @@ def _core_decision(
     if len(core.ev_count):
         if mask:
             event = core.ev_count[0]
-            if event == len(core.ev_bar):
+            capacity = len(core.ev_bar)
+            # Stop as soon as an eighth-full buffer projects past twice its capacity:
+            # the whole batch reruns anyway, sized from the rate observed here.
+            if event == capacity or (
+                event == capacity >> 3 and (event + 1) * len(core.volume) > 2 * capacity * (i + 1)
+            ):
                 account[2] = 13
                 return
             core.event_state[1] = event

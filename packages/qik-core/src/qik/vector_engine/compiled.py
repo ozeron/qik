@@ -289,7 +289,10 @@ def _run_columns_typed(
                 raise ValueError("compiled core: side must be -1, 0, 1")
             if np.any(counts == -13):
                 assert event_bound < n, "event buffer bound"
-                event_capacity = min(n, max(1, 2 * event_capacity))
+                stopped = counts == -13
+                event_capacity = _grow_event_capacity(
+                    event_capacity, n, ev_count[stopped], raw[1][stopped, 9]
+                )
                 continue
             break
         meta = raw[1]
@@ -428,6 +431,20 @@ _BATCH_BYTES = 256 << 20
 def _initial_event_capacity(n: int) -> int:
     """Three percent headroom; an event on every bar is the hard bound."""
     return min(n, max(16, (3 * n + 99) // 100))
+
+
+def _grow_event_capacity(capacity: int, n: int, events: np.ndarray, reached: np.ndarray) -> int:
+    """Event rows for the rerun after an overflow: the densest observed rate, at least double.
+
+    A stopped config stored ``events`` and stopped at the next one, after ``reached`` bars
+    (a full buffer, or an eighth-full one projecting past twice its capacity). Every
+    overflow reruns the whole batch, so doubling from three percent cost a dense strategy
+    (P059: ~0.45 events a bar) four wasted reruns.
+    """
+    estimate = max(
+        -(-5 * (int(e) + 1) * n // (4 * int(r))) for e, r in zip(events, reached, strict=True)
+    )
+    return min(n, max(1, 2 * capacity, estimate))
 
 
 def _initial_capacity(n: int) -> int:
