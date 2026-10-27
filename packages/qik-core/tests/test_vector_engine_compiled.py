@@ -61,7 +61,11 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
     # follow the rules the way run() derives them.
     everything = frozenset(range(len(SIGNAL_FIELDS)))
     layout = _layout(everything, everything, bool(rc[13]), bool(slots and rc[8] and rc[5]))
-    store, trades = _Buffers().take(1, layout.nrows, len(c), 2 * len(c))
+    buffers = _Buffers()
+    sparse = not bool(nb.config.DISABLE_JIT)
+    store, trades = buffers.take(1, layout.nrows, 1 if sparse else len(c), 2 * len(c))
+    event_buffers = buffers.events(1, len(c) if sparse else 0, layout.nrows)
+    risk_store = buffers.risk(1, len(c) if layout.risk_row >= 0 else 0)
     from qik.vector_engine.fixed import runner as fixed_runner
 
     runner = (
@@ -96,6 +100,9 @@ def replay_column(decisions, o, h, lo, c, days, rc, slots, masks, expiry_days):
         np.empty(0, np.bool_),
         np.empty(0, np.bool_) if expiry_days is None else expiry_days,
         False,
+        *event_buffers,
+        layout.rows,
+        *((risk_store,) if sparse else ()),
     )
     return (raw[0], raw[1], *trades)  # the final (empty) state rows are dropped
 

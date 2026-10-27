@@ -12,6 +12,7 @@ from qik.vector_engine.straddle import validate_pair
 
 from .codes import (
     ACCOUNT_INVALID_SIDE,
+    EVENT_FLAG_BITS,
     V_ENTRY_I,
     V_ENTRY_PX,
     V_EQUITY,
@@ -69,7 +70,13 @@ def _core_decision(
         # The trade buffer is smaller than the worst case; the caller reruns this config.
         account[2] = 9
         return
-    pv, friction, bps, mode, amount, cap, lot, minimum = core.economic[:8]
+    pv, friction, bps, mode = core.economic[0], core.economic[1], core.economic[2], core.economic[3]
+    amount, cap, lot, minimum = (
+        core.economic[4],
+        core.economic[5],
+        core.economic[6],
+        core.economic[7],
+    )
     clamp = len(core.economic) > 8 and bool(core.economic[8])
     for k in range(seen, cnt):
         points = core.sizing_risks[out_ei[k]]
@@ -106,15 +113,22 @@ def _core_decision(
     view[V_EQUITY] = account[1]
     view[12], view[13] = work_long, work_short
     d = core.decision
-    d[:] = np.nan
+    for q in range(len(d)):
+        d[q] = np.nan
     d[0], d[1], d[12], d[13], d[14], d[28] = 0, 0, 0, 0, 0, 0
     core.step(core.state, core.params, i, core.feats, o, h, lo, c, core.volume[i], view, d)
     levels, layout = core.levels, core.layout
+    at = 0 if core.event_mode == 2 else i
+    if core.event_mode == 2:
+        core.force_close[0] = core.masks[0, i] if i < core.masks.shape[1] else 0
     stored, declared, legs, block, row = layout[0], layout[1], layout[2], layout[4], 0
     dropped = False
+    mask = 0
     for q in range(len(d)):
+        if d[q] != 0 if (EVENT_FLAG_BITS >> q & 1) else not np.isnan(d[q]):
+            mask |= 1 << q
         if (q < 16 or q > 27) and stored >> q & 1:
-            levels[row, i] = d[q]
+            levels[row, at] = d[q]
             row += 1
         flag = q == 12 or q == 13 or q == 14 or q == 28
         if not declared >> q & 1 and (d[q] != 0 if flag else np.isfinite(d[q])):
@@ -130,27 +144,44 @@ def _core_decision(
     if stored >> 16 & 1:
         for leg in range(12):
             if legs >> leg & 1:
-                levels[row, i] = d[16 + leg]
+                levels[row, at] = d[16 + leg]
                 row += 1
             else:
-                levels[block + leg, i] = d[16 + leg]
+                levels[block + leg, at] = d[16 + leg]
+    core.event_state[0], core.event_state[1] = i, -1
+    if len(core.ev_count):
+        if mask:
+            event = core.ev_count[0]
+            if event == len(core.ev_bar):
+                account[2] = 13
+                return
+            core.event_state[1] = event
+            core.ev_bar[event], core.ev_mask[event] = i, mask
+            core.ev_count[0] += 1
     if d[0] != -1 and d[0] != 0 and d[0] != 1:
         account[2], account[3] = ACCOUNT_INVALID_SIDE, i
         return
     for col in (1, 12, 13, 14, 28):
         if d[col] != 0 and d[col] != 1:
             raise ValueError("compiled core: boolean decision must be 0 or 1")
-    core.sides[i], core.exits[i] = int(d[0]), bool(d[1])
+    core.sides[at], core.exits[at] = int(d[0]), bool(d[1])
     for col in range(10):
-        _put_level(levels, layout, col, i, d[col + 2])
-    _put_level(levels, layout, 10, i, d[15])
+        _put_level(levels, layout, col, at, d[col + 2])
+    _put_level(levels, layout, 10, at, d[15])
     # Carry these refusals out of prange like sizing refusals; raising inside
     # a compiled callback can otherwise leave uninitialized result buffers.
-    pair = d[16:28].copy()
+    pair = core.pair_scratch
+    for leg in range(12):
+        pair[leg] = d[16 + leg]
+    for leg in range(10):
+        core.leg_scratch[leg] = d[2 + leg]
+    any_pair = False
+    for leg in range(12):
+        any_pair |= np.isfinite(d[16 + leg])
     if d[28]:
         pair[0] += next_px
         pair[6] += next_px
-    if np.isfinite(d[16:28]).any():
+    if any_pair:
         if core.pair_rules & 16:
             account[2] = 3
             return
@@ -178,7 +209,7 @@ def _core_decision(
         return
     validate_pair(
         pair,
-        d[2:12],
+        core.leg_scratch,
         d[0],
         bool(
             d[13]
@@ -194,45 +225,52 @@ def _core_decision(
         bool(core.pair_rules & 64),
     )
     for col in range(12):
-        _put_level(levels, layout, 11 + col, i, pair[col])
+        _put_level(levels, layout, 11 + col, at, pair[col])
     for offset, direction in ((0, 1), (6, -1)):
         _put_level(
             levels,
             layout,
             11 + offset,
-            i,
+            at,
             _round_price(pair[offset], core.tick, core.rounding, direction),
         )
         _put_level(
             levels,
             layout,
             12 + offset,
-            i,
+            at,
             _round_price(pair[1 + offset], core.tick, core.rounding, -direction),
         )
-    _put_level(levels, layout, 2, i, _round_price(d[4], core.tick, core.rounding, -d[0]))
+    _put_level(levels, layout, 2, at, _round_price(d[4], core.tick, core.rounding, -d[0]))
     trigger = d[7] + next_px if d[28] else d[7]
-    _put_level(levels, layout, 5, i, _round_price(trigger, core.tick, core.rounding, d[0]))
-    _put_level(levels, layout, 23, i, d[28])
-    _put_level(levels, layout, 24, i, d[29])
-    _put_level(levels, layout, 25, i, d[30])
-    core.long_exits[i], core.short_exits[i] = bool(d[13]), bool(d[14])
+    _put_level(levels, layout, 5, at, _round_price(trigger, core.tick, core.rounding, d[0]))
+    _put_level(levels, layout, 23, at, d[28])
+    _put_level(levels, layout, 24, at, d[29])
+    _put_level(levels, layout, 25, at, d[30])
+    core.long_exits[at], core.short_exits[at] = bool(d[13]), bool(d[14])
     # Match shared validation boundary transformation on the current decision, without future signals.
     if core.boundary == 1 and core.ends[i] and core.exit_next_open:
-        core.force_close[i] |= int(core.exits[i]) | (2 * int(d[13])) | (4 * int(d[14]))
-        core.exits[i], core.long_exits[i], core.short_exits[i] = False, False, False
+        core.force_close[at] |= int(core.exits[at]) | (2 * int(d[13])) | (4 * int(d[14]))
+        core.exits[at], core.long_exits[at], core.short_exits[at] = False, False, False
     if core.flatten_mode == 2:
         if core.ends[i]:
-            core.force_close[i] |= 1
+            core.force_close[at] |= 1
     elif d[12]:
         if core.flatten_mode == 1:
-            core.force_close[i] |= 1
-        elif i + 1 == len(core.sides) or (core.days[i + 1] and core.boundary != 2):
-            core.force_close[i] |= 1 if core.boundary == 1 else 8
+            core.force_close[at] |= 1
+        elif i + 1 == len(core.volume) or (core.days[i + 1] and core.boundary != 2):
+            core.force_close[at] |= 1 if core.boundary == 1 else 8
         else:
-            core.force_open[i + 1] = True
+            if core.event_mode == 2:
+                core.force_open[0], core.force_open[1] = core.force_open[1], i + 1
+            else:
+                core.force_open[i + 1] = True
+    if len(core.ev_count) and mask:
+        event = core.ev_count[0] - 1
+        if core.event_mode == 2:
+            core.ev_val[event, -1] = np.nan
+        for row in range(levels.shape[0]):
+            core.ev_val[event, row] = levels[row, at]
 
 
-__all__ = [
-    "_core_decision",
-]
+__all__ = ["_core_decision"]

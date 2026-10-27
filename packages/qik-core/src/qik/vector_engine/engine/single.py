@@ -44,6 +44,7 @@ from .codes import (
     REASON_STOP_GAP,
 )
 from .decision import _core_decision
+from .events import _close_at, _current_flag, _flag_at, _level_at, _open_at, _side_at
 from .fills import (
     _day_entry_expires,
     _exit_for,
@@ -254,11 +255,13 @@ def _column_advance(state, i, inputs, core=None):
     stale_dir = 0  # side of a position closed by a limit fill this bar whose quote is stale
     stale_px = 0.0
     ci = c[i]
-    long_exit_i = _optional_at(long_exits, i, False)
-    short_exit_i = _optional_at(short_exits, i, False)
-    close_mask = _optional_at(force_close, i, 0)
-    open_flatten = _optional_at(force_open, i, False)
-    exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
+    long_exit_i = _flag_at(core, long_exits, i, 13)
+    short_exit_i = _flag_at(core, short_exits, i, 14)
+    close_mask = _close_at(core, force_close, i)
+    open_flatten = _open_at(core, force_open, i)
+    exit_now = _exit_for(
+        _flag_at(core, exit_sig, i, 1), long_exit_i, short_exit_i, pos if pos else pend
+    )
     if pend != 0 and _day_entry_expires(day_cancel, _optional_at(expiry_days, i, new_day[i])):
         pend, p_chase = 0, -1
     if pend != 0 and new_day[i] and not day_cancel:
@@ -321,20 +324,20 @@ def _column_advance(state, i, inputs, core=None):
         exited = True
         market_exit = False
     if market_entry >= 0:
-        cap = _optional_at(ioc_limits, market_entry, np.nan)
-        if not np.isnan(cap) and side_sig[market_entry] * (o[i] - cap) > 0:
+        cap = _level_at(core, ioc_limits, market_entry, 10)
+        if not np.isnan(cap) and _side_at(core, side_sig, market_entry) * (o[i] - cap) > 0:
             market_entry = -1
     if market_entry >= 0:
         d = market_entry
-        s = side_sig[d]
+        s = _side_at(core, side_sig, d)
         fill = o[i] + s * slip
         st, tg = levels(
             s,
             _anchor(bracket_anchor, c[d], fill, fill),
-            entry_stop[d],
-            entry_target[d],
-            stop_pts[d],
-            target_pts[d],
+            _level_at(core, entry_stop, d, 0),
+            _level_at(core, entry_target, d, 1),
+            _level_at(core, stop_pts, d, 3),
+            _level_at(core, target_pts, d, 4),
             round_tick,
             tick_round,
             combine=combine,
@@ -426,9 +429,17 @@ def _column_advance(state, i, inputs, core=None):
                 out_stop,
             )
             core_called = True
-            long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
-            close_mask, open_flatten = core.force_close[i], core.force_open[i]
-            exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
+            long_exit_i, short_exit_i = (
+                _current_flag(core, core.long_exits, i),
+                _current_flag(core, core.short_exits, i),
+            )
+            close_mask, open_flatten = (
+                _close_at(core, core.force_close, i),
+                _open_at(core, core.force_open, i),
+            )
+            exit_now = _exit_for(
+                _flag_at(core, exit_sig, i, 1), long_exit_i, short_exit_i, pos if pos else pend
+            )
         if filled or (i == p_chase and not exit_now):
             # chase: cancel, market at this close, levels from that fill (an exit on the
             # same bar flattens instead, and V2's flatten clears the chase)
@@ -474,8 +485,14 @@ def _column_advance(state, i, inputs, core=None):
                     out_stop,
                 )
                 core_called = True
-                long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
-                close_mask, open_flatten = core.force_close[i], core.force_open[i]
+                long_exit_i, short_exit_i = (
+                    _current_flag(core, core.long_exits, i),
+                    _current_flag(core, core.short_exits, i),
+                )
+                close_mask, open_flatten = (
+                    _close_at(core, core.force_close, i),
+                    _open_at(core, core.force_open, i),
+                )
             err, why = _fill_then_protect(
                 s, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i, out_exit_i,
                 out_side, out_entry_px, out_exit_px, out_reason, out_stop, base + cnt,
@@ -602,8 +619,14 @@ def _column_advance(state, i, inputs, core=None):
             out_reason,
             out_stop,
         )
-        long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
-        close_mask, open_flatten = core.force_close[i], core.force_open[i]
+        long_exit_i, short_exit_i = (
+            _current_flag(core, core.long_exits, i),
+            _current_flag(core, core.short_exits, i),
+        )
+        close_mask, open_flatten = (
+            _close_at(core, core.force_close, i),
+            _open_at(core, core.force_open, i),
+        )
     if close_mask & 8:
         if pos or pend:
             return (
@@ -713,7 +736,9 @@ def _column_advance(state, i, inputs, core=None):
             ERR_NONE,
             -1,
         )
-    exit_now = _exit_for(exit_sig[i], long_exit_i, short_exit_i, pos if pos else pend)
+    exit_now = _exit_for(
+        _flag_at(core, exit_sig, i, 1), long_exit_i, short_exit_i, pos if pos else pend
+    )
     market_exit = exit_now and pos != 0 and exit_next_open
     if market_exit and (i + 1 == n or (new_day[i + 1] and not cross_session)):
         return (
@@ -758,13 +783,13 @@ def _column_advance(state, i, inputs, core=None):
         )
         cnt += 1
         pos, exited, pend = 0, True, 0
-    if next_open or not np.isnan(_optional_at(ioc_limits, i, np.nan)):
+    if next_open or not np.isnan(_level_at(core, ioc_limits, i, 10)):
         # R1 decisions remain at the close; stage only actionable orders. At the following
         # open a market exit executes before a replacement entry and before the price sweep.
         enter = (
             (pos == 0 or (market_exit and reenter))
             and (next_open or (pend == 0 and not busy))
-            and side_sig[i] != 0
+            and _side_at(core, side_sig, i) != 0
             and (reenter or not exited)
         )
         if market_exit or enter:
@@ -832,11 +857,11 @@ def _column_advance(state, i, inputs, core=None):
     if (
         pos == 0
         and (next_open or (pend == 0 and not busy))
-        and side_sig[i] != 0
+        and _side_at(core, side_sig, i) != 0
         and (reenter or not exited)
     ):
-        s = side_sig[i]
-        lim = entry_limit[i]
+        s = _side_at(core, side_sig, i)
+        lim = _level_at(core, entry_limit, i, 2)
         if not np.isnan(lim):
             # A same-bar target fill's stale quote does not touch a limit entry (A13: pinned by
             # ltm_bracket, 100+ such entries, all equal to Nautilus).
@@ -845,10 +870,10 @@ def _column_advance(state, i, inputs, core=None):
                 st, tg = levels(
                     s,
                     _anchor(bracket_anchor, ci, ci, lim),
-                    entry_stop[i],
-                    entry_target[i],
-                    stop_pts[i],
-                    target_pts[i],
+                    _level_at(core, entry_stop, i, 0),
+                    _level_at(core, entry_target, i, 1),
+                    _level_at(core, stop_pts, i, 3),
+                    _level_at(core, target_pts, i, 4),
                     round_tick,
                     tick_round,
                     combine=combine,
@@ -894,10 +919,10 @@ def _column_advance(state, i, inputs, core=None):
                 pend = s
                 p_lim = lim
                 p_chase = i + chase
-                p_st = entry_stop[i]
-                p_tg = entry_target[i]
-                p_stp = stop_pts[i]
-                p_tgp = target_pts[i]
+                p_st = _level_at(core, entry_stop, i, 0)
+                p_tg = _level_at(core, entry_target, i, 1)
+                p_stp = _level_at(core, stop_pts, i, 3)
+                p_tgp = _level_at(core, target_pts, i, 4)
             return (
                 ColumnState(
                     pos,
@@ -922,10 +947,10 @@ def _column_advance(state, i, inputs, core=None):
         st, tg = levels(
             s,
             ci,
-            entry_stop[i],
-            entry_target[i],
-            stop_pts[i],
-            target_pts[i],
+            _level_at(core, entry_stop, i, 0),
+            _level_at(core, entry_target, i, 1),
+            _level_at(core, stop_pts, i, 3),
+            _level_at(core, target_pts, i, 4),
             round_tick,
             tick_round,
             combine=combine,
@@ -1035,9 +1060,4 @@ def _column_advance(state, i, inputs, core=None):
 _compiled_column = nb.njit(cache=False, nogil=True)(getattr(_column, "py_func", _column))
 
 
-__all__ = [
-    "ColumnState",
-    "_column",
-    "_column_advance",
-    "_compiled_column",
-]
+__all__ = ["ColumnState", "_column", "_column_advance", "_compiled_column"]

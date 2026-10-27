@@ -155,7 +155,7 @@ V_LAST_EXIT_I, V_LAST_EXIT_PX, V_LAST_EXIT_REASON, V_EQUITY = range(8, 12)
 CoreContext = namedtuple(
     "CoreContext",
     "step state params feats volume position_view decision sides exits levels long_exits short_exits "
-    "force_close force_open days ends economic account flatten_mode boundary tick rounding layout exit_next_open pair_rules sizing_risks",
+    "force_close force_open days ends economic account flatten_mode boundary tick rounding layout exit_next_open pair_rules sizing_risks ev_count ev_bar ev_mask ev_val event_mode event_state field_rows level_rows pair_scratch leg_scratch masks",
 )
 # CoreContext.layout is six integers: an array field access refcounts and a tuple indexed
 # at run time spills, and the core runs once per bar. CoreContext.levels rows, in order:
@@ -163,6 +163,14 @@ CoreContext = namedtuple(
 # whose level _core_decision transforms; the twelve-row leg block the matcher reads (a
 # transformed leg's own row, otherwise that leg's decision); own rows for levels 2 and 5.
 
+
+EVENT_FLAG_BITS = (1 << 0) | (1 << 1) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 28)
+
+
+PAIR_BITS = ((1 << 12) - 1) << 16
+
+
+PAIR_TRIGGER_BITS = (1 << 16) | (1 << 22)
 
 __all__ = [
     "ACCOUNT_INVALID_SIDE",
@@ -238,4 +246,7 @@ __all__ = [
     "_SLOT_REPLACE",
     "_SLOT_SUBMIT",
     "rule_settings",
+    "EVENT_FLAG_BITS",
+    "PAIR_BITS",
+    "PAIR_TRIGGER_BITS",
 ]

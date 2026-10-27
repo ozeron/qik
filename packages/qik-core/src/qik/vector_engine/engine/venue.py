@@ -40,6 +40,7 @@ from .codes import (
     REASON_STOP_GAP,
 )
 from .decision import _core_decision
+from .events import _close_at, _current_flag, _flag_at, _level_at, _open_at, _side_at
 from .fills import (
     _cancel_entry_commands,
     _day_entry_expires,
@@ -203,26 +204,31 @@ def _venue_column_advance(state, i, inputs, core=None):
         cnt,
     ) = state
     ci = c[i]
-    long_exit_i = _optional_at(long_exits, i, False)
-    short_exit_i = _optional_at(short_exits, i, False)
-    close_mask = _optional_at(force_close, i, 0)
-    open_flatten = _optional_at(force_open, i, False)
+    long_exit_i = _flag_at(core, long_exits, i, 13)
+    short_exit_i = _flag_at(core, short_exits, i, 14)
+    close_mask = _close_at(core, force_close, i)
+    open_flatten = _open_at(core, force_open, i)
     exit_now = _exit_for(
-        exit_sig[i],
+        _flag_at(core, exit_sig, i, 1),
         long_exit_i,
         short_exit_i,
-        pos if pos else (side_sig[pending] if pending >= 0 else 0),
+        pos if pos else (_side_at(core, side_sig, pending) if pending >= 0 else 0),
     )
     exited = False
     busy = pending >= 0
     if (
         pending >= 0
-        and not np.isnan(entry_limit[pending])
+        and not np.isnan(_level_at(core, entry_limit, pending, 2))
         and _day_entry_expires(day_cancel, _optional_at(expiry_days, i, new_day[i]))
     ):
         _cancel_entry_commands(commands, pending)
         pending, resting, chasing, closing, busy = -1, False, False, False, False
-    if pending >= 0 and not np.isnan(entry_limit[pending]) and new_day[i] and not day_cancel:
+    if (
+        pending >= 0
+        and not np.isnan(_level_at(core, entry_limit, pending, 2))
+        and new_day[i]
+        and not day_cancel
+    ):
         return (
             VenueState(
                 commands,
@@ -273,8 +279,8 @@ def _venue_column_advance(state, i, inputs, core=None):
             commands.pop(q)
             if pending != d:
                 continue
-            s = side_sig[d]
-            cap = _optional_at(ioc_limits, d, np.nan)
+            s = _side_at(core, side_sig, d)
+            cap = _level_at(core, ioc_limits, d, 10)
             if s * (o[i] - cap) > 0:
                 pending, resting, chasing, closing = -1, False, False, False
                 continue
@@ -282,10 +288,10 @@ def _venue_column_advance(state, i, inputs, core=None):
             stop, target = levels(
                 s,
                 _anchor(bracket_anchor, c[d], ep, ep),
-                entry_stop[d],
-                entry_target[d],
-                stop_pts[d],
-                target_pts[d],
+                _level_at(core, entry_stop, d, 0),
+                _level_at(core, entry_target, d, 1),
+                _level_at(core, stop_pts, d, 3),
+                _level_at(core, target_pts, d, 4),
                 round_tick,
                 tick_round,
                 combine=combine,
@@ -300,12 +306,12 @@ def _venue_column_advance(state, i, inputs, core=None):
     # Locate the first matching point. A newly filled entry has no resting protection yet.
     if pending >= 0 and resting:
         d = pending
-        s = side_sig[d]
+        s = _side_at(core, side_sig, d)
         extreme = lo[i] if s > 0 else h[i]
-        if (s > 0 and extreme + slip <= entry_limit[d]) or (
-            s < 0 and extreme - slip >= entry_limit[d]
+        if (s > 0 and extreme + slip <= _level_at(core, entry_limit, d, 2)) or (
+            s < 0 and extreme - slip >= _level_at(core, entry_limit, d, 2)
         ):
-            px = entry_limit[d]
+            px = _level_at(core, entry_limit, d, 2)
             if slip:
                 for m in range(4):
                     pt = (
@@ -314,19 +320,19 @@ def _venue_column_advance(state, i, inputs, core=None):
                         else (c[i] if m == 3 else (h[i] if (m == 1) == high_first else lo[i]))
                     )
                     candidate = pt + s * slip
-                    if (s > 0 and candidate <= entry_limit[d]) or (
-                        s < 0 and candidate >= entry_limit[d]
+                    if (s > 0 and candidate <= _level_at(core, entry_limit, d, 2)) or (
+                        s < 0 and candidate >= _level_at(core, entry_limit, d, 2)
                     ):
                         px = candidate
                         break
             pos, ei, ep, gen = s, i, px, d
             stop, target = levels(
                 s,
-                _anchor(bracket_anchor, c[d], px, entry_limit[d]),
-                entry_stop[d],
-                entry_target[d],
-                stop_pts[d],
-                target_pts[d],
+                _anchor(bracket_anchor, c[d], px, _level_at(core, entry_limit, d, 2)),
+                _level_at(core, entry_stop, d, 0),
+                _level_at(core, entry_target, d, 1),
+                _level_at(core, stop_pts, d, 3),
+                _level_at(core, target_pts, d, 4),
                 round_tick,
                 tick_round,
                 combine=combine,
@@ -337,8 +343,8 @@ def _venue_column_advance(state, i, inputs, core=None):
             protection = 0 if closing else 1
             commands.append((i + latency, 6 if closing else 3, d))
     elif pos == 0 and protection == 2 and rejected_stop and not np.isnan(target):
-        extreme = h[i] if side_sig[gen] > 0 else lo[i]
-        if _in_market(side_sig[gen], target, extreme, False):
+        extreme = h[i] if _side_at(core, side_sig, gen) > 0 else lo[i]
+        if _in_market(_side_at(core, side_sig, gen), target, extreme, False):
             protection = 0  # flat reduce-only target is cancelled before liquidity is checked
     elif pos and protection >= 2:
         adverse_hit = (
@@ -400,8 +406,8 @@ def _venue_column_advance(state, i, inputs, core=None):
             ep,
             (stop if protection >= 2 and not rejected_stop else np.nan),
             (target if protection >= 2 else np.nan),
-            side_sig[pending] if pending >= 0 else 0,
-            entry_limit[pending] if pending >= 0 else np.nan,
+            _side_at(core, side_sig, pending) if pending >= 0 else 0,
+            _level_at(core, entry_limit, pending, 2) if pending >= 0 else np.nan,
             stop,
             cnt,
             out_entry_i,
@@ -412,8 +418,14 @@ def _venue_column_advance(state, i, inputs, core=None):
             out_reason,
             out_stop,
         )
-        long_exit_i, short_exit_i = core.long_exits[i], core.short_exits[i]
-        close_mask, open_flatten = core.force_close[i], core.force_open[i]
+        long_exit_i, short_exit_i = (
+            _current_flag(core, core.long_exits, i),
+            _current_flag(core, core.short_exits, i),
+        )
+        close_mask, open_flatten = (
+            _close_at(core, core.force_close, i),
+            _open_at(core, core.force_open, i),
+        )
     if close_mask & 8:
         if pos or pending >= 0:
             return (
@@ -459,7 +471,9 @@ def _venue_column_advance(state, i, inputs, core=None):
             -1,
         )
     if (
-        _force_for(close_mask, pos if pos else (side_sig[pending] if pending >= 0 else 0))
+        _force_for(
+            close_mask, pos if pos else (_side_at(core, side_sig, pending) if pending >= 0 else 0)
+        )
         or open_flatten
     ):
         if pos:
@@ -511,18 +525,23 @@ def _venue_column_advance(state, i, inputs, core=None):
         commands.append((i + latency, 5, gen))
         protection = 3
     exit_now = _exit_for(
-        exit_sig[i],
+        _flag_at(core, exit_sig, i, 1),
         long_exit_i,
         short_exit_i,
-        pos if pos else (side_sig[pending] if pending >= 0 else 0),
+        pos if pos else (_side_at(core, side_sig, pending) if pending >= 0 else 0),
     )
-    if pending >= 0 and not closing and not np.isnan(entry_limit[pending]) and i == pending + chase:
+    if (
+        pending >= 0
+        and not closing
+        and not np.isnan(_level_at(core, entry_limit, pending, 2))
+        and i == pending + chase
+    ):
         chasing = True
         commands.append((i + latency, 4, pending))
     if exit_now:
         chasing = False
         if pending >= 0:
-            if not closing and not np.isnan(entry_limit[pending]):
+            if not closing and not np.isnan(_level_at(core, entry_limit, pending, 2)):
                 commands.append((i + latency, 4, pending))
             closing, close_reason = True, REASON_SIGNAL
         if pos:
@@ -537,17 +556,19 @@ def _venue_column_advance(state, i, inputs, core=None):
         and pending < 0
         and not busy
         and not closing
-        and side_sig[i] != 0
+        and _side_at(core, side_sig, i) != 0
         and (reenter or not exited)
     ):
         pending = i
-        if not np.isnan(_optional_at(ioc_limits, i, np.nan)):
+        if not np.isnan(_level_at(core, ioc_limits, i, 10)):
             due = i + latency + 1
             if due >= len(c) or (not cross_session and np.any(new_day[i + 1 : due + 1])):
                 return state, ERR_NEXT_OPEN_SESSION_END, i
             commands.append((due, 7, i))
         else:
-            commands.append((i + latency, 1 if np.isnan(entry_limit[i]) else 2, i))
+            commands.append(
+                (i + latency, 1 if np.isnan(_level_at(core, entry_limit, i, 2)) else 2, i)
+            )
     while len(commands):
         ready = -1
         for q in range(len(commands)):
@@ -560,18 +581,27 @@ def _venue_column_advance(state, i, inputs, core=None):
         if kind == 1 or kind == 2:
             if pending != d:
                 continue
-            s = side_sig[d]
+            s = _side_at(core, side_sig, d)
             px = ci + s * slip
-            if kind == 1 or (s > 0 and px <= entry_limit[d]) or (s < 0 and px >= entry_limit[d]):
-                anchor = _anchor(bracket_anchor, c[d], px, px if kind == 1 else entry_limit[d])
+            if (
+                kind == 1
+                or (s > 0 and px <= _level_at(core, entry_limit, d, 2))
+                or (s < 0 and px >= _level_at(core, entry_limit, d, 2))
+            ):
+                anchor = _anchor(
+                    bracket_anchor,
+                    c[d],
+                    px,
+                    px if kind == 1 else _level_at(core, entry_limit, d, 2),
+                )
                 pos, ei, ep, gen = s, i, px, d
                 stop, target = levels(
                     s,
                     anchor,
-                    entry_stop[d],
-                    entry_target[d],
-                    stop_pts[d],
-                    target_pts[d],
+                    _level_at(core, entry_stop, d, 0),
+                    _level_at(core, entry_target, d, 1),
+                    _level_at(core, stop_pts, d, 3),
+                    _level_at(core, target_pts, d, 4),
                     round_tick,
                     tick_round,
                     combine=combine,

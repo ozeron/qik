@@ -60,7 +60,11 @@ def test_shared_record_matches_batch(mode: str, rules_width: int):
     days = np.zeros(len(x), bool)
     everything = frozenset(range(len(SIGNAL_FIELDS)))
     layout = _layout(everything, everything, False, False)
-    store, trades = _Buffers().take(2, layout.nrows, len(x), 2 * len(x))
+    buffers = _Buffers()
+    sparse = not bool(nb.config.DISABLE_JIT)
+    store, trades = buffers.take(2, layout.nrows, 1 if sparse else len(x), 2 * len(x))
+    event_buffers = buffers.events(2, len(x) if sparse else 0, layout.nrows)
+    risk_store = buffers.risk(2, len(x) if layout.risk_row >= 0 else 0)
     blank = np.full(len(x), np.nan)
     args = (
         states,
@@ -89,6 +93,9 @@ def test_shared_record_matches_batch(mode: str, rules_width: int):
         np.empty(0, np.bool_),
         np.empty(0, np.bool_),
         False,
+        *event_buffers,
+        layout.rows,
+        *((risk_store,) if sparse else ()),
     )
     if rules_width != RULES_WIDTH:
         with pytest.raises(
@@ -98,7 +105,14 @@ def test_shared_record_matches_batch(mode: str, rules_width: int):
         return
     raw = runner(*args)
     # Every field stored: the decision rows are the store rows in Signals order.
-    decisions = store[:, layout.rows]
+    if sparse:
+        dense = np.full((2, layout.nrows, len(x)), np.nan)
+        for j, count in enumerate(event_buffers[0]):
+            for row in range(count):
+                dense[j, :, event_buffers[1][j, row]] = event_buffers[3][j, row, : layout.nrows]
+        decisions = dense[:, layout.rows]
+    else:
+        decisions = store[:, layout.rows]
     assert decisions.shape == (2, 31, len(x))
     levels = [np.ascontiguousarray(decisions[:, q]) for q in range(2, 12)]
     batch = kernel_columns(

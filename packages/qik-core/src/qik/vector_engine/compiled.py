@@ -69,6 +69,7 @@ def _run_columns_typed(
     cash_accumulation: str = "batch",
     _capture_columns: list[DecisionColumns] | None = None,
     _bound_runner: Any = None,
+    _event_storage: bool = False,
     _final_states: list[np.recarray] | None = None,
 ) -> list[EngineResult]:
     """Run independent compiled cores in parallel, returning one normal Result per config.
@@ -211,7 +212,8 @@ def _run_columns_typed(
     own_risk = bool(slots and rc[8] and rc[5])
     full = _layout(frozenset(range(len(SIGNAL_FIELDS))), declared, rounding, own_risk)
     compact = _layout(_stored_fields(declared), declared, rounding, own_risk)
-    capacity = _initial_capacity(n)
+    event_capacity = _initial_event_capacity(n)
+    capacity = min(2 * n, _initial_capacity(n))
     blank = np.full(n, np.nan)
     # Unstored straddle legs: the batch path's absent block (every pair lookup misses).
     blank_pairs = np.full((12, 0), np.nan)
@@ -220,43 +222,76 @@ def _run_columns_typed(
         _day_order_dates(bars) if rules.day_order_expiry == "cancel" else np.empty(0, np.bool_)
     )
     shared = _Buffers()
+    snapshots: tuple[np.ndarray, ...] = ()
+    attempts = 0
 
     def launch(
         index: np.ndarray, layout: _Layout, width: int, buffers: _Buffers
     ) -> tuple[list[_Config], np.recarray]:
-        store, trades = buffers.take(len(index), layout.nrows, n, width)
-        raw = _bound_runner(
-            state[index],
-            params[index],
-            features,
-            bars.open,
-            bars.high,
-            bars.low,
-            bars.close,
-            volume,
-            days,
-            ends,
-            rc,
-            economic,
-            float(initial_cash) if initial_cash is not None else np.nan,
-            slots,
-            layout.context,
-            layout.level_rows,
-            store,
-            trades,
-            blank,
-            blank_pairs,
-            layout.risk_row,
-            None,
-            np.empty((0, 2, 0), np.int8),
-            np.ascontiguousarray(session_days, dtype=np.bool_),
-            expiry_days,
-            pair_declared,
-        )
-        counts = raw[0]
-        # Scan the whole batch before touching any potentially incomplete row.
-        if np.any(counts == -K.ACCOUNT_INVALID_SIDE):
-            raise ValueError("compiled core: side must be -1, 0, 1")
+        nonlocal event_capacity, attempts
+        while True:
+            if attempts:
+                from .fixed import _writable
+
+                for lane, saved in zip(features[1:], snapshots, strict=True):
+                    # Numeric equality ignores signed zero and NaN payload bits.
+                    np.copyto(_writable(lane), saved)
+            attempts += 1
+            store, trades = buffers.take(
+                len(index), layout.nrows, 1 if _event_storage else n, width
+            )
+            risk_store = buffers.risk(len(index), n if own_risk else 0)
+            event_bound = (
+                (n if layout is full and width == 2 * n else event_capacity)
+                if _event_storage
+                else 0
+            )
+            ev_count, ev_bar, ev_mask, ev_val = buffers.events(
+                len(index), event_bound, layout.nrows
+            )
+            raw = _bound_runner(
+                state[index],
+                params[index],
+                features,
+                bars.open,
+                bars.high,
+                bars.low,
+                bars.close,
+                volume,
+                days,
+                ends,
+                rc,
+                economic,
+                float(initial_cash) if initial_cash is not None else np.nan,
+                slots,
+                layout.context,
+                layout.level_rows,
+                store,
+                trades,
+                blank,
+                blank_pairs,
+                layout.risk_row,
+                None,
+                np.empty((0, 2, 0), np.int8),
+                np.ascontiguousarray(session_days, dtype=np.bool_),
+                expiry_days,
+                pair_declared,
+                ev_count,
+                ev_bar,
+                ev_mask,
+                ev_val,
+                layout.rows,
+                *(() if not _event_storage else (risk_store,)),
+            )
+            counts = raw[0]
+            # Scan the whole batch before touching any potentially incomplete row.
+            if np.any(counts == -K.ACCOUNT_INVALID_SIDE):
+                raise ValueError("compiled core: side must be -1, 0, 1")
+            if np.any(counts == -13):
+                assert event_bound < n, "event buffer bound"
+                event_capacity = min(n, max(1, 2 * event_capacity))
+                continue
+            break
         meta = raw[1]
         configs = [
             _Config(
@@ -266,6 +301,12 @@ def _run_columns_typed(
                 store[p],
                 layout,
                 width,
+                int(ev_count[p]),
+                ev_bar[p],
+                ev_mask[p],
+                ev_val[p],
+                _event_storage,
+                risk_store[p],
             )
             for p in range(len(index))
         ]
@@ -276,12 +317,19 @@ def _run_columns_typed(
         # -10: the compact layout dropped an undeclared field the core emitted.
         dropped = config.count == -10
         overflow = config.count == -9 or config.count > config.width
+        # The hard bound is terminal for compact storage too. Otherwise a broken
+        # matcher can replay forever at the same 2n capacity without growing.
+        assert not overflow or config.width < 2 * n, "trade buffer bound"
         if not (dropped or overflow):
             return None
         return dropped or config.layout is full, overflow or config.width == 2 * n
 
     def finalize(index: np.ndarray) -> tuple[list[_Config], np.recarray]:
         """Run one config batch to its final per-config outputs, rerunning where needed."""
+        nonlocal snapshots, attempts
+        snapshots = ()
+        snapshots = tuple(lane.copy() for lane in features[1:])
+        attempts = 0
         try:
             return settle(index)
         except Exception as error:
@@ -301,21 +349,17 @@ def _run_columns_typed(
             # An undeclared field was emitted: rerun with every field stored, as the
             # matcher acted on it before, so the same refusal surfaces first.
             configs, finals = launch(index, full, capacity, _Buffers())
-        # Reruns compose (a full-storage rerun can still overflow): repeat until final.
-        while pending := {p: plan for p, config in enumerate(configs) if (plan := redo(config))}:
-            for every, bound in set(pending.values()):
-                group = [p for p, plan in pending.items() if plan == (every, bound)]
-                rerun, rerun_finals = launch(
-                    index[group],
-                    full if every else compact,
-                    2 * n if bound else capacity,
-                    _Buffers(),
-                )
-                for p, config in zip(group, rerun, strict=True):
-                    # A bar records at most two trades: 2n is a proven bound, never refilled.
-                    assert not (every and bound) or redo(config) is None, "trade buffer bound"
-                    configs[p] = config
-                finals[group] = rerun_finals
+        # All configurations replay together: callbacks may mutate shared feature
+        # lanes, so a subset retry would observe another execution's side effects.
+        while pending := [plan for config in configs if (plan := redo(config))]:
+            every = any(plan[0] for plan in pending)
+            bound = any(plan[1] for plan in pending)
+            configs, finals = launch(
+                index, full if every else compact, 2 * n if bound else capacity, _Buffers()
+            )
+            assert not (every and bound) or all(redo(c) is None for c in configs), (
+                "trade buffer bound"
+            )
         return configs, finals
 
     results: list[EngineResult] = []
@@ -325,7 +369,12 @@ def _run_columns_typed(
     rearm_refused = False
     lo = 0
     while lo < k:
-        width = compact.nrows * 8 * n + 6 * n + capacity * 42
+        width = (
+            (compact.nrows * 8 + 16) * event_capacity
+            + (8 * n if own_risk else 0)
+            + capacity * 42
+            + (0 if _event_storage else (compact.nrows * 8 + 6) * n)
+        )
         hi = min(k, lo + max(nb.get_num_threads(), _BATCH_BYTES // width))
         configs, batch_finals = finalize(np.arange(lo, hi))
         finals.append(batch_finals)
@@ -354,7 +403,12 @@ def _run_columns_typed(
             except Exception as error:  # noqa: BLE001  (deferred, re-raised below)
                 failure = error
         busiest = max((config.count for config in configs), default=0)
-        capacity = min(2 * n, max(capacity, 2 * busiest))
+        capacity = min(
+            2 * n, max(capacity, 2 * busiest, 2 * max((c.ev_count for c in configs), default=0))
+        )
+        if _event_storage:
+            observed_events = max((config.ev_count for config in configs), default=0)
+            event_capacity = min(n, max(16, (5 * observed_events + 3) // 4))
         lo = hi
     if _final_states is not None:
         _final_states.append(np.concatenate(finals).view(np.recarray))
@@ -371,9 +425,14 @@ def _run_columns_typed(
 _BATCH_BYTES = 256 << 20
 
 
+def _initial_event_capacity(n: int) -> int:
+    """Three percent headroom; an event on every bar is the hard bound."""
+    return min(n, max(16, (3 * n + 99) // 100))
+
+
 def _initial_capacity(n: int) -> int:
     """Trade rows per config before a rerun; a bar records at most two trades (2n)."""
-    return min(2 * n, n // 4 + 16)
+    return min(2 * n, 2 * _initial_event_capacity(n))
 
 
 # Level row -> the decision field it carries: protection and slot levels, IOC, straddle
@@ -471,6 +530,12 @@ class _Config(NamedTuple):
     levels: np.ndarray
     layout: _Layout
     width: int
+    ev_count: int
+    ev_bar: np.ndarray
+    ev_mask: np.ndarray
+    ev_val: np.ndarray
+    sparse: bool
+    risks: np.ndarray
 
 
 class _Buffers:
@@ -479,6 +544,26 @@ class _Buffers:
     def __init__(self) -> None:
         self.key: tuple[int, int, int] | None = None
         self.size = 0
+
+    def events(self, m: int, capacity: int, fields: int) -> tuple[np.ndarray, ...]:
+        key = (capacity, fields)
+        if getattr(self, "event_key", None) != key or len(self.ev_count) < m:
+            self.event_key = key
+            self.ev_count = np.empty(m, np.int64)
+            self.ev_bar = np.empty((m, capacity), np.int64)
+            # Row -1 is HOLD; column -1 is an absent scalar level. Initialize
+            # the latter only when publishing, leaving unused capacity untouched.
+            self.ev_mask = np.empty((m, capacity + 1), np.int64)
+            self.ev_val = np.empty((m, capacity + 1, fields + 1))
+        self.ev_count[:m] = 0
+        self.ev_mask[:m, -1] = 0
+        self.ev_val[:m, -1, :] = np.nan
+        return self.ev_count[:m], self.ev_bar[:m], self.ev_mask[:m], self.ev_val[:m]
+
+    def risk(self, m: int, n: int) -> np.ndarray:
+        if not hasattr(self, "risks") or self.risks.shape[0] < m or self.risks.shape[1] != n:
+            self.risks = np.empty((m, n))
+        return self.risks[:m]
 
     def take(
         self, m: int, nrows: int, n: int, width: int
@@ -518,6 +603,8 @@ def _matched_result(
 ) -> EngineResult:
     """Validate and account one matched config through the existing API, without rematching."""
     cnt, meta = config.count, config.meta
+    if cnt == -14:
+        raise RuntimeError("backward event cursor")
     if cnt == -11:
         raise RuntimeError(
             "fixed-ABI strategy callback raised; run refused (use jit=False for the original exception)"
@@ -535,37 +622,61 @@ def _matched_result(
     rows = config.layout.rows
 
     def decision(q: int) -> np.ndarray:
+        if config.sparse:
+            row = np.full(len(bars), 0.0 if q in (0, 1, 12, 13, 14, 28) else np.nan)
+            if rows[q] >= 0:
+                row[config.ev_bar[: config.ev_count]] = config.ev_val[: config.ev_count, rows[q]]
+            return row
         row = config.levels[rows[q]]
         # Buffers are reused by the next batch: captured columns own their arrays.
         return row.copy() if captured is not None else row
 
     # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
     # refusal first, retaining complete terminal captures for causality checks.
-    if meta[0] and (captured is None or np.isnan(config.levels[rows[0]]).any()):
+    if meta[0] and (captured is None or int(meta[9]) < len(bars)):
         bar = int(meta[1])
         next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
         price = float(bars.open[bar] if next_open else bars.close[bar])
         _raise_kernel_error(int(meta[0]), bar, j, price, next_open=next_open)
     if cnt < 0:
         _sizing_error(int(meta[7]), j, int(meta[6]))
-    # Validation and accounting use the existing API; the matcher is not run again.
+    # The event mask identifies inactive fields without rebuilding n-bar arrays.
+    # Captures still own the complete declared transport, including default lanes.
+    emitted = (
+        int(np.bitwise_or.reduce(config.ev_mask[: config.ev_count], initial=0))
+        if config.sparse
+        else int(meta[8])
+    )
     sig = DecisionColumns(
         decision(0).astype(np.int8),
         decision(1).astype(bool),
         **{
             name: decision(q).astype(bool) if name in _BOOL_FIELDS else decision(q)
             for q, name in enumerate(SIGNAL_FIELDS)
-            if q >= 2 and name in fields
+            if q >= 2
+            and name in fields
+            and (not config.sparse or captured is not None or emitted >> q & 1)
         },
     )
-    emitted = int(meta[8])
     for q, name in enumerate(SIGNAL_FIELDS):
         if q >= 2 and name not in fields and emitted >> q & 1:
+            # Legacy declaration validation counts finite scalar values. Infinities
+            # still create events and reach the matcher before this check.
+            if config.sparse and name not in _BOOL_FIELDS:
+                raw_values = config.ev_val[: config.ev_count, rows[q]]
+                if not np.isfinite(raw_values).any():
+                    continue
             raise ValueError(f"core emitted undeclared field {name}")
     if captured is not None:
         captured.append(sig)
     risk_row = config.layout.risk_row
-    risks = config.levels[risk_row] if risk_row >= 0 else blank
+    risks = (
+        config.risks
+        if config.sparse and risk_row >= 0
+        else config.levels[risk_row]
+        if risk_row >= 0
+        else blank
+    )
     values = (
         np.array([cnt]),
         np.array([0, cnt]),
@@ -735,6 +846,7 @@ def _record_run(
             (clock, *(getattr(values, name) for name in names)),
             bars,
             _bound_runner=runner,
+            _event_storage=jit and not bool(getattr(nb.config, "DISABLE_JIT")),
             _final_states=final,
             _capture_columns=_capture_columns,
             **kwargs,

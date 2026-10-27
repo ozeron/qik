@@ -6,6 +6,7 @@ there is no cycle):
     codes     settings/rule/error/level codes, the float64 settings record, CoreContext
     fills     fill policy helpers: direction and exit masks, path order, entry expiry
     levels    level-store layout, level/risk writes, optional-column accessors
+    events    sparse event rows, retained decision access and current-bar scratch
     pairs     straddle pair legs: pair reads, resting/level lookups, lifetime triggers
     decision  _core_decision: the strategy callback into the level store and account
     venue     the venue settlement matcher (command queue, protection, fills)
@@ -58,6 +59,7 @@ _ENGINE_MODULE_NAMES = (
     "codes",
     "fills",
     "levels",
+    "events",
     "pairs",
     "decision",
     "venue",
@@ -290,12 +292,24 @@ class _ThrowawayLocator:
 
 _install_cache_locator()  # noqa: E402  (before the first ``cache=True`` dispatcher exists)
 
-from . import batch, codes, decision, fills, levels, pairs, single, slots, venue  # noqa: E402
+from . import (  # noqa: E402
+    batch,
+    codes,
+    decision,
+    events,
+    fills,
+    levels,
+    pairs,
+    single,
+    slots,
+    venue,
+)
 
 ENGINE_MODULES: tuple[ModuleType, ...] = (
     codes,
     fills,
     levels,
+    events,
     pairs,
     decision,
     venue,

@@ -195,6 +195,12 @@ class FixedRunner:
         sessions: np.ndarray,
         expiry: np.ndarray,
         pair: bool,
+        ev_count: np.ndarray,
+        ev_bar: np.ndarray,
+        ev_mask: np.ndarray,
+        ev_val: np.ndarray,
+        field_rows: np.ndarray,
+        risk_store: np.ndarray,
     ) -> tuple[Any, ...]:
         # Once per run, never once per bar. Copy the state at the same boundary as
         # the bound runner; views in the callback mutate these bytes in place.
@@ -215,7 +221,9 @@ class FixedRunner:
             for a in (o, h, lo, c, volume, rules, economic)
         ]
         flags = [
-            np.array(a, dtype=np.bool_, order="C", copy=True)
+            np.empty(0, np.bool_)
+            if a is None
+            else np.array(a, dtype=np.bool_, order="C", copy=True)
             for a in (days, ends, sessions, expiry)
         ]
         raw = self.engine.invoke(
@@ -236,9 +244,18 @@ class FixedRunner:
             blank_pairs,
             int(risk_row),
             None,
-            np.array(masks, dtype=np.int8, order="C", copy=True),
+            np.empty((0, 2, 0), np.int8)
+            if masks is None
+            else np.array(masks, dtype=np.int8, order="C", copy=True),
             *flags[2:],
             bool(pair),
+            ev_count,
+            ev_bar,
+            ev_mask,
+            ev_val,
+            field_rows,
+            2,
+            risk_store,
         )
         final = raw[-1].reshape(-1).view(states.dtype).view(np.recarray)
         return (*raw[:-1], final)
