@@ -454,8 +454,9 @@ def _book_loop(
     has_expiry = _has_lane(expiry_days)
 
     # Loop-carried scalars start as int64, not as literals: a literal initial value makes Numba
-    # compile a second copy of every outlined callee they are passed to.
-    zero, unset = 0, (-1)
+    # compile a second copy of every outlined callee they are passed to. ``n - n`` is a typed zero.
+    zero = n - n
+    unset = zero - 1
     pos, cnt, ei, ep = zero, zero, unset, 0.0
     stop, target = np.nan, np.nan  # the published levels
     sx, tx = -np.inf, np.inf  # sentinel copies the sweep gate reads
