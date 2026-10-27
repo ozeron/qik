@@ -12,6 +12,7 @@ there is no cycle):
     venue     the venue settlement matcher (command queue, protection, fills)
     single    the single-order matcher and its dispatcher
     slots     the slots matcher (trigger/stop/target updates, straddle legs)
+    book      the unified matcher (single-matcher plan, stage 2; not routed to yet)
     batch     run_columns, the parallel column runner and its Python-boundary ABI
 
 ``venue``/``single``/``slots`` all sit on ``decision``; ``batch`` runs all three.
@@ -65,8 +66,12 @@ _ENGINE_MODULE_NAMES = (
     "venue",
     "single",
     "slots",
+    "book",
     "batch",
 )
+# Legacy matchers (differential oracles; production never imports them). They are still engine
+# sources: Numba's cache locator keys every file in this package by ``fingerprint()``.
+_LEGACY_FILES = ("legacy/__init__", "legacy/single")
 # Modules outside this package whose source the matchers bind.
 SHARED_MODULES = ("compiled", "protection", "account", "straddle", "types")
 # Names the facade re-binds under another identifier: alias -> (module, attribute).
@@ -106,6 +111,7 @@ def _engine_files() -> tuple[Path, ...]:
     return (
         _ENGINE_DIR / "__init__.py",
         *(_ENGINE_DIR / f"{name}.py" for name in _ENGINE_MODULE_NAMES),
+        *(_ENGINE_DIR / f"{name}.py" for name in _LEGACY_FILES),
         *(package / f"{name}.py" for name in SHARED_MODULES),
     )
 
@@ -294,6 +300,7 @@ _install_cache_locator()  # noqa: E402  (before the first ``cache=True`` dispatc
 
 from . import (  # noqa: E402
     batch,
+    book,
     codes,
     decision,
     events,
@@ -315,6 +322,7 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     venue,
     single,
     slots,
+    book,
     batch,
 )
 
