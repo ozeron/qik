@@ -38,6 +38,8 @@ from numba.extending import overload
 
 from qik.vector_engine.protection import (
     ERR_NONE,
+    ERR_PROTECT_REJECTED,
+    REASON_PROTECT_FAIL,
     REASON_TARGET,
     _anchor,
     _fill_then_protect,
@@ -74,7 +76,8 @@ from .codes import (
 )
 from .decision import _core_decision, _core_decision_rare
 from .events import _close_at, _open_at
-from .fills import _no_reversal
+from .fills import _high_first, _no_reversal, _target_fill_price
+from .levels import _any_in
 
 # Rule bits, decoded once from the settings record: the low word of the flags.
 (
@@ -103,22 +106,48 @@ _RULE_BITS = (1 << 11) - 1
 C_IN_MARKET_SHIFT = 16
 C_IN_MARKET_MASK = 1 << C_IN_MARKET_SHIFT
 IN_MARKET_REFUSE = 1
-# A working limit entry across a New York date change: the single route refuses (ERR 5).
-# TODO(stage 3): V2 drops the chase and leaves a DAY limit resting (the venue arm). Clearing this
-# field does not model that: the chase would stay armed. The venue arm needs its own named value,
-# and a route that sets it needs the drop in the loop; until then 0 is not a valid policy.
+# A working limit entry across a New York date change: every route refuses (ERR 5), the venue
+# route only for a pending entry that carries a limit. V2 itself drops a staged chase there and
+# leaves the DAY limit resting, but no route models that (``reference.py`` refuses the same
+# input), so the field has one policy. A value that drops the chase would change refusals into
+# trades, which is a digest-changing decision for the owner, not a compat bit.
 C_NEW_DAY_SHIFT = 17
 C_NEW_DAY_MASK = 3 << C_NEW_DAY_SHIFT
 NEW_DAY_REFUSE = 1
+# Which matcher's semantics own the column. The venue route (latency, or ONE_TICK without
+# next-open entries) runs a per-command settlement state machine: the protection 0..3 machine,
+# the limit slippage search, the IOC command. It never reads next-open fills and does not model
+# the stale quote (A13), so those rule bits are masked off for it in ``_rule_flags``.
+C_ROUTE_SHIFT = 19
+C_ROUTE_MASK = 1 << C_ROUTE_SHIFT
+ROUTE_VENUE = 1
+_VENUE_IGNORES = F_NEXT_OPEN | F_EXIT_NEXT_OPEN | F_STALE_DROP
 COMPAT_SINGLE = (IN_MARKET_REFUSE << C_IN_MARKET_SHIFT) | (NEW_DAY_REFUSE << C_NEW_DAY_SHIFT)
-if _RULE_BITS & (C_IN_MARKET_MASK | C_NEW_DAY_MASK) or C_IN_MARKET_MASK & C_NEW_DAY_MASK:
+COMPAT_VENUE = (NEW_DAY_REFUSE << C_NEW_DAY_SHIFT) | (ROUTE_VENUE << C_ROUTE_SHIFT)
+if (
+    _RULE_BITS & (C_IN_MARKET_MASK | C_NEW_DAY_MASK | C_ROUTE_MASK)
+    or C_IN_MARKET_MASK & (C_NEW_DAY_MASK | C_ROUTE_MASK)
+    or C_NEW_DAY_MASK & C_ROUTE_MASK
+):
     raise RuntimeError("rule bits and compat fields must be disjoint masks")
 
-# Transition ring: next-open staging. A close enqueues, the next open settles in FIFO order.
+# Transition ring. Single: next-open staging; a close enqueues, the next open settles in FIFO
+# order. Venue: the command list, FIFO in insertion order, each entry settling once its due bar
+# has come (dues need not be monotone).
 K_OPEN_EXIT, K_OPEN_ENTRY = 1, 2
-CAP = 8  # a power of two; single holds at most a staged exit and a staged entry
+# Venue command kinds (the legacy codes): market entry, limit entry, protection, cancel entry,
+# cancel protection, close, IOC entry (settles at its due open, before everything else).
+K_MARKET, K_LIMIT, K_PROTECT, K_CANCEL, K_UNPROTECT, K_CLOSE, K_IOC = 1, 2, 3, 4, 5, 6, 7
+CAP = 8  # a power of two; see the live-entry bound below
 RING_FULL = (1 << CAP) - 1
-ERR_RING_OVERFLOW = 15  # a hard refusal; unreachable on this route (two staged at most)
+ERR_RING_OVERFLOW = 15  # a hard refusal, never a drop; unreachable on both routes (bound below)
+
+# Venue scalars that are cold (loaded on events): indices into one int64 array.
+# decision bar and retained identity of the pending entry, the position's decision bar and side,
+# protection 0 none / 1 submitted / 2 working / 3 cancel in flight, then flags.
+VS_PD, VS_PIDENT, VS_GEN, VS_GSIDE, VS_PROT = 0, 1, 2, 3, 4
+VS_CLOSING, VS_REASON, VS_REJECTED, VS_RESTING, VS_CHASING = 5, 6, 7, 8, 9
+VS_SIZE = 10
 
 
 def _has_lane(a):
@@ -247,6 +276,8 @@ def _rule_flags(rules, compat):
     ):
         if rules[index] != 0.0:
             flags |= bit
+    if compat & C_ROUTE_MASK:
+        flags &= ~_VENUE_IGNORES  # the venue never reads these (R15 keeps them off its route)
     return flags
 
 
@@ -314,6 +345,106 @@ def _ring_pop(ring, qmask, qhead, qtail, now):
                 qhead += 1
             return slot, qmask, qhead
     return -1, qmask, qhead
+
+
+@nb.njit(cache=True, nogil=True, inline="always")
+def _ring_pop_cmd(ring, qmask, qhead, qtail, now, ioc):
+    """Venue: the first entry in insertion order whose due has come, among the IOC entries
+    (``ioc``) or among every other kind. Returns ``(slot, qmask, qhead)``; the slot is -1 when
+    nothing is ready. An entry behind a not-yet-due one is passed over, never reordered."""
+    for t in range(qhead, qtail):
+        slot = t & (CAP - 1)
+        if (qmask >> slot) & 1 and ring[0, slot] <= now and (ring[1, slot] == K_IOC) == ioc:
+            qmask &= ~(1 << slot)
+            while qhead < qtail and not (qmask >> (qhead & (CAP - 1))) & 1:
+                qhead += 1
+            return slot, qmask, qhead
+    return -1, qmask, qhead
+
+
+@nb.njit(cache=True, nogil=True)
+def _ring_drop(ring, qmask, qhead, qtail, bar):
+    """Venue: remove every entry of the decision at ``bar`` (an expired entry's commands)."""
+    for t in range(qhead, qtail):
+        slot = t & (CAP - 1)
+        if (qmask >> slot) & 1 and ring[2, slot] == bar:
+            qmask &= ~(1 << slot)
+    while qhead < qtail and not (qmask >> (qhead & (CAP - 1))) & 1:
+        qhead += 1
+    return qmask, qhead, qtail
+
+
+@nb.njit(cache=True, nogil=True)
+def _vsweep(oi, hi, li, ci, high_first, pos, stop, target, slip, rejected, adverse_first, gap):
+    """Venue: the first path point (O, e1, e2, C) at which the live stop or target fills.
+
+    Returns ``(reason, px)``, reason 0 for no fill. A stop is tested before the target at a
+    point, and not at all once the venue rejected it. Slippage applies to the fill price of both
+    legs, the target is also tested at the slipped point. Adverse-first suppresses the target
+    on a bar whose extreme reaches the stop.
+    """
+    adverse_hit = (
+        adverse_first
+        and not rejected
+        and not np.isnan(stop)
+        and (li <= stop if pos > 0 else hi >= stop)
+    )
+    for m in range(4):
+        pt = oi if m == 0 else (ci if m == 3 else (hi if (m == 1) == high_first else li))
+        if not rejected and _in_market(pos, stop, pt, True):
+            reason = REASON_STOP_GAP if m == 0 else REASON_STOP
+            return reason, (pt - pos * slip if slip else (pt if m == 0 else stop))
+        candidate = pt - pos * slip
+        if not adverse_hit and _in_market(pos, target, candidate, False):
+            return REASON_TARGET, _target_fill_price(pt, target, m == 0, gap, pos, slip)
+    return 0, 0.0
+
+
+@nb.njit(cache=True, nogil=True)
+def _limit_fill_px(oi, hi, li, ci, high_first, side, slip, lim):
+    """Venue: where a resting limit fills. Its own level, or with slippage the first path point
+    whose adverse tick is still inside the limit."""
+    px = lim
+    if slip:
+        for m in range(4):
+            pt = oi if m == 0 else (ci if m == 3 else (hi if (m == 1) == high_first else li))
+            candidate = pt + side * slip
+            if (side > 0 and candidate <= lim) or (side < 0 and candidate >= lim):
+                px = candidate
+                break
+    return px
+
+
+@nb.njit(cache=True, nogil=True)
+def _row_save(
+    count_only, k, prior_i, prior_f, out_entry_i, out_exit_i, out_side, out_entry_px,
+    out_exit_px, out_reason, out_stop,
+):  # fmt: skip
+    """Keep the row a trade is about to overwrite, so a refused bar can put it back."""
+    if not count_only and k < len(out_entry_i):
+        prior_i[0], prior_i[1], prior_i[2], prior_i[3] = (
+            out_entry_i[k],
+            out_exit_i[k],
+            out_side[k],
+            out_reason[k],
+        )
+        prior_f[0], prior_f[1], prior_f[2] = out_entry_px[k], out_exit_px[k], out_stop[k]
+
+
+@nb.njit(cache=True, nogil=True)
+def _row_restore(
+    count_only, k, prior_i, prior_f, out_entry_i, out_exit_i, out_side, out_entry_px,
+    out_exit_px, out_reason, out_stop,
+):  # fmt: skip
+    """Put back the row ``_row_save`` kept: a refused bar leaves nothing past the count."""
+    if not count_only and k < len(out_entry_i):
+        out_entry_i[k], out_exit_i[k], out_side[k], out_reason[k] = (
+            prior_i[0],
+            prior_i[1],
+            prior_i[2],
+            prior_i[3],
+        )
+        out_entry_px[k], out_exit_px[k], out_stop[k] = prior_f[0], prior_f[1], prior_f[2]
 
 
 @nb.njit(cache=True, nogil=True)
@@ -410,15 +541,20 @@ def _book_loop(
     core=None,
     ioc_limits=None,
     expiry_days=None,
+    compat=COMPAT_SINGLE,
 ):
-    """The single-route loop, for a column that ``_routes_here`` accepts: numeric ABI, optional
-    strategy callback.
+    """The matcher loop: numeric ABI, optional strategy callback, the route in ``compat``.
+
+    ``COMPAT_SINGLE`` is the single route (``_routes_here``); ``COMPAT_VENUE`` the venue route
+    (latency, or ONE_TICK without next-open entries): same arguments, same seven-field result.
 
     Returns ``(n_trades, err, err_bar, final_side, final_entry_i, final_entry_px, final_stop)``.
     A callback or account refusal returns ``err == ERR_NONE`` with ``core.account[2]`` set.
     """
     n = o.shape[0]
-    flags = _rule_flags(rules, COMPAT_SINGLE)
+    flags = _rule_flags(rules, compat)
+    venue = flags & C_ROUTE_MASK != 0
+    lat = int(rules[R_LATENCY_BARS])
     adaptive = flags & F_ADAPTIVE != 0
     adverse_first = flags & F_ADVERSE_FIRST != 0
     reenter = flags & F_REENTER != 0
@@ -457,195 +593,381 @@ def _book_loop(
     # compile a second copy of every outlined callee they are passed to. ``n - n`` is a typed zero.
     zero = n - n
     unset = zero - 1
-    pos, cnt, ei, ep = zero, zero, unset, 0.0
+    pos, cnt, ei = zero, zero, unset
+    ep = np.nan if venue else 0.0  # the venue's initial entry price is NaN
     stop, target = np.nan, np.nan  # the published levels
     sx, tx = -np.inf, np.inf  # sentinel copies the sweep gate reads
     # A working limit entry: its side (0 none), level and chase bar are hot; the protection
     # levels and distances it will trade with are cold and live in ``rec``.
     pend, p_lim, p_chase = zero, 0.0, unset
     rec = np.full(4, np.nan)  # stop, target, stop points, target points of the working entry
+    # Venue only: the cold state, and the exit row a refused bar puts back (see ``VS_*``).
+    vs = np.zeros(VS_SIZE, np.int64)
+    prior_i, prior_f = np.zeros(4, np.int64), np.zeros(3)
+    vs[VS_GEN], vs[VS_REASON] = -1, REASON_SIGNAL
     ring = np.empty((4, CAP), np.int64)  # due bar, kind, decision bar, decision identity
     qmask, qhead, qtail = zero, zero, zero
     err, eb = ERR_NONE, -1
     for i in range(n):
         at = _scratch_at(core, i)
-        s = 0
-        if core is None:
-            # Dense columns hold every decision already: a bar with nothing to do is skipped.
-            # A callback column cannot be: the strategy observes every bar (decided below).
-            s = int(side_sig[i])
-            if pos == 0 and pend == 0 and qmask == 0 and s == 0:
-                continue  # nothing rests, nothing is in flight, nothing to enter
-            xg, xl, xs = _exit_flags(
-                exit_sig, long_exits, short_exits, i, has_exit, has_long, has_short
-            )
-            cmask = _lane_at(force_close, i, 0) if has_close else 0
-            oflat = _lane_at(force_open, i, False) if has_open else False
-        else:
-            # Nothing is published yet at this bar's open: the strategy decides at the close.
-            xg, xl, xs = False, False, False
-            cmask = 0
-            oflat = _open_at(core, force_open, i)
-        exited = False
-        busy = False  # a working entry resolved on this bar: the sleeve could not act (A15)
-        pin_side = 0  # side of a position a target filled this bar at a stale quote (A13)
-        pin = 0.0
-        oi = o[i]
-        ci = c[i]
-        if pend != 0:
-            if day_cancel and (_lane_at(expiry_days, i, False) if has_expiry else new_day[i]):
-                pend, p_chase = zero, unset
-            if pend != 0 and new_day[i] and not day_cancel and refuse_new_day:
-                err, eb = ERR_PENDING_NEW_DAY, i
-                break
-        # --- the open: a forced flatten, then the transitions staged at the last close ---
-        if oflat:
-            if pos != 0:
-                _put_trade(
-                    count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL, stop,
-                    out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
-                    out_reason, out_stop,
-                )  # fmt: skip
-                cnt += 1
-            pos, pend, qmask, qhead, qtail, exited = zero, zero, zero, zero, zero, True
-        while qmask != 0:
-            ready, qmask, qhead = _ring_pop(ring, qmask, qhead, qtail, i)
-            if ready < 0:
-                break
-            d = ring[2, ready]
-            if ring[1, ready] == K_OPEN_EXIT:
-                _put_trade(
-                    count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL, stop,
-                    out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
-                    out_reason, out_stop,
-                )  # fmt: skip
-                cnt += 1
-                pos = zero
-                exited = True
-                continue
-            held = ring[3, ready]
-            sd = _held_side(core, side_sig, held)
-            cap = _held_level(core, ioc_limits, held, 10, np.nan) if has_ioc else np.nan
-            if not np.isnan(cap) and sd * (oi - cap) > 0:
-                continue  # the IOC cap is through at the open: the entry is dropped
-            fill = oi + sd * slip
-            st, tg = levels(
-                sd,
-                _anchor(bracket_anchor, c[d], fill, fill),
-                _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
-                _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
-                _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
-                _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
-                tick,
-                tick_round,
-                combine=combine,
-                fill=fill,
-            )
-            # Protection placed now is validated at the actual entry open (R1).
-            if refuse_in_market:
-                if _in_market(sd, st, oi, True):
-                    err, eb = ERR_STOP_IN_MARKET, i
-                    break
-                if _in_market(sd, tg, oi, False):
-                    err, eb = ERR_TARGET_IN_MARKET, i
-                    break
-            pos, ei, ep, stop, target = sd, i, fill, st, tg
-            sx, tx = _stop_sentinel(sd, st), _target_sentinel(sd, tg)
-        if err != ERR_NONE:
-            break
-        called = False  # the strategy has published this bar's close decision
-        if pend != 0:
-            # A resting limit fills at its own level once any path point reaches it (A5); its
-            # protection meets this bar's close, not the rest of the bar (A15).
-            filled = (pend > 0 and lo[i] <= p_lim) or (pend < 0 and h[i] >= p_lim)
-            busy = filled or i == p_chase
-            if core is not None and not filled and i == p_chase:
-                # A chase is a close command, so the cancellation decision precedes that fill.
-                _core_decision_rare(
-                    core, i, oi, h[i], lo[i], ci, pos, ei, ep, stop, target, pend, p_lim, stop,
-                    cnt, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
-                    out_reason, out_stop,
-                )  # fmt: skip
-                if core.account[2] != 0:
-                    break
-                called = True
+        if venue:
+            # --- the venue route, up to the strategy's close decision ---
+            # A per-command settlement machine (the legacy venue matcher): commands are ring
+            # entries that settle once their due bar has come, in insertion order.
+            exited = False
+            busy = pend != 0  # an entry in flight or working: the sleeve cannot place another
+            swept = zero  # the side of the position a stop/target exit closed on this bar
+            oi = o[i]
+            ci = c[i]
+            if core is None:
+                s = int(side_sig[i])
                 xg, xl, xs = _exit_flags(
-                    exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short
+                    exit_sig, long_exits, short_exits, i, has_exit, has_long, has_short
                 )
-            # A chase is a close command: an exit on this bar flattens instead of chasing.
-            if filled or (i == p_chase and not (xg or (pend > 0 and xl) or (pend < 0 and xs))):
-                side = pend
-                pend = zero
-                px = p_lim if filled else ci
+                cmask = _lane_at(force_close, i, 0) if has_close else 0
+                oflat = _lane_at(force_open, i, False) if has_open else False
+                if (
+                    pos == 0
+                    and pend == 0
+                    and qmask == 0
+                    and s == 0
+                    and vs[VS_PROT] == 0
+                    and vs[VS_CLOSING] == 0
+                ):
+                    continue  # nothing rests, nothing is in flight, nothing to enter
+            else:
+                s = 0
+                xg, xl, xs = False, False, False
+                cmask = 0
+                oflat = _open_at(core, force_open, i)
+            pin_side = 0
+            pin = 0.0
+            if pend != 0 and not np.isnan(p_lim):
+                if day_cancel and (_lane_at(expiry_days, i, False) if has_expiry else new_day[i]):
+                    qmask, qhead, qtail = _ring_drop(ring, qmask, qhead, qtail, vs[VS_PD])
+                    pend = zero
+                    vs[VS_RESTING], vs[VS_CHASING], vs[VS_CLOSING] = 0, 0, 0
+                    busy = False
+                elif refuse_new_day and new_day[i] and not day_cancel:
+                    err, eb = ERR_PENDING_NEW_DAY, i
+                    break
+            if oflat:
+                if pos != 0:
+                    _put_trade(
+                        count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL,
+                        stop, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                        out_reason, out_stop,
+                    )  # fmt: skip
+                    cnt += 1
+                pos, pend, qmask, qhead, qtail = zero, zero, zero, zero, zero
+                vs[VS_PROT], vs[VS_CLOSING], vs[VS_RESTING], vs[VS_CHASING] = 0, 0, 0, 0
+            # IOC entries settle at their due open, before anything else rests or fills.
+            while qmask != 0:
+                ready, qmask, qhead = _ring_pop_cmd(ring, qmask, qhead, qtail, i, True)
+                if ready < 0:
+                    break
+                vd = ring[2, ready]
+                if pend == 0 or vs[VS_PD] != vd:
+                    continue
+                held = ring[3, ready]
+                cap = _held_level(core, ioc_limits, held, 10, np.nan) if has_ioc else np.nan
+                if pend * (oi - cap) > 0:
+                    pend = zero
+                    vs[VS_RESTING], vs[VS_CHASING], vs[VS_CLOSING] = 0, 0, 0
+                    continue
                 st, tg = levels(
-                    side,
-                    _anchor(bracket_anchor, c[p_chase - chase], px, px),
-                    rec[0],
-                    rec[1],
-                    rec[2],
-                    rec[3],
+                    pend,
+                    _anchor(bracket_anchor, c[vd], oi, oi),
+                    _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
+                    _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
+                    _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
+                    _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
                     tick,
                     tick_round,
                     combine=combine,
-                    fill=px,
+                    fill=oi,
                 )
-                if core is not None and filled:
-                    # The resting entry has printed, but its callback protection is a close
-                    # command: the strategy observes the position before the legs are accepted.
-                    _core_decision_rare(
-                        core, i, oi, h[i], lo[i], ci, side, i, px, np.nan, np.nan, pend,
-                        np.nan, st, cnt, out_entry_i, out_exit_i, out_side, out_entry_px,
-                        out_exit_px, out_reason, out_stop,
-                    )  # fmt: skip
-                    if core.account[2] != 0:
-                        break
-                    called = True
-                e, why = _fill_then_protect(
-                    side, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i,
-                    out_exit_i, out_side, out_entry_px, out_exit_px, out_reason, out_stop,
-                    base + cnt,
+                pos, ei, ep, stop, target = pend, i, oi, st, tg
+                sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
+                vs[VS_GEN], vs[VS_GSIDE] = vd, pos
+                pend = zero
+                vs[VS_RESTING], vs[VS_CHASING], vs[VS_REJECTED] = 0, 0, 0
+                vs[VS_PROT] = 0 if vs[VS_CLOSING] != 0 else 1
+                qmask, qhead, qtail, ok = _ring_push(
+                    ring, qmask, qhead, qtail, i + lat,
+                    K_CLOSE if vs[VS_CLOSING] != 0 else K_PROTECT, vd, -1,
                 )  # fmt: skip
-                if e != ERR_NONE:
-                    err, eb = e, i
+                if not ok:
+                    err, eb = ERR_RING_OVERFLOW, i
                     break
-                if why != 0:
-                    cnt += 1
-                    exited = True
+            if err != ERR_NONE:
+                break
+            if (
+                vs[VS_CLOSING] != 0
+                and pend == 0
+                and pos == 0
+                and (vs[VS_PROT] == 0 or vs[VS_PROT] == 3)
+            ):
+                vs[VS_CLOSING] = 0
+            hf = _high_first(adaptive, oi, h[i], lo[i])
+            # The first matching point. A newly filled entry has no resting protection yet.
+            if pend != 0 and vs[VS_RESTING] != 0:
+                ext = lo[i] if pend > 0 else h[i]
+                if (pend > 0 and ext + slip <= p_lim) or (pend < 0 and ext - slip >= p_lim):
+                    vd = vs[VS_PD]
+                    held = vs[VS_PIDENT]
+                    px = _limit_fill_px(oi, h[i], lo[i], ci, hf, pend, slip, p_lim)
+                    st, tg = levels(
+                        pend,
+                        _anchor(bracket_anchor, c[vd], px, p_lim),
+                        _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
+                        _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
+                        _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
+                        _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                        tick,
+                        tick_round,
+                        combine=combine,
+                        fill=px,
+                    )
+                    pos, ei, ep, stop, target = pend, i, px, st, tg
+                    sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
+                    vs[VS_GEN], vs[VS_GSIDE] = vd, pos
+                    pend = zero
+                    vs[VS_RESTING], vs[VS_CHASING], vs[VS_REJECTED] = 0, 0, 0
+                    vs[VS_PROT] = 0 if vs[VS_CLOSING] != 0 else 1
+                    qmask, qhead, qtail, ok = _ring_push(
+                        ring, qmask, qhead, qtail, i + lat,
+                        K_CLOSE if vs[VS_CLOSING] != 0 else K_PROTECT, vd, -1,
+                    )  # fmt: skip
+                    if not ok:
+                        err, eb = ERR_RING_OVERFLOW, i
+                        break
+            elif pos == 0 and vs[VS_PROT] == 2 and vs[VS_REJECTED] != 0 and not np.isnan(target):
+                # A flat reduce-only target is cancelled before its liquidity is checked.
+                ext = h[i] if vs[VS_GSIDE] > 0 else lo[i]
+                if _in_market(vs[VS_GSIDE], target, ext, False):
+                    vs[VS_PROT] = 0
+            elif pos != 0 and vs[VS_PROT] >= 2:
+                if pos > 0:
+                    touched = (
+                        (oi <= sx) | (h[i] <= sx) | (lo[i] <= sx) | (ci <= sx)
+                        | (oi - slip >= tx) | (h[i] - slip >= tx)
+                        | (lo[i] - slip >= tx) | (ci - slip >= tx)
+                    )  # fmt: skip
                 else:
-                    pos, ei, ep, stop, target = side, i, px, st, tg
-                    sx, tx = _stop_sentinel(side, st), _target_sentinel(side, tg)
-        elif pos != 0:
-            if pos > 0:
-                touched = (oi <= sx) | (lo[i] <= sx) | (oi >= tx) | (h[i] >= tx)
-            else:
-                touched = (oi >= sx) | (h[i] >= sx) | (oi <= tx) | (lo[i] <= tx)
-            if touched:
-                reason, px, point, high_first = _sweep(
-                    oi, h[i], lo[i], pos, stop, target, adaptive, adverse_first, target_gap
+                    touched = (
+                        (oi >= sx) | (h[i] >= sx) | (lo[i] >= sx) | (ci >= sx)
+                        | (oi + slip <= tx) | (h[i] + slip <= tx)
+                        | (lo[i] + slip <= tx) | (ci + slip <= tx)
+                    )  # fmt: skip
+                if touched:
+                    reason, px = _vsweep(
+                        oi, h[i], lo[i], ci, hf, pos, stop, target, slip, vs[VS_REJECTED] != 0,
+                        adverse_first, target_gap,
+                    )  # fmt: skip
+                    if reason != 0:
+                        _row_save(
+                            count_only, base + cnt, prior_i, prior_f, out_entry_i, out_exit_i,
+                            out_side, out_entry_px, out_exit_px, out_reason, out_stop,
+                        )  # fmt: skip
+                        _put_trade(
+                            count_only, base + cnt, ei, i, pos, ep, px, reason, stop,
+                            out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                            out_reason, out_stop,
+                        )  # fmt: skip
+                        cnt += 1
+                        swept = pos
+                        pos = zero
+                        exited = True
+                        qmask, qhead, qtail, ok = _ring_push(
+                            ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
+                        )
+                        if not ok:
+                            err, eb = ERR_RING_OVERFLOW, i
+                            break
+                        vs[VS_PROT] = 3
+            called = False
+        else:
+            s = 0
+            if core is None:
+                # Dense columns hold every decision already: a bar with nothing to do is skipped.
+                # A callback column cannot be: the strategy observes every bar (decided below).
+                s = int(side_sig[i])
+                if pos == 0 and pend == 0 and qmask == 0 and s == 0:
+                    continue  # nothing rests, nothing is in flight, nothing to enter
+                xg, xl, xs = _exit_flags(
+                    exit_sig, long_exits, short_exits, i, has_exit, has_long, has_short
                 )
-                if reason != 0:
-                    if reason != REASON_TARGET:
-                        px -= pos * slip
+                cmask = _lane_at(force_close, i, 0) if has_close else 0
+                oflat = _lane_at(force_open, i, False) if has_open else False
+            else:
+                # Nothing is published yet at this bar's open: the strategy decides at the close.
+                xg, xl, xs = False, False, False
+                cmask = 0
+                oflat = _open_at(core, force_open, i)
+            exited = False
+            busy = False  # a working entry resolved on this bar: the sleeve could not act (A15)
+            pin_side = 0  # side of a position a target filled this bar at a stale quote (A13)
+            pin = 0.0
+            oi = o[i]
+            ci = c[i]
+            if pend != 0:
+                if day_cancel and (_lane_at(expiry_days, i, False) if has_expiry else new_day[i]):
+                    pend, p_chase = zero, unset
+                if pend != 0 and new_day[i] and not day_cancel and refuse_new_day:
+                    err, eb = ERR_PENDING_NEW_DAY, i
+                    break
+            # --- the open: a forced flatten, then the transitions staged at the last close ---
+            if oflat:
+                if pos != 0:
                     _put_trade(
-                        count_only, base + cnt, ei, i, pos, ep, px, reason, stop,
+                        count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL, stop,
                         out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
                         out_reason, out_stop,
                     )  # fmt: skip
                     cnt += 1
-                    if reason == REASON_TARGET and point > 0:  # a gap fill pins nothing
-                        e1 = h[i] if high_first else lo[i]
-                        e2 = lo[i] if high_first else h[i]
-                        if _no_reversal(oi, e1, e2, ci, point, pos):
-                            pin_side = pos
-                            pin = px
+                pos, pend, qmask, qhead, qtail, exited = zero, zero, zero, zero, zero, True
+            while qmask != 0:
+                ready, qmask, qhead = _ring_pop(ring, qmask, qhead, qtail, i)
+                if ready < 0:
+                    break
+                d = ring[2, ready]
+                if ring[1, ready] == K_OPEN_EXIT:
+                    _put_trade(
+                        count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL, stop,
+                        out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                        out_reason, out_stop,
+                    )  # fmt: skip
+                    cnt += 1
                     pos = zero
                     exited = True
+                    continue
+                held = ring[3, ready]
+                sd = _held_side(core, side_sig, held)
+                cap = _held_level(core, ioc_limits, held, 10, np.nan) if has_ioc else np.nan
+                if not np.isnan(cap) and sd * (oi - cap) > 0:
+                    continue  # the IOC cap is through at the open: the entry is dropped
+                fill = oi + sd * slip
+                st, tg = levels(
+                    sd,
+                    _anchor(bracket_anchor, c[d], fill, fill),
+                    _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
+                    _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
+                    _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
+                    _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                    tick,
+                    tick_round,
+                    combine=combine,
+                    fill=fill,
+                )
+                # Protection placed now is validated at the actual entry open (R1).
+                if refuse_in_market:
+                    if _in_market(sd, st, oi, True):
+                        err, eb = ERR_STOP_IN_MARKET, i
+                        break
+                    if _in_market(sd, tg, oi, False):
+                        err, eb = ERR_TARGET_IN_MARKET, i
+                        break
+                pos, ei, ep, stop, target = sd, i, fill, st, tg
+                sx, tx = _stop_sentinel(sd, st), _target_sentinel(sd, tg)
+            if err != ERR_NONE:
+                break
+            called = False  # the strategy has published this bar's close decision
+            if pend != 0:
+                # A resting limit fills at its own level once any path point reaches it (A5); its
+                # protection meets this bar's close, not the rest of the bar (A15).
+                filled = (pend > 0 and lo[i] <= p_lim) or (pend < 0 and h[i] >= p_lim)
+                busy = filled or i == p_chase
+                if core is not None and not filled and i == p_chase:
+                    # A chase is a close command, so the cancellation decision precedes that fill.
+                    _core_decision_rare(
+                        core, i, oi, h[i], lo[i], ci, pos, ei, ep, stop, target, pend, p_lim, stop,
+                        cnt, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                        out_reason, out_stop,
+                    )  # fmt: skip
+                    if core.account[2] != 0:
+                        break
+                    called = True
+                    xg, xl, xs = _exit_flags(
+                        exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short
+                    )
+                # A chase is a close command: an exit on this bar flattens instead of chasing.
+                if filled or (i == p_chase and not (xg or (pend > 0 and xl) or (pend < 0 and xs))):
+                    side = pend
+                    pend = zero
+                    px = p_lim if filled else ci
+                    st, tg = levels(
+                        side,
+                        _anchor(bracket_anchor, c[p_chase - chase], px, px),
+                        rec[0],
+                        rec[1],
+                        rec[2],
+                        rec[3],
+                        tick,
+                        tick_round,
+                        combine=combine,
+                        fill=px,
+                    )
+                    if core is not None and filled:
+                        # The resting entry has printed, but its callback protection is a close
+                        # command: the strategy observes the position before the legs are accepted.
+                        _core_decision_rare(
+                            core, i, oi, h[i], lo[i], ci, side, i, px, np.nan, np.nan, pend,
+                            np.nan, st, cnt, out_entry_i, out_exit_i, out_side, out_entry_px,
+                            out_exit_px, out_reason, out_stop,
+                        )  # fmt: skip
+                        if core.account[2] != 0:
+                            break
+                        called = True
+                    e, why = _fill_then_protect(
+                        side, i, px, st, tg, ci, protect_flatten, count_only, out_entry_i,
+                        out_exit_i, out_side, out_entry_px, out_exit_px, out_reason, out_stop,
+                        base + cnt,
+                    )  # fmt: skip
+                    if e != ERR_NONE:
+                        err, eb = e, i
+                        break
+                    if why != 0:
+                        cnt += 1
+                        exited = True
+                    else:
+                        pos, ei, ep, stop, target = side, i, px, st, tg
+                        sx, tx = _stop_sentinel(side, st), _target_sentinel(side, tg)
+            elif pos != 0:
+                if pos > 0:
+                    touched = (oi <= sx) | (lo[i] <= sx) | (oi >= tx) | (h[i] >= tx)
+                else:
+                    touched = (oi >= sx) | (h[i] >= sx) | (oi <= tx) | (lo[i] <= tx)
+                if touched:
+                    reason, px, point, high_first = _sweep(
+                        oi, h[i], lo[i], pos, stop, target, adaptive, adverse_first, target_gap
+                    )
+                    if reason != 0:
+                        if reason != REASON_TARGET:
+                            px -= pos * slip
+                        _put_trade(
+                            count_only, base + cnt, ei, i, pos, ep, px, reason, stop,
+                            out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                            out_reason, out_stop,
+                        )  # fmt: skip
+                        cnt += 1
+                        if reason == REASON_TARGET and point > 0:  # a gap fill pins nothing
+                            e1 = h[i] if high_first else lo[i]
+                            e2 = lo[i] if high_first else h[i]
+                            if _no_reversal(oi, e1, e2, ci, point, pos):
+                                pin_side = pos
+                                pin = px
+                        pos = zero
+                        exited = True
         # --- decisions at bar i's close ---
         if core is not None:
             if not called:
+                # The venue publishes the protection that is working, not the one in flight.
                 _core_decision(
-                    core, i, oi, h[i], lo[i], ci, pos, ei, ep, stop, target, pend,
-                    p_lim if pend else np.nan, stop, cnt, out_entry_i, out_exit_i, out_side,
+                    core, i, oi, h[i], lo[i], ci, pos, ei, ep,
+                    stop if not venue or (vs[VS_PROT] >= 2 and vs[VS_REJECTED] == 0) else np.nan,
+                    target if not venue or vs[VS_PROT] >= 2 else np.nan,
+                    pend, p_lim if pend else np.nan, stop, cnt, out_entry_i, out_exit_i, out_side,
                     out_entry_px, out_exit_px, out_reason, out_stop,
                 )  # fmt: skip
                 if core.account[2] != 0:
@@ -655,11 +977,220 @@ def _book_loop(
                 exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short
             )
             cmask = _close_at(core, force_close, i)
-            if pos == 0 and pend == 0 and qmask == 0 and s == 0:
+            if venue:
+                oflat = _open_at(core, force_open, i)  # the venue re-reads it after the callback
+            if (
+                pos == 0
+                and pend == 0
+                and qmask == 0
+                and s == 0
+                and (not venue or (vs[VS_PROT] == 0 and vs[VS_CLOSING] == 0))
+            ):
                 continue
         if cmask & 8:
             if pos != 0 or pend != 0:
                 err, eb = ERR_NEXT_OPEN_SESSION_END, i
+                break
+            continue
+        if venue:
+            # --- the venue route, from the strategy's close decision: commands, then settlement ---
+            fside = pos if pos != 0 else pend
+            if ((cmask & 1) or (fside > 0 and cmask & 2) or (fside < 0 and cmask & 4)) or oflat:
+                if pos != 0:
+                    _put_trade(
+                        count_only, base + cnt, ei, i, pos, ep, ci - pos * slip, REASON_SIGNAL,
+                        stop, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                        out_reason, out_stop,
+                    )  # fmt: skip
+                    cnt += 1
+                pos, pend, qmask, qhead, qtail = zero, zero, zero, zero, zero
+                vs[VS_PROT], vs[VS_CLOSING], vs[VS_RESTING], vs[VS_CHASING] = 0, 0, 0, 0
+                continue
+            if (
+                vs[VS_CLOSING] != 0
+                and pend == 0
+                and pos == 0
+                and (vs[VS_PROT] == 0 or vs[VS_PROT] == 3)
+            ):
+                vs[VS_CLOSING] = 0
+            if vs[VS_CLOSING] != 0 and pos == 0 and vs[VS_PROT] == 2:
+                qmask, qhead, qtail, ok = _ring_push(
+                    ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
+                )
+                if not ok:
+                    err, eb = ERR_RING_OVERFLOW, i
+                vs[VS_PROT] = 3
+            xside = pos if pos != 0 else pend
+            exit_now = xg or (xside > 0 and xl) or (xside < 0 and xs)
+            if pend != 0 and vs[VS_CLOSING] == 0 and not np.isnan(p_lim) and i == p_chase:
+                vs[VS_CHASING] = 1
+                qmask, qhead, qtail, ok = _ring_push(
+                    ring, qmask, qhead, qtail, i + lat, K_CANCEL, vs[VS_PD], -1
+                )
+                if not ok:
+                    err, eb = ERR_RING_OVERFLOW, i
+            if exit_now:
+                vs[VS_CHASING] = 0
+                if pend != 0:
+                    if vs[VS_CLOSING] == 0 and not np.isnan(p_lim):
+                        qmask, qhead, qtail, ok = _ring_push(
+                            ring, qmask, qhead, qtail, i + lat, K_CANCEL, vs[VS_PD], -1
+                        )
+                        if not ok:
+                            err, eb = ERR_RING_OVERFLOW, i
+                    vs[VS_CLOSING], vs[VS_REASON] = 1, REASON_SIGNAL
+                if pos != 0:
+                    if vs[VS_PROT] == 2:
+                        qmask, qhead, qtail, ok = _ring_push(
+                            ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
+                        )
+                        if not ok:
+                            err, eb = ERR_RING_OVERFLOW, i
+                        vs[VS_PROT] = 3
+                    if vs[VS_CLOSING] == 0:
+                        qmask, qhead, qtail, ok = _ring_push(
+                            ring, qmask, qhead, qtail, i + lat, K_CLOSE, vs[VS_GEN], -1
+                        )
+                        if not ok:
+                            err, eb = ERR_RING_OVERFLOW, i
+                    vs[VS_CLOSING], vs[VS_REASON] = 1, REASON_SIGNAL
+            if (
+                pos == 0
+                and pend == 0
+                and not busy
+                and vs[VS_CLOSING] == 0
+                and s != 0
+                and (reenter or not exited)
+            ):
+                lim = _lane_at(entry_limit, at, np.nan) if has_limit else np.nan
+                cap = _lane_at(ioc_limits, at, np.nan) if has_ioc else np.nan
+                pend, p_lim, p_chase = s, lim, i + chase
+                vs[VS_PD], vs[VS_PIDENT] = i, _held_ident(core, i)
+                if not np.isnan(cap):
+                    due = i + lat + 1
+                    if due >= n or (not cross_session and _any_in(new_day, i + 1, due + 1)):
+                        if exited:
+                            # The refused bar reports the state it started in: its exit row and
+                            # count are put back.
+                            _row_restore(
+                                count_only, base + cnt - 1, prior_i, prior_f, out_entry_i,
+                                out_exit_i, out_side, out_entry_px, out_exit_px, out_reason,
+                                out_stop,
+                            )  # fmt: skip
+                            cnt -= 1
+                            pos = swept
+                        err, eb = ERR_NEXT_OPEN_SESSION_END, i
+                        break
+                    qmask, qhead, qtail, ok = _ring_push(
+                        ring, qmask, qhead, qtail, due, K_IOC, i, vs[VS_PIDENT]
+                    )
+                else:
+                    qmask, qhead, qtail, ok = _ring_push(
+                        ring, qmask, qhead, qtail, i + lat,
+                        K_MARKET if np.isnan(lim) else K_LIMIT, i, vs[VS_PIDENT],
+                    )  # fmt: skip
+                if not ok:
+                    err, eb = ERR_RING_OVERFLOW, i
+            if err != ERR_NONE:
+                break
+            while qmask != 0:
+                ready, qmask, qhead = _ring_pop_cmd(ring, qmask, qhead, qtail, i, False)
+                if ready < 0:
+                    break
+                kind = ring[1, ready]
+                vd = ring[2, ready]
+                if kind <= K_LIMIT:
+                    if pend == 0 or vs[VS_PD] != vd:
+                        continue
+                    px = ci + pend * slip
+                    if kind == K_MARKET or (pend > 0 and px <= p_lim) or (pend < 0 and px >= p_lim):
+                        held = vs[VS_PIDENT]
+                        st, tg = levels(
+                            pend,
+                            _anchor(bracket_anchor, c[vd], px, px if kind == K_MARKET else p_lim),
+                            _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
+                            _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
+                            _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
+                            _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                            tick,
+                            tick_round,
+                            combine=combine,
+                            fill=px,
+                        )
+                        pos, ei, ep, stop, target = pend, i, px, st, tg
+                        sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
+                        vs[VS_GEN], vs[VS_GSIDE] = vd, pos
+                        pend = zero
+                        vs[VS_RESTING], vs[VS_CHASING], vs[VS_REJECTED] = 0, 0, 0
+                        vs[VS_PROT] = 0 if vs[VS_CLOSING] != 0 else 1
+                        qmask, qhead, qtail, ok = _ring_push(
+                            ring, qmask, qhead, qtail, i + lat,
+                            K_CLOSE if vs[VS_CLOSING] != 0 else K_PROTECT, vd, -1,
+                        )  # fmt: skip
+                        if not ok:
+                            err, eb = ERR_RING_OVERFLOW, i
+                    else:
+                        vs[VS_RESTING] = 1
+                elif kind == K_CANCEL:
+                    if pend != 0 and vs[VS_PD] == vd:
+                        vs[VS_RESTING] = 0
+                        if vs[VS_CHASING] != 0:
+                            # The chase: the limit is gone, the entry goes in at market.
+                            vs[VS_CHASING] = 0
+                            qmask, qhead, qtail, ok = _ring_push(
+                                ring, qmask, qhead, qtail, i + lat, K_MARKET, vd, -1
+                            )
+                            if not ok:
+                                err, eb = ERR_RING_OVERFLOW, i
+                        else:
+                            pend = zero
+                elif kind == K_PROTECT and vs[VS_GEN] == vd:
+                    vs[VS_PROT] = 2
+                    if pos != 0:
+                        if _in_market(pos, stop, ci, True):
+                            # The venue rejects a stop at or through the market (A10).
+                            if not protect_flatten:
+                                err, eb = ERR_PROTECT_REJECTED, i
+                                break
+                            vs[VS_REJECTED] = 1
+                            if np.isnan(target):
+                                vs[VS_PROT] = 0
+                            if vs[VS_CLOSING] == 0:
+                                vs[VS_REASON] = REASON_PROTECT_FAIL
+                                qmask, qhead, qtail, ok = _ring_push(
+                                    ring, qmask, qhead, qtail, i + lat, K_CLOSE, vd, -1
+                                )
+                                if not ok:
+                                    err, eb = ERR_RING_OVERFLOW, i
+                            vs[VS_CLOSING] = 1
+                        px = ci - pos * slip
+                        if _in_market(pos, target, px, False):  # a marketable target fills (A11)
+                            _put_trade(
+                                count_only, base + cnt, ei, i, pos, ep, px, REASON_TARGET, stop,
+                                out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                                out_reason, out_stop,
+                            )  # fmt: skip
+                            cnt += 1
+                            pos = zero
+                            qmask, qhead, qtail, ok = _ring_push(
+                                ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vd, -1
+                            )
+                            if not ok:
+                                err, eb = ERR_RING_OVERFLOW, i
+                            vs[VS_PROT] = 3
+                elif kind == K_UNPROTECT and vs[VS_GEN] == vd:
+                    vs[VS_PROT] = 0
+                elif kind == K_CLOSE and pos != 0:
+                    _put_trade(
+                        count_only, base + cnt, ei, i, pos, ep, ci - pos * slip, vs[VS_REASON],
+                        stop, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
+                        out_reason, out_stop,
+                    )  # fmt: skip
+                    cnt += 1
+                    pos = zero
+                if err != ERR_NONE:
+                    break
+            if err != ERR_NONE:
                 break
             continue
         if cmask != 0:
@@ -780,10 +1311,13 @@ def _book_loop(
 __all__ = [
     "CAP",
     "COMPAT_SINGLE",
+    "COMPAT_VENUE",
     "C_IN_MARKET_MASK",
     "C_IN_MARKET_SHIFT",
     "C_NEW_DAY_MASK",
     "C_NEW_DAY_SHIFT",
+    "C_ROUTE_MASK",
+    "C_ROUTE_SHIFT",
     "ERR_RING_OVERFLOW",
     "F_ADAPTIVE",
     "F_ADVERSE_FIRST",
@@ -797,10 +1331,29 @@ __all__ = [
     "F_STALE_DROP",
     "F_TARGET_GAP",
     "IN_MARKET_REFUSE",
+    "K_CANCEL",
+    "K_CLOSE",
+    "K_IOC",
+    "K_LIMIT",
+    "K_MARKET",
     "K_OPEN_ENTRY",
     "K_OPEN_EXIT",
+    "K_PROTECT",
+    "K_UNPROTECT",
     "NEW_DAY_REFUSE",
     "RING_FULL",
+    "ROUTE_VENUE",
+    "VS_CHASING",
+    "VS_CLOSING",
+    "VS_GEN",
+    "VS_GSIDE",
+    "VS_PD",
+    "VS_PIDENT",
+    "VS_PROT",
+    "VS_REASON",
+    "VS_REJECTED",
+    "VS_RESTING",
+    "VS_SIZE",
     "_book_loop",
     "_exit_flags",
     "_has_lane",
@@ -808,14 +1361,20 @@ __all__ = [
     "_held_level",
     "_held_side",
     "_lane_at",
+    "_limit_fill_px",
     "_put_trade",
     "_ring_compact",
+    "_ring_drop",
     "_ring_pop",
+    "_ring_pop_cmd",
     "_ring_push",
     "_routes_here",
+    "_row_restore",
+    "_row_save",
     "_rule_flags",
     "_scratch_at",
     "_stop_sentinel",
     "_sweep",
     "_target_sentinel",
+    "_vsweep",
 ]

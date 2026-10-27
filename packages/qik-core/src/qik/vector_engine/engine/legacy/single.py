@@ -55,8 +55,8 @@ from qik.vector_engine.engine.fills import (
     _target_fill_price,
     _venue_record,
 )
+from qik.vector_engine.engine.legacy.venue import _venue_driver
 from qik.vector_engine.engine.levels import _optional_at
-from qik.vector_engine.engine.venue import _venue_driver
 from qik.vector_engine.protection import (
     ERR_NONE,
     REASON_TARGET,

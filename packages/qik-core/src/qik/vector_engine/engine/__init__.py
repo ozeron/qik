@@ -73,7 +73,7 @@ _ENGINE_MODULE_NAMES = (
 )
 # Legacy matchers (differential oracles; production never imports them). They are still engine
 # sources: Numba's cache locator keys every file in this package by ``fingerprint()``.
-_LEGACY_FILES = ("legacy/__init__", "legacy/single")
+_LEGACY_FILES = ("legacy/__init__", "legacy/single", "legacy/venue")
 # Modules outside this package whose source the matchers bind.
 SHARED_MODULES = ("compiled", "protection", "account", "straddle", "types")
 # Names the facade re-binds under another identifier: alias -> (module, attribute).
