@@ -204,6 +204,7 @@ def _run_columns_typed(
             sizing.lot_step if sizing else 1.0,
             sizing.min_qty if sizing else 1.0,
             sizing.min_qty_policy == "clamp" if sizing else False,
+            0.0,  # set per launch: the projected-overflow stop (first launch of a batch only)
         ]
     )
     k, n = len(params), len(bars)
@@ -249,6 +250,9 @@ def _run_columns_typed(
             ev_count, ev_bar, ev_mask, ev_val = buffers.events(
                 len(index), event_bound, layout.nrows
             )
+            # Later launches grow only on a real overflow: a projection must not stop
+            # a retry whose capacity the batch budget already bounded.
+            economic[9] = attempts == 1
             raw = _bound_runner(
                 state[index],
                 params[index],
@@ -291,7 +295,11 @@ def _run_columns_typed(
                 assert event_bound < n, "event buffer bound"
                 stopped = counts == -13
                 event_capacity = _grow_event_capacity(
-                    event_capacity, n, ev_count[stopped], raw[1][stopped, 9]
+                    event_capacity,
+                    n,
+                    ev_count[stopped],
+                    raw[1][stopped, 9],
+                    _event_budget(len(index), layout.nrows, width, n if own_risk else 0),
                 )
                 continue
             break
@@ -372,6 +380,7 @@ def _run_columns_typed(
     rearm_refused = False
     lo = 0
     while lo < k:
+        # Per-config bytes; _event_budget inverts the sparse part for overflow reruns.
         width = (
             (compact.nrows * 8 + 16) * event_capacity
             + (8 * n if own_risk else 0)
@@ -433,16 +442,28 @@ def _initial_event_capacity(n: int) -> int:
     return min(n, max(16, (3 * n + 99) // 100))
 
 
-def _grow_event_capacity(capacity: int, n: int, events: np.ndarray, reached: np.ndarray) -> int:
+def _event_budget(m: int, nrows: int, trade_capacity: int, risk_bars: int) -> int:
+    """Event rows per config that fit a batch of ``m`` in _BATCH_BYTES (the batch-size bytes)."""
+    spare = _BATCH_BYTES // m - 8 * risk_bars - 42 * trade_capacity
+    return max(0, spare) // (nrows * 8 + 16)
+
+
+def _grow_event_capacity(
+    capacity: int, n: int, events: np.ndarray, reached: np.ndarray, budget: int
+) -> int:
     """Event rows for the rerun after an overflow: the densest observed rate, at least double.
 
     A stopped config stored ``events`` and stopped at the next one, after ``reached`` bars
-    (a full buffer, or an eighth-full one projecting past twice its capacity). Every
-    overflow reruns the whole batch, so doubling from three percent cost a dense strategy
-    (P059: ~0.45 events a bar) four wasted reruns.
+    (a full buffer, or a first-launch projection past twice the capacity). Every overflow
+    reruns the whole batch, so doubling from three percent cost a dense strategy (P059:
+    ~0.45 events a bar) four wasted reruns. An extrapolated rate may not reserve more than
+    the batch's ``budget`` rows (the bytes the batch size was chosen for); only doubling,
+    after a real overflow, grows past it.
     """
-    estimate = max(
-        -(-5 * (int(e) + 1) * n // (4 * int(r))) for e, r in zip(events, reached, strict=True)
+    estimate = min(
+        n,
+        budget,
+        max(-(-5 * (int(e) + 1) * n // (4 * int(r))) for e, r in zip(events, reached, strict=True)),
     )
     return min(n, max(1, 2 * capacity, estimate))
 

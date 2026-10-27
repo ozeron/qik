@@ -151,12 +151,16 @@ def _core_decision(
     core.event_state[0], core.event_state[1] = i, -1
     if len(core.ev_count):
         if mask:
-            event = core.ev_count[0]
-            capacity = len(core.ev_bar)
-            # Stop as soon as an eighth-full buffer projects past twice its capacity:
-            # the whole batch reruns anyway, sized from the rate observed here.
+            event, capacity, n = core.ev_count[0], len(core.ev_bar), len(core.volume)
+            # A batch's first launch (economic[9]) stops once an eighth-full buffer,
+            # a sixty-fourth into the tape, projects past twice its capacity: the
+            # whole batch reruns anyway, sized from the rate observed here.
             if event == capacity or (
-                event == capacity >> 3 and (event + 1) * len(core.volume) > 2 * capacity * (i + 1)
+                event >= capacity >> 3
+                and 64 * (i + 1) >= n
+                and len(core.economic) > 9
+                and core.economic[9] != 0
+                and (event + 1) * n > 2 * capacity * (i + 1)
             ):
                 account[2] = 13
                 return
