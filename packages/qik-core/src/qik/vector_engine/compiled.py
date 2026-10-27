@@ -214,7 +214,7 @@ def _run_columns_typed(
     compact = _layout(_stored_fields(declared), declared, rounding, own_risk)
     event_capacity = _initial_event_capacity(n)
     capacity = min(2 * n, _initial_capacity(n))
-    blank = np.full(n, np.nan)
+    blank = np.full(1 if _event_storage else n, np.nan)
     # Unstored straddle legs: the batch path's absent block (every pair lookup misses).
     blank_pairs = np.full((12, 0), np.nan)
     volume = bars.volume if bars.volume is not None else np.zeros(n)

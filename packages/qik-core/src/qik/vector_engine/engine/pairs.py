@@ -87,7 +87,7 @@ def _open_in_market(triggers, pair, sides, d, opening, core=None):
     return _in_market(-_side_at(core, sides, d), _level_at(core, triggers, d, 5), opening, True)
 
 
-@nb.njit(cache=True, inline="always")
+@nb.njit(cache=True)
 def _event_pair_at(masks, values, rows, row):
     if row < 0:
         return False

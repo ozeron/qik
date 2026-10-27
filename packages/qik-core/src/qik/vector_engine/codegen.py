@@ -322,7 +322,34 @@ def _write_module(
                 and node.func.id == "_python_step"
             ):
                 node.func = ast.Attribute(ast.Name("core", ast.Load()), "step", ast.Load())
+    field_writer = None
     if callback:
+        # Borrow pointers as at the callback boundary: passing owning arrays to
+        # an outlined scan adds per-bar NRT reference-count traffic.
+        first = next(
+            index
+            for index, statement in enumerate(decision.body)
+            if isinstance(statement, ast.Assign)
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == "dropped"
+        )
+        scan = decision.body[first : first + 3]
+        assert isinstance(scan[-1], ast.For)
+        field_writer = ast.parse("""
+@nb.njit(cache=True, inline="never", no_cpython_wrapper=True, no_cfunc_wrapper=True)
+def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, declared, account_addr):
+    d = nb.carray(_pointer(d_addr), size, dtype=np.float64)
+    levels = nb.carray(_pointer(levels_addr), (height, width), dtype=np.float64)
+    account = nb.carray(_pointer(account_addr), 6, dtype=np.float64)
+    row = 0
+""").body[0]
+        assert isinstance(field_writer, ast.FunctionDef)
+        field_writer.body += copy.deepcopy(scan)
+        field_writer.body += ast.parse("return mask, dropped, row").body
+        decision.body[first : first + 3] = ast.parse(
+            "mask, dropped, row = _decision_fields(d.ctypes.data, len(d), levels.ctypes.data, "
+            "levels.shape[0], levels.shape[1], at, stored, declared, account.ctypes.data)"
+        ).body
 
         class CallbackStatus(ast.NodeTransformer):
             def visit_Expr(self, node: ast.Expr) -> ast.stmt | list[ast.stmt]:
@@ -371,6 +398,8 @@ def _write_module(
             "\n".join(f"_decision_{name} = core.{name}" for name in attributes)
         ).body
     functions: list[ast.stmt] = [decision] if callback else [adapter, decision]
+    if field_writer is not None:
+        functions.insert(0, field_writer)
     if callback:
         # The basic scheduler publishes at three distinct points. Share the two
         # limit-fill/chase paths instead of expanding the publisher three times;
@@ -522,6 +551,8 @@ context = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
             "from qik.vector_engine.types import Bar, Position\n"
             "_features_type = _strategy.__strategy__.features\n"
         )
+    else:
+        header += "from qik.vector_engine.fixed import _pointer\n"
     if not callback:
         for function in functions:
             if isinstance(function, ast.FunctionDef):

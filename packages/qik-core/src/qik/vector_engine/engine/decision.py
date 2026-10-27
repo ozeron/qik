@@ -79,7 +79,7 @@ def _core_decision(
     )
     clamp = len(core.economic) > 8 and bool(core.economic[8])
     for k in range(seen, cnt):
-        points = core.sizing_risks[out_ei[k]]
+        points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else out_ei[k]]
         risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
         qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
         if qty < 0:
@@ -102,7 +102,7 @@ def _core_decision(
     view[V_ENTRY_I], view[V_ENTRY_PX] = (ei if pos else -1), (ep if pos else np.nan)
     view[V_STOP], view[V_TARGET] = (stop if pos else np.nan), (target if pos else np.nan)
     if pos:
-        points = core.sizing_risks[ei]
+        points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else ei]
         risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
         qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
         if qty < 0:
