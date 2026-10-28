@@ -98,6 +98,7 @@ _LOCATOR_NAMES = (
     "ZipCacheLocator",
 )
 _content_variants: tuple[Any, ...] = ()
+_first_party_variants: tuple[Any, ...] = ()
 # (directory, stamp) for engine files no locator can cache; created on first use, per process.
 _throwaway: tuple[str, str] | None = None
 
@@ -200,11 +201,14 @@ def _install_cache_locator() -> None:
             "engine: an unstamped fallback can serve stale machine code."
         )
     variants = tuple(_content_locator(locator) for locator in defaults)
-    global _content_variants
+    global _content_variants, _first_party_variants
     _content_variants = variants
+    _first_party_variants = tuple(_first_party_locator(locator) for locator in defaults)
 
     tested = [index for index, cls in enumerate(locators) if getattr(cls, "_qik_content", False)]
-    locators.insert(tested[0] + 1 if tested else 0, EngineCacheLocator)
+    at = tested[0] + 1 if tested else 0
+    locators.insert(at, EngineCacheLocator)
+    locators.insert(at + 1, FirstPartyCacheLocator)
 
 
 class EngineCacheLocator:
@@ -241,6 +245,56 @@ def _content_locator(base: Any) -> Any:
             return fingerprint()
 
     ContentLocator.__name__ = ContentLocator.__qualname__ = f"Engine{base.__name__}"
+    return ContentLocator
+
+
+class FirstPartyCacheLocator:
+    """Content-stamped stand-in for the locator of a first-party ``@njit(cache=True)`` function.
+
+    Numba stamps a cache entry by the mtime and size of the file that defines the function, so a
+    cached helper is served stale after an edit to anything it calls in another file (the strategy
+    trades the old direction). Every first-party file outside the engine gets the twin of each of
+    Numba's locators, stamped by the import closure of its module (``reach.module_stamp``): an edit
+    to any first-party module the helper's module imports, directly or not, is a cache miss. The
+    cache path is the one Numba would have chosen. The engine's own and generated modules keep
+    their locators (they are keyed by content already).
+    """
+
+    _qik_engine = True
+
+    @classmethod
+    def from_function(cls, py_func: Any, py_file: str) -> Any:
+        from qik.vector_engine import reach
+
+        module = getattr(py_func, "__module__", "") or ""
+        path = reach.first_party_path(py_file)
+        if path is None or _ENGINE_DIR in path.parents or module.startswith("_qik_"):
+            return None
+        for variant in _first_party_variants:
+            locator = variant.from_function(py_func, py_file)
+            if locator is not None:
+                locator._qik_module = (module, path)
+                return locator
+        return None
+
+
+def _first_party_locator(base: Any) -> Any:
+    class ContentLocator(base):  # type: ignore[misc, valid-type]
+        _qik_engine = True
+        _qik_module: tuple[str, Path]
+
+        def get_source_stamp(self) -> str:
+            from qik.vector_engine import reach
+
+            name, path = self._qik_module
+            try:
+                return reach.module_stamp(name, path)
+            except (OSError, SyntaxError, ValueError) as error:
+                # A file that cannot be read or parsed has no identity: stamp it so that no other
+                # process, and no later call, can match the entry (a miss, never a stale hit).
+                return f"unreadable-{os.getpid()}-{secrets.token_hex(8)}-{type(error).__name__}"
+
+    ContentLocator.__name__ = ContentLocator.__qualname__ = f"FirstParty{base.__name__}"
     return ContentLocator
 
 
