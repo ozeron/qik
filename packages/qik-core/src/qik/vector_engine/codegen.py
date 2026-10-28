@@ -259,13 +259,11 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                         and isinstance(statement.targets[0].value, ast.Name)
                         and statement.targets[0].value.id == "counts"
                     ):
-                        node.body.insert(
-                            index + 1,
-                            ast.parse(
-                                "if counts[j] == -ACCOUNT_INVALID_SIDE:\n"
-                                "    raise ValueError('compiled core: side must be -1, 0, 1')"
-                            ).body[0],
-                        )
+                        node.body[index + 1 : index + 1] = ast.parse(
+                            "if counts[j] == -ACCOUNT_INVALID_SIDE:\n"
+                            "    raise ValueError('compiled core: side must be -1, 0, 1')\n"
+                            "_raise_column_refusal(counts[j])"
+                        ).body
                         break
     functions.append(runner)
     strategy = None if callback else importlib.import_module(strategy_module)
@@ -282,7 +280,7 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
         + ("" if callback else f"from {strategy_module} import {strategy_name} as _strategy\n")
         + "\n".join(engine.imports(names))
         + "\n"
-        "from qik.vector_engine.compiled import RULES_WIDTH\n"
+        "from qik.vector_engine.compiled import RULES_WIDTH, _raise_column_refusal\n"
         "_no_callback = None\n"
     )
     if not callback:
@@ -585,8 +583,8 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
     if pair_declared and (not slots):
         raise ValueError('straddle requires the slots scheduler')
     k, n = (len(params_grid), len(c))
-    counts = np.empty(k, np.int64)
-    meta = np.empty((k, 10))
+    counts = np.full(k, K.COLUMN_UNRUN, np.int64)
+    meta = np.zeros((k, 10))
     a0s, a1s, a2s, a3s, a4s, a5s, a6s = trades
     rows = level_rows
     pairs = rows[11]

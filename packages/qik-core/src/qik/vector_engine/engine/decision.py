@@ -8,10 +8,12 @@ import numpy as np
 from qik.vector_engine.account import fill_cost, settle
 from qik.vector_engine.account import quantity as _contracts_for
 from qik.vector_engine.protection import _round_price
-from qik.vector_engine.straddle import validate_pair
+from qik.vector_engine.straddle import pair_refusal
 
 from .codes import (
+    ACCOUNT_BOOLEAN_DECISION,
     ACCOUNT_INVALID_SIDE,
+    ACCOUNT_PAIR_REFUSAL,
     EVENT_FLAG_BITS,
     V_ENTRY_I,
     V_ENTRY_PX,
@@ -172,7 +174,8 @@ def _core_decision(
         return
     for col in (1, 12, 13, 14, 28):
         if d[col] != 0 and d[col] != 1:
-            raise ValueError("compiled core: boolean decision must be 0 or 1")
+            account[2], account[3] = ACCOUNT_BOOLEAN_DECISION, i
+            return
     core.sides[at], core.exits[at] = int(d[0]), bool(d[1])
     for col in range(10):
         _put_level(levels, layout, col, at, d[col + 2])
@@ -216,7 +219,7 @@ def _core_decision(
         # A23 settles a flatten at this close only; a future-open flatten is refused.
         account[2] = 8
         return
-    validate_pair(
+    refusal = pair_refusal(
         pair,
         core.leg_scratch,
         d[0],
@@ -233,6 +236,10 @@ def _core_decision(
         bool(core.pair_rules & 32),
         bool(core.pair_rules & 64),
     )
+    if refusal > 1:
+        # PAIR_MESSAGES[refusal - 2], raised in Python: a raise here would not leave the loop.
+        account[2], account[3] = ACCOUNT_PAIR_REFUSAL + refusal - 2, i
+        return
     for col in range(12):
         _put_level(levels, layout, 11 + col, at, pair[col])
     for offset, direction in ((0, 1), (6, -1)):

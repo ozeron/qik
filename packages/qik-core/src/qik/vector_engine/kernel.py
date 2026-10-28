@@ -120,7 +120,10 @@ from .engine.codes import (
     _SLOT_PROTECT_FAIL,
     _SLOT_REPLACE,
     _SLOT_SUBMIT,
+    ACCOUNT_BOOLEAN_DECISION,
     ACCOUNT_INVALID_SIDE,
+    ACCOUNT_PAIR_REFUSAL,
+    COLUMN_UNRUN,
     ERR_AMEND_NO_ORDER,
     ERR_AMEND_REJECTED,
     ERR_BUSY_ENTRY_DROPPED,
@@ -284,7 +287,7 @@ from .protection import (
     _round_price,
     levels,
 )
-from .straddle import validate_pair
+from .straddle import pair_refusal, validate_pair
 
 # The historic kernel surface, re-exported by name; the code lives in engine/.
 __all__ = [
@@ -336,7 +339,10 @@ __all__ = [
     "_spop",
     "_spush",
     "_any_in",
+    "ACCOUNT_BOOLEAN_DECISION",
     "ACCOUNT_INVALID_SIDE",
+    "ACCOUNT_PAIR_REFUSAL",
+    "COLUMN_UNRUN",
     "Any",
     "CoreContext",
     "ERR_AMEND_NO_ORDER",
@@ -456,6 +462,7 @@ __all__ = [
     "run_columns",
     "settle",
     "signature",
+    "pair_refusal",
     "validate_pair",
     "wraps",
     "EVENT_FLAG_BITS",

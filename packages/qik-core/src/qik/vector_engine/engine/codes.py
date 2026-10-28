@@ -133,6 +133,14 @@ ERR_REARM_BEFORE_CLOSE = 14  # A23: replacement fills at this close, the old clo
 
 # Account refusals 9/10/11 are buffer overflow, dropped fields and callback failure.
 ACCOUNT_INVALID_SIDE = 12
+# Refusals the column code used to raise, which a parallel loop loses (the column's remaining work
+# is skipped and the run returns normally): carried in the account row like the others, raised
+# in Python with the message the reference run raises. 16.. are ``straddle.PAIR_MESSAGES``.
+ACCOUNT_BOOLEAN_DECISION = 15
+ACCOUNT_PAIR_REFUSAL = 16
+# ``counts`` of a column the parallel loop never completed; any other value was written by the
+# column itself, so this one is never a result.
+COLUMN_UNRUN = -1000
 
 _SLOT_SUBMIT = 1
 _SLOT_PROTECT = 2
@@ -171,7 +179,10 @@ PAIR_BITS = ((1 << 12) - 1) << 16
 
 
 __all__ = [
+    "ACCOUNT_BOOLEAN_DECISION",
     "ACCOUNT_INVALID_SIDE",
+    "ACCOUNT_PAIR_REFUSAL",
+    "COLUMN_UNRUN",
     "CoreContext",
     "ERR_AMEND_NO_ORDER",
     "ERR_AMEND_REJECTED",

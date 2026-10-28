@@ -48,10 +48,25 @@ from .api import (
     Result as EngineResult,
 )
 from .schema import Features, Params, Scalar, State, StrategySpec
-from .straddle import PAIR_FIELDS
+from .straddle import PAIR_FIELDS, PAIR_MESSAGES
 from .types import Bar, Decision, Position
 
 RULES_WIDTH = K.RULES_WIDTH
+
+BOOLEAN_DECISION_MESSAGE = "compiled core: boolean decision must be 0 or 1"
+
+
+def _raise_column_refusal(count: int) -> None:
+    """Raise what the Python reference raises for the refusals the column code carries as codes.
+
+    A raise inside the compiled column loop does not leave it: the loop's remaining work is
+    skipped and the run returns normally with unwritten rows. The column code therefore writes
+    the code to its account row, stops, and the Python side raises here, in config order."""
+    if count == -K.ACCOUNT_BOOLEAN_DECISION:
+        raise ValueError(BOOLEAN_DECISION_MESSAGE)
+    first = K.ACCOUNT_PAIR_REFUSAL
+    if -(first + len(PAIR_MESSAGES)) < count <= -first:
+        raise ValueError(PAIR_MESSAGES[-count - first])
 
 
 def _run_columns_typed(
@@ -288,6 +303,13 @@ def _run_columns_typed(
                 *(() if not _event_storage else (risk_store,)),
             )
             counts = raw[0]
+            if np.any(counts == K.COLUMN_UNRUN):
+                # Every column writes its count, so one left unwritten means a native exception
+                # ended the parallel loop. Never return the rows around it as results.
+                raise RuntimeError(
+                    "compiled engine column did not complete (a native exception ended the "
+                    "parallel loop); run refused (use jit=False for the original exception)"
+                )
             # Scan the whole batch before touching any potentially incomplete row.
             if np.any(counts == -K.ACCOUNT_INVALID_SIDE):
                 raise ValueError("compiled core: side must be -1, 0, 1")
@@ -651,6 +673,7 @@ def _matched_result(
     cnt, meta = config.count, config.meta
     if cnt == -14:
         raise RuntimeError("backward event cursor")
+    _raise_column_refusal(cnt)
     if cnt == -11:
         raise RuntimeError(
             "fixed-ABI strategy callback raised; run refused (use jit=False for the original exception)"
