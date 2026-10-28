@@ -21,7 +21,7 @@ from numba.extending import intrinsic
 from numba.typed import List
 
 from . import engine
-from .codegen import _ADAPTER_SOURCE, write_fixed_module
+from .codegen import _ADAPTER_SOURCE, check_borrowed, write_fixed_module
 from .schema import BoolArray, FloatArray, IntArray, StrategySpec
 
 ABI = nb.void(nb.int64, nb.int64)
@@ -202,6 +202,17 @@ class FixedRunner:
         field_rows: np.ndarray,
         risk_store: np.ndarray,
     ) -> tuple[Any, ...]:
+        check_borrowed(
+            trades,
+            store=store,
+            ev_count=ev_count,
+            ev_bar=ev_bar,
+            ev_mask=ev_mask,
+            ev_val=ev_val,
+            risk_store=risk_store,
+            field_rows=field_rows,
+            level_rows=level_rows,
+        )
         # Once per run, never once per bar. Copy the state at the same boundary as
         # the bound runner; views in the callback mutate these bytes in place.
         state_bytes = states.view(np.uint8).reshape(len(states), states.dtype.itemsize)

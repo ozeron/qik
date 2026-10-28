@@ -10,6 +10,8 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from . import engine, kernel
 
 
@@ -408,6 +410,38 @@ def _parse_function(source: str) -> ast.FunctionDef:
     function = ast.parse(source).body[0]
     assert isinstance(function, ast.FunctionDef)
     return function
+
+
+# What the publisher assumes of the arrays the runner hands the engine (it reads them through raw
+# views): name -> (dtype, dimensions). ``compiled._Buffers`` allocates them; ``check_borrowed``
+# refuses a caller whose arrays differ, instead of letting the publisher read bytes as another type.
+_BORROWED_INPUTS = {
+    "store": ("float64", 3),
+    "ev_count": ("int64", 1),
+    "ev_bar": ("int64", 2),
+    "ev_mask": ("int64", 2),
+    "ev_val": ("float64", 3),
+    "risk_store": ("float64", 2),
+    "field_rows": ("int64", 1),
+    "level_rows": ("int64", 1),
+}
+
+
+def check_borrowed(trades: tuple[np.ndarray, ...], **arrays: np.ndarray) -> None:
+    """Refuse arrays the pointer-table publisher would misread: wrong dtype, rank or layout."""
+    expected: dict[str, tuple[str, int]] = dict(_BORROWED_INPUTS)
+    expected |= {f"trades[{k}]": (dtype[3:], 2) for k, (_, _, dtype) in enumerate(_BORROWED_TRADES)}
+    given = {f"trades[{k}]": array for k, array in enumerate(trades)} | arrays
+    if set(given) != set(expected):
+        raise ValueError(f"fixed engine: expected arrays {sorted(expected)}, got {sorted(given)}")
+    for name, array in given.items():
+        dtype, ndim = expected[name]
+        if array.dtype != np.dtype(dtype) or array.ndim != ndim or not array.flags.c_contiguous:
+            raise ValueError(
+                f"fixed engine: {name} must be a C-contiguous {ndim}-d {dtype} array (the "
+                f"publisher reads it through a raw view), got {array.ndim}-d {array.dtype}"
+                f"{'' if array.flags.c_contiguous else ' non-contiguous'}"
+            )
 
 
 def _decision_scalars(decision: ast.FunctionDef) -> list[str]:
