@@ -1,8 +1,6 @@
-"""Fill policy helpers: direction masks, exit masks, path order and entry expiry."""
+"""Fill policy helpers: path order, the stale-quote test and the target fill price."""
 
 from __future__ import annotations
-
-from typing import Any
 
 import numba as nb
 
@@ -25,34 +23,10 @@ def _no_reversal(o, e1, e2, c, m, pos):
     return True
 
 
-@nb.njit(cache=True, nogil=True)
-def _force_for(mask, side):
-    return bool(mask & 1) or (side > 0 and bool(mask & 2)) or (side < 0 and bool(mask & 4))
-
-
-@nb.njit(cache=True, nogil=True)
-def _exit_for(global_exit, long_exit, short_exit, side):
-    return global_exit or (side > 0 and long_exit) or (side < 0 and short_exit)
-
-
 @nb.njit(cache=True, nogil=True, inline="always")
 def _high_first(adaptive: bool, open_px: float, high: float, low: float) -> bool:
     """Adaptive paths visit the nearer extreme first; ties visit low first."""
     return not adaptive or abs(open_px - high) < abs(open_px - low)
-
-
-@nb.njit(cache=True, nogil=True, inline="always")
-def _day_entry_expires(day_cancel: bool, expiry: bool) -> bool:
-    """Only the cancel policy expires a pending DAY entry at its boundary."""
-    return expiry and day_cancel
-
-
-@nb.njit(cache=True, nogil=True, inline="always")
-def _cancel_entry_commands(commands: Any, pending: int) -> None:
-    """Remove queued commands belonging to the expired entry generation."""
-    for q in range(len(commands) - 1, -1, -1):
-        if commands[q][2] == pending:
-            commands.pop(q)
 
 
 @nb.njit(cache=True, nogil=True, inline="always")
@@ -90,10 +64,6 @@ def _venue_record(
 
 
 __all__ = [
-    "_cancel_entry_commands",
-    "_day_entry_expires",
-    "_exit_for",
-    "_force_for",
     "_high_first",
     "_no_reversal",
     "_target_fill_price",

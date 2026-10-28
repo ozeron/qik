@@ -174,11 +174,6 @@ def _open_at(core, column, bar):
     return bool(_optional_at(column, bar, False))
 
 
-@nb.njit(cache=True, inline="always")
-def _current_flag(core, column, bar):
-    return column[0 if core.event_mode == 2 else bar]
-
-
 __all__ = [
     "_past_event_row",
     "_event_row",
@@ -195,5 +190,4 @@ __all__ = [
     "_pair_value_type",
     "_close_at",
     "_open_at",
-    "_current_flag",
 ]

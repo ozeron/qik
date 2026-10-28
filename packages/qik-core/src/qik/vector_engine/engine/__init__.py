@@ -4,28 +4,29 @@ Module map, in dependency order (an import only ever points at an earlier entry,
 there is no cycle):
 
     codes     settings/rule/error/level codes, the float64 settings record, CoreContext
-    fills     fill policy helpers: direction and exit masks, path order, entry expiry
-    levels    level-store layout, level/risk writes, optional-column accessors
+    fills     fill policy helpers: path order, the stale-quote test, the target fill price
+    levels    level-store layout, level/risk writes, optional-column accessors, the per-config
+              straddle block
     events    sparse event rows, retained decision access and current-bar scratch
-    pairs     straddle pair legs: pair reads, resting/level lookups, lifetime triggers
     decision  _core_decision: the strategy callback into the level store and account
     ring      the transition ring (single next-open staging, venue command list) and the venue
               arm's plain-call helpers
-    book      the unified loop (single-matcher plan, stages 2-3): rule bits and compat fields,
-              the transition ring, the single and venue arms, the callback sites
-    slot_ring the slots arm's command ring and its held-decision helpers (stage 4)
-    book_slots the slots arm: the slots matcher as a flat event-gated loop (stage 4)
-    single    the single-order entry: pick the loop's route from the rules
-    slots     the slots matcher (trigger/stop/target updates, straddle legs)
+    book      the unified loop: rule bits and compat fields, the transition ring, the single
+              and venue arms, the callback sites
+    slot_ring the slots arm's command ring and its held-decision helpers
+    book_slots the slots arm: a flat event-gated loop over that ring
+    entry     the matcher entry points: ``_column`` (single/venue arms of ``book``) and
+              ``_slots_column`` (``book_slots``), each a column on its loop's route
     batch     run_columns, the parallel column runner and its Python-boundary ABI
 
-``book`` and ``slots`` sit on ``decision`` (``book`` also on ``ring``); ``batch`` runs both.
-``legacy/`` holds the matchers a stage has replaced, kept as differential oracles: nothing here imports them.
-``qik.vector_engine.kernel`` re-exports every name for compatibility.
+``book`` and ``book_slots`` sit on ``decision`` (``book`` also on ``ring``); ``batch`` runs both
+through ``entry``. ``qik.vector_engine.kernel`` re-exports every name for compatibility. The
+matchers the single-matcher plan retired are not in the tree: their outputs are the frozen tapes
+of ``tests/vector_engine/matcher_diff/tapes``.
 
 The matchers cache to disk (``cache=True``) and Numba keys a cache entry by the source
 stamp of the file that *defines* the function. Splitting the one ``kernel`` module into
-modules that bind each other's constants would leave ``pairs``' entry valid while
+modules that bind each other's constants would leave ``levels``' entry valid while
 ``codes`` changed under it. ``_install_cache_locator`` therefore keys every file in this
 package by ``fingerprint()`` -- the content of the whole engine -- so the split recompiles
 as one unit, exactly as the single module did.
@@ -66,19 +67,14 @@ _ENGINE_MODULE_NAMES = (
     "fills",
     "levels",
     "events",
-    "pairs",
     "decision",
     "ring",
     "book",
     "slot_ring",
     "book_slots",
-    "single",
-    "slots",
+    "entry",
     "batch",
 )
-# Legacy matchers (differential oracles; production never imports them). They are still engine
-# sources: Numba's cache locator keys every file in this package by ``fingerprint()``.
-_LEGACY_FILES = ("legacy/__init__", "legacy/single", "legacy/venue", "legacy/slots")
 # Modules outside this package whose source the matchers bind.
 SHARED_MODULES = ("compiled", "protection", "account", "straddle", "types")
 # Names the facade re-binds under another identifier: alias -> (module, attribute).
@@ -118,7 +114,6 @@ def _engine_files() -> tuple[Path, ...]:
     return (
         _ENGINE_DIR / "__init__.py",
         *(_ENGINE_DIR / f"{name}.py" for name in _ENGINE_MODULE_NAMES),
-        *(_ENGINE_DIR / f"{name}.py" for name in _LEGACY_FILES),
         *(package / f"{name}.py" for name in SHARED_MODULES),
     )
 
@@ -311,14 +306,12 @@ from . import (  # noqa: E402
     book_slots,
     codes,
     decision,
+    entry,
     events,
     fills,
     levels,
-    pairs,
     ring,
-    single,
     slot_ring,
-    slots,
 )
 
 ENGINE_MODULES: tuple[ModuleType, ...] = (
@@ -326,14 +319,12 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     fills,
     levels,
     events,
-    pairs,
     decision,
     ring,
     book,
     slot_ring,
     book_slots,
-    single,
-    slots,
+    entry,
     batch,
 )
 

@@ -50,7 +50,7 @@ def _write_module(
     class BindGlobals(ast.NodeTransformer):
         def visit_Attribute(self, node: ast.Attribute) -> ast.expr:
             if isinstance(node.value, ast.Name) and node.value.id == "K":
-                return ast.Name(node.attr.replace("_compiled_", "_"), ast.Load())
+                return ast.Name(node.attr, ast.Load())
             return node
 
     adapter = ast.parse(_ADAPTER_SOURCE).body[0]
@@ -185,8 +185,8 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
         (engine.book, "_entry_levels"),
         (engine.book, "_book_loop"),
         (engine.book_slots, "_slots_loop"),
-        (engine.single, "_column"),
-        (engine.slots, "_slots_column"),
+        (engine.entry, "_column"),
+        (engine.entry, "_slots_column"),
     ):
         node = source(getattr(module, name))
         BindGlobals().visit(node)
@@ -206,9 +206,6 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
     runner = ast.parse(_RUNNER_SOURCE).body[0]
     assert isinstance(runner, ast.FunctionDef)
     runner.name = "run"
-    for node in ast.walk(runner):
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_compiled_"):
-            node.attr = node.attr.replace("_compiled_", "_")
     BindGlobals().visit(runner)
     for node in runner.body:
         if isinstance(node, ast.Return):
@@ -563,9 +560,9 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
                     ev_val[j, -1, field_rows[q]] = 0.0
         a0, a1, a2, a3, a4, a5, a6 = (a0s[j], a1s[j], a2s[j], a3s[j], a4s[j], a5s[j], a6s[j])
         if slots:
-            result = K._compiled_slots_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, K._level_row(levels, blank, rows[5]), K._level_row(levels, blank, rows[6]), K._level_row(levels, blank, rows[7]), K._level_row(levels, blank, rows[8]), K._level_row(levels, blank, rows[9]), long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days=expiry_days, straddle=straddle, from_open=K._level_row(levels, blank, rows[23]), stop_fracs=K._level_row(levels, blank, rows[24]), target_fracs=K._level_row(levels, blank, rows[25]))
+            result = K._slots_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, K._level_row(levels, blank, rows[5]), K._level_row(levels, blank, rows[6]), K._level_row(levels, blank, rows[7]), K._level_row(levels, blank, rows[8]), K._level_row(levels, blank, rows[9]), long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days=expiry_days, straddle=straddle, from_open=K._level_row(levels, blank, rows[23]), stop_fracs=K._level_row(levels, blank, rows[24]), target_fracs=K._level_row(levels, blank, rows[25]))
         else:
-            result = K._compiled_column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days)
+            result = K._column(o, h, lo, c, sides, exits, K._level_row(levels, blank, rows[0]), K._level_row(levels, blank, rows[1]), K._level_row(levels, blank, rows[2]), K._level_row(levels, blank, rows[3]), K._level_row(levels, blank, rows[4]), days, rules, long_exits, short_exits, force_close, force_open, False, a0, a1, a2, a3, a4, a5, a6, 0, core, K._level_row(levels, blank, rows[10]), expiry_days)
         # Negative counts carry refusals out of prange without exceptions.
         counts[j] = -int(account[2]) if account[2] else result[0]
         meta[j, 0] = result[1]

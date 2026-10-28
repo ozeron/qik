@@ -12,10 +12,8 @@ import numpy as np
 from qik.vector_engine.protection import _round_price
 
 from .codes import R_ARM_STOP, R_DAY_CANCEL, R_TICK, R_TICK_ROUND, RULES_WIDTH
-from .levels import _optional_column
-from .pairs import _straddle_column
-from .single import _column
-from .slots import _slots_column
+from .entry import _column, _slots_column
+from .levels import _optional_column, _straddle_column
 
 
 @nb.njit(parallel=True, cache=True)

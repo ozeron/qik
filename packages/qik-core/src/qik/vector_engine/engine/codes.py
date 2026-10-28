@@ -170,8 +170,6 @@ EVENT_FLAG_BITS = (1 << 0) | (1 << 1) | (1 << 12) | (1 << 13) | (1 << 14) | (1 <
 PAIR_BITS = ((1 << 12) - 1) << 16
 
 
-PAIR_TRIGGER_BITS = (1 << 16) | (1 << 22)
-
 __all__ = [
     "ACCOUNT_INVALID_SIDE",
     "CoreContext",
@@ -248,5 +246,4 @@ __all__ = [
     "rule_settings",
     "EVENT_FLAG_BITS",
     "PAIR_BITS",
-    "PAIR_TRIGGER_BITS",
 ]

@@ -1,7 +1,7 @@
 """Numba engine entry point: the matchers live in ``engine/``, re-exported here.
 
-``qik.vector_engine.engine`` maps the modules (codes -> fills/levels/pairs -> decision ->
-book -> single/slots -> batch). This facade keeps the historic import surface
+``qik.vector_engine.engine`` maps the modules (codes -> fills/levels -> decision ->
+book/book_slots -> entry -> batch). This facade keeps the historic import surface
 ``qik.vector_engine.kernel.<name>`` used by ``api``, ``compiled``, ``codegen``, ``fixed``,
 ``reference`` and the tests: every name below is the same object its module defines.
 """
@@ -136,7 +136,6 @@ from .engine.codes import (
     ERR_TARGET_IN_MARKET,
     EVENT_FLAG_BITS,
     PAIR_BITS,
-    PAIR_TRIGGER_BITS,
     R_ADAPTIVE,
     R_ADVERSE_FIRST,
     R_AMEND_CLOSE,
@@ -186,9 +185,9 @@ from .engine.codes import (
     rule_settings,
 )
 from .engine.decision import _core_decision, _core_decision_rare
+from .engine.entry import _column, _slots_column
 from .engine.events import (
     _close_at,
-    _current_flag,
     _event_get,
     _event_row,
     _flag_at,
@@ -205,10 +204,6 @@ from .engine.events import (
     _side_at_type,
 )
 from .engine.fills import (
-    _cancel_entry_commands,
-    _day_entry_expires,
-    _exit_for,
-    _force_for,
     _high_first,
     _no_reversal,
     _target_fill_price,
@@ -222,15 +217,6 @@ from .engine.levels import (
     _optional_column,
     _put_level,
     _store_risk,
-)
-from .engine.pairs import (
-    _has_pairs,
-    _lifetime_crosses,
-    _open_in_market,
-    _pair_at,
-    _pair_level,
-    _pair_rests,
-    _stop_pair,
     _straddle_column,
 )
 from .engine.ring import (
@@ -257,7 +243,6 @@ from .engine.ring import (
     _row_save,
     _vsweep,
 )
-from .engine.single import _column, _compiled_column
 from .engine.slot_ring import (
     RING_ROWS,
     RW_D,
@@ -288,7 +273,6 @@ from .engine.slot_ring import (
     _spop,
     _spush,
 )
-from .engine.slots import _compiled_slots_column, _slots_column
 from .protection import (
     ERR_NONE,
     ERR_PROTECT_REJECTED,
@@ -437,39 +421,26 @@ __all__ = [
     "_SLOT_REPLACE",
     "_SLOT_SUBMIT",
     "_anchor",
-    "_cancel_entry_commands",
     "_column",
     "_column_input",
-    "_compiled_column",
-    "_compiled_slots_column",
     "_contracts_for",
     "_core_decision",
     "_core_decision_rare",
-    "_day_entry_expires",
     "_empty_input",
-    "_exit_for",
     "_fill_then_protect",
-    "_force_for",
-    "_has_pairs",
     "_high_first",
     "_in_market",
     "_layout_context",
     "_level_row",
-    "_lifetime_crosses",
     "_no_reversal",
     "_normalized_columns",
-    "_open_in_market",
     "_optional_at",
     "_optional_column",
-    "_pair_at",
-    "_pair_level",
-    "_pair_rests",
     "_put_level",
     "_python_run_columns",
     "_round_price",
     "_run_columns",
     "_slots_column",
-    "_stop_pair",
     "_store_risk",
     "_straddle_column",
     "_target_fill_price",
@@ -489,9 +460,7 @@ __all__ = [
     "wraps",
     "EVENT_FLAG_BITS",
     "PAIR_BITS",
-    "PAIR_TRIGGER_BITS",
     "_close_at",
-    "_current_flag",
     "_empty_input",
     "_event_get",
     "_event_row",

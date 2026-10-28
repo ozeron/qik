@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numba as nb
+import numpy as np
 
 
 @nb.njit(cache=True)
@@ -57,6 +58,14 @@ def _optional_column(array, j):
     return array[0] if array.shape[1] == 0 else array[j]
 
 
+@nb.njit(cache=True, inline="never")
+def _straddle_column(pair, j):
+    """One config's twelve-row straddle block, or an empty one for a batch that declares none."""
+    if pair is None or pair.shape[2] == 0:
+        return np.empty((12, 0))
+    return pair[j]
+
+
 __all__ = [
     "_any_in",
     "_layout_context",
@@ -65,4 +74,5 @@ __all__ = [
     "_optional_column",
     "_put_level",
     "_store_risk",
+    "_straddle_column",
 ]

@@ -1,6 +1,6 @@
 """The slots arm of the unified matcher (single-matcher plan, stage 4).
 
-The slots matcher (``legacy.slots._slots_column``, the test oracle) as a flat, event-gated loop
+The slots matcher as a flat, event-gated loop
 over a fixed command ring, in the shape of ``book._book_loop``: scalar state in locals, no state
 tuple and no per-branch return, the rule bits decoded once, and a bar with nothing resting, nothing
 in flight and nothing to enter skipped before it costs anything. The route's differences from the
@@ -897,6 +897,12 @@ def _slots_loop(
                     )  # fmt: skip
                     ovf = ovf or not ok
             # --- the commands that are due settle, in insertion order ---
+            # A next-open command still ahead at this close is checked here, before anything
+            # settles. Nothing pushed by the settle loop below can fail the same test: with no
+            # latency, only a straddle submission's IOC attempt is due after this close
+            # (``d + 1``), and the settle-time pair check just passed ``d + 1 < n`` with no new
+            # date there (or a session-crossing mode, or no IOC leg to push), so the scan would
+            # find nothing.
             if qmask != 0 and not error and not latency and (next_open or exit_next_open):
                 if _session_end(
                     ring,
@@ -1134,21 +1140,6 @@ def _slots_loop(
                         if (next_open or exit_and_rearm) and pend >= 0 and pend != gen:
                             closing = False
                         pos, exited, live = zero, True, False
-            if qmask != 0 and not error and not latency and (next_open or exit_next_open):
-                if _session_end(
-                    ring,
-                    qmask,
-                    i,
-                    n,
-                    new_day,
-                    cross_session,
-                    next_bar,
-                    hv,
-                    triggers,
-                    has_trig,
-                    straddle,
-                ):
-                    error = ERR_NEXT_OPEN_SESSION_END
         if halt:
             break
         if ovf:
