@@ -69,6 +69,31 @@ def _raise_column_refusal(count: int) -> None:
         raise ValueError(PAIR_MESSAGES[-count - first])
 
 
+_COLUMN_UNRUN = (
+    "compiled engine column did not complete (a native exception ended the "
+    "parallel loop); run refused (use jit=False for the original exception)"
+)
+
+
+def _refuse_native_exception(run: Any) -> Any:
+    """Make a native exception in the parallel loop the same refusal on every platform.
+
+    Where the parallel runtime swallows it, the unwritten column count refuses the run. Linux
+    surfaces it as ``SystemError: ... returned a result with an exception set`` instead: the
+    same event, so the same refusal.
+    """
+
+    def guarded(*args: Any) -> Any:
+        try:
+            return run(*args)
+        except SystemError as error:
+            if "exception set" not in str(error):
+                raise
+            raise RuntimeError(_COLUMN_UNRUN) from error
+
+    return guarded
+
+
 def _run_columns_typed(
     init_state: np.ndarray,
     params_grid: np.ndarray,
@@ -312,10 +337,7 @@ def _run_columns_typed(
             if np.any(counts == K.COLUMN_UNRUN):
                 # Every column writes its count, so one left unwritten means a native exception
                 # ended the parallel loop. Never return the rows around it as results.
-                raise RuntimeError(
-                    "compiled engine column did not complete (a native exception ended the "
-                    "parallel loop); run refused (use jit=False for the original exception)"
-                )
+                raise RuntimeError(_COLUMN_UNRUN)
             # Scan the whole batch before touching any potentially incomplete row.
             if np.any(counts == -K.ACCOUNT_INVALID_SIDE):
                 raise ValueError("compiled core: side must be -1, 0, 1")
@@ -927,7 +949,7 @@ def _record_run(
             fixed = fixed_runner(step)
             # Once per run: the fixed ABI borrows contiguous lanes, so a strided one is copied here.
             lanes = fixed.contiguous(lanes)
-            runner = fixed.run
+            runner = _refuse_native_exception(fixed.run)
         else:
             runner = _python_runner(_python_module(step))
         results = _run_columns_typed(
