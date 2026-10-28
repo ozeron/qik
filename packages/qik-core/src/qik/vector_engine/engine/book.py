@@ -1274,4 +1274,5 @@ __all__ = [
     "_stop_sentinel",
     "_sweep",
     "_target_sentinel",
+    "_VENUE_IGNORES",
 ]

@@ -35,6 +35,7 @@ from .engine.batch import (
     run_columns,
 )
 from .engine.book import (
+    _VENUE_IGNORES,
     C_IN_MARKET_MASK,
     C_IN_MARKET_SHIFT,
     C_NEW_DAY_MASK,
@@ -491,4 +492,5 @@ __all__ = [
     "_stop_sentinel",
     "_sweep",
     "_target_sentinel",
+    "_VENUE_IGNORES",
 ]
