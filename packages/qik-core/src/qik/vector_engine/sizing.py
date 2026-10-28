@@ -25,8 +25,12 @@ from .account import (
 from .account import (
     ERR_NONE,
     MODE_CONTRACTS,
+    MODE_NOTIONAL,
     MODE_RISK_FRACTION,
     MODE_RISK_USD,
+)
+from .account import (
+    ERR_UNAFFORDABLE as ERR_UNAFFORDABLE,
 )
 from .account import (
     ERR_ZERO as ERR_ZERO,
@@ -40,15 +44,23 @@ __all__ = ["Sizing"]
 
 @dataclass(frozen=True)
 class Sizing[Quantity: int | float = int]:
-    """Contracts per entry; set exactly one of ``contracts``, ``risk_usd`` or ``risk_fraction``.
+    """Contracts per entry; set exactly one of ``contracts``, ``risk_usd``, ``risk_fraction`` or
+    ``notional_usd``.
 
     * ``contracts``: the same number for every trade.
     * ``risk_usd``: ``floor(risk_usd / (|entry - stop| * point_value))``; needs a stop on every entry.
     * ``risk_fraction``: as ``risk_usd`` with ``risk_usd = risk_fraction * equity`` before the trade
       (compounding); needs ``initial_cash``.
+    * ``notional_usd``: ``floor(notional_usd / (|entry fill| * point_value))``, no stop. The size
+      comes from the actual accepted fill price and is the same for every trade (a loss does not
+      change the next entry). ``affordability`` is mandatory with it: ``"refuse"`` (needs
+      ``initial_cash``) refuses an entry whose notional plus the entry fill's costs exceeds the
+      balance before the trade, so fees are never borrowed; ``"unchecked"`` assumes no account
+      (independent fixed-notional books). ``min_qty_policy="clamp"`` is refused: it would exceed
+      the fixed notional.
 
     The stop distance is in points from the entry fill; costs are not part of the risk.
-    ``max_contracts`` caps the risk modes. Risk quantities floor to ``lot_step`` multiples
+    ``max_contracts`` caps the computed modes. Computed quantities floor to ``lot_step`` multiples
     and refuse below ``min_qty`` by default. Opt-in ``min_qty_policy="clamp"``
     raises risk quantities to the grid-aligned minimum, potentially exceeding the risk budget.
     Fixed quantities must already be on that grid.
@@ -64,12 +76,36 @@ class Sizing[Quantity: int | float = int]:
     min_qty: float = 1.0
     min_qty_policy: Literal["refuse", "clamp"] = "refuse"
 
+    notional_usd: float | None = None
+    affordability: Literal["refuse", "unchecked"] | None = None
+
     def __post_init__(self) -> None:
         if self.min_qty_policy not in ("refuse", "clamp"):
             raise ValueError("min_qty_policy must be refuse or clamp")
-        set_ = [x is not None for x in (self.contracts, self.risk_usd, self.risk_fraction)]
+        set_ = [
+            x is not None
+            for x in (self.contracts, self.risk_usd, self.risk_fraction, self.notional_usd)
+        ]
         if sum(set_) != 1:
-            raise ValueError("Sizing needs exactly one of contracts, risk_usd, risk_fraction")
+            raise ValueError(
+                "Sizing needs exactly one of contracts, risk_usd, risk_fraction, notional_usd"
+            )
+        if self.notional_usd is None:
+            if self.affordability is not None:
+                raise ValueError("affordability applies to notional_usd only")
+        else:
+            if self.affordability not in ("refuse", "unchecked"):
+                raise ValueError(
+                    "Sizing(notional_usd=...) needs affordability='refuse' or 'unchecked'"
+                )
+            if isinstance(self.notional_usd, bool) or not (
+                np.isfinite(self.notional_usd) and self.notional_usd > 0
+            ):
+                raise ValueError(
+                    f"notional_usd must be finite and positive, got {self.notional_usd!r}"
+                )
+            if self.min_qty_policy == "clamp":
+                raise ValueError("min_qty_policy='clamp' would exceed a fixed notional")
         for name in ("lot_step", "min_qty"):
             v = getattr(self, name)
             if isinstance(v, bool) or not (np.isfinite(v) and v > 0):
@@ -99,14 +135,20 @@ class Sizing[Quantity: int | float = int]:
     def mode(self) -> int:
         if self.contracts is not None:
             return MODE_CONTRACTS
+        if self.notional_usd is not None:
+            return MODE_NOTIONAL
         return MODE_RISK_USD if self.risk_usd is not None else MODE_RISK_FRACTION
 
     @property
     def amount(self) -> float:
-        for x in (self.contracts, self.risk_usd, self.risk_fraction):
+        for x in (self.contracts, self.risk_usd, self.risk_fraction, self.notional_usd):
             if x is not None:
                 return float(x)
         raise AssertionError("unreachable: validated in __post_init__")
+
+    @property
+    def check_cash(self) -> bool:
+        return self.affordability == "refuse"
 
     @property
     def cap(self) -> float:
@@ -118,6 +160,8 @@ def size_trades(
     cfg: np.ndarray,
     net_per_contract: np.ndarray,
     risk_per_contract: np.ndarray,
+    notional_per_unit: np.ndarray,
+    entry_cost_per_unit: np.ndarray,
     mode: int,
     amount: float,
     cap: float,
@@ -126,10 +170,12 @@ def size_trades(
     lot_step: float = 1.0,
     min_qty: float = 1.0,
     clamp_min_qty: bool = False,
+    check_cash: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Sequential sizing of closed trades grouped by config, in time order within each config.
 
-    Returns ``(contracts, final_equity[k], err, err_row)``.
+    ``notional_per_unit`` and ``entry_cost_per_unit`` (per trade, from the entry fill) matter to
+    ``MODE_NOTIONAL`` only. Returns ``(contracts, final_equity[k], err, err_row)``.
     """
 
     m = cfg.shape[0]
@@ -146,6 +192,9 @@ def size_trades(
             lot_step,
             min_qty,
             clamp_min_qty,
+            notional_per_unit[r],
+            entry_cost_per_unit[r],
+            check_cash,
         )
         if n < 0:
             return contracts, final_equity, int(-n), r
@@ -159,12 +208,15 @@ def size_open(
     cfg: np.ndarray,
     equity: np.ndarray,
     risk_per_contract: np.ndarray,
+    notional_per_unit: np.ndarray,
+    entry_cost_per_unit: np.ndarray,
     mode: int,
     amount: float,
     cap: float,
     lot_step: float = 1.0,
     min_qty: float = 1.0,
     clamp_min_qty: bool = False,
+    check_cash: bool = False,
 ) -> np.ndarray:
     """Contracts of the positions still open after the last bar (equity = after the last close)."""
 
@@ -180,6 +232,9 @@ def size_open(
             lot_step,
             min_qty,
             clamp_min_qty,
+            notional_per_unit[r],
+            entry_cost_per_unit[r],
+            check_cash,
         )  # < 0: error code
     return out
 

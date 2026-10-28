@@ -13,9 +13,11 @@ import numpy as np
 MODE_CONTRACTS = 0
 MODE_RISK_USD = 1
 MODE_RISK_FRACTION = 2
+MODE_NOTIONAL = 3  # stop-free fixed notional (A24); 4 is reserved for cash_fraction
 ERR_NONE = 0
 ERR_ZERO = 1
 ERR_NO_STOP = 2
+ERR_UNAFFORDABLE = 3
 
 
 @nb.njit(cache=True)
@@ -28,14 +30,24 @@ def quantity(
     lot_step: float = 1.0,
     min_qty: float = 1.0,
     clamp_min_qty: bool = False,
+    notional_per_unit: float = 0.0,
+    entry_cost_per_unit: float = 0.0,
+    check_cash: bool = False,
 ) -> float:
-    """Contracts for one entry, or a negative error code."""
+    """Contracts for one entry, or a negative error code.
+
+    ``MODE_NOTIONAL`` sizes from the entry fill's notional per unit (``notional_per_unit``, no
+    stop) and, with ``check_cash``, refuses an entry whose notional plus the entry fill's costs
+    (``entry_cost_per_unit``) exceeds ``equity``. The other modes ignore the last three arguments.
+    """
 
     if mode == MODE_CONTRACTS:
         return amount
+    if mode == MODE_NOTIONAL:
+        risk_per_contract = notional_per_unit
     if not (risk_per_contract > 0.0):  # NaN stop
         return float(-ERR_NO_STOP)
-    budget = amount if mode == MODE_RISK_USD else amount * equity
+    budget = amount * equity if mode == MODE_RISK_FRACTION else amount
     if not (budget > 0.0):
         return float(-ERR_ZERO)
     n = np.floor(budget / risk_per_contract / lot_step + 1e-9) * lot_step
@@ -45,6 +57,8 @@ def quantity(
         n = max(min_qty, n)
     if n < min_qty - 1e-10:
         return float(-ERR_ZERO)
+    if check_cash and n * (notional_per_unit + entry_cost_per_unit) > equity:
+        return float(-ERR_UNAFFORDABLE)
     return n
 
 

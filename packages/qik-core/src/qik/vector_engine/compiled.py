@@ -94,6 +94,9 @@ def _run_columns_typed(
     """
     if cash_accumulation not in ("batch", "sequential"):
         raise ValueError("cash_accumulation must be batch or sequential")
+    if sizing is not None and sizing.check_cash and initial_cash is None:
+        # The column's balance would be NaN and silently accept every entry.
+        raise ValueError("Sizing(notional_usd=..., affordability='refuse') needs initial_cash")
     fields = set(signal_fields)
     if not fields <= set(SIGNAL_FIELDS):
         raise ValueError("unknown signal_fields")
@@ -220,6 +223,9 @@ def _run_columns_typed(
             sizing.min_qty if sizing else 1.0,
             sizing.min_qty_policy == "clamp" if sizing else False,
             0.0,  # set per launch: the projected-overflow stop (the run's first launch only)
+            # A24: fee charged on the entry fill's notional; refuse unaffordable entries.
+            costs is not None and costs.fee_basis == "entry_notional",
+            sizing is not None and sizing.check_cash,
         ]
     )
     k, n = len(params), len(bars)

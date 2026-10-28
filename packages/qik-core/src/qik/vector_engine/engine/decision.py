@@ -80,10 +80,27 @@ def _core_decision(
         core.economic[7],
     )
     clamp = len(core.economic) > 8 and bool(core.economic[8])
+    # A24 flags (entry-notional fees, cash check); older callers pass shorter arrays.
+    entry_fees = len(core.economic) > 10 and core.economic[10] != 0.0
+    check_cash = len(core.economic) > 11 and core.economic[11] != 0.0
     for k in range(seen, cnt):
         points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else out_ei[k]]
         risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
-        qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
+        # A24: the fixed-notional unit and the entry fill's costs, as the array path's pass.
+        unit = abs(out_ep[k]) * pv
+        qty = _contracts_for(
+            mode,
+            amount,
+            cap,
+            account[1],
+            risk,
+            lot,
+            minimum,
+            clamp,
+            unit,
+            friction * 0.5 + unit * bps / 10000,
+            check_cash,
+        )
         if qty < 0:
             # Entry bar and sizing error code: the array path's refusal text needs both.
             account[2], account[3], account[4] = 1, out_ei[k], -qty
@@ -92,7 +109,7 @@ def _core_decision(
             out_sd[k] * (out_xp[k] - out_ep[k]),
             pv,
             friction,
-            fill_cost(out_ep[k], out_xp[k], pv, bps),
+            fill_cost(out_ep[k], out_ep[k] if entry_fees else out_xp[k], pv, bps),
         )
         account[1] += qty * net
         core.position_view[V_LAST_EXIT_I] = out_xi[k]
@@ -106,7 +123,20 @@ def _core_decision(
     if pos:
         points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else ei]
         risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
-        qty = _contracts_for(mode, amount, cap, account[1], risk, lot, minimum, clamp)
+        unit = abs(ep) * pv
+        qty = _contracts_for(
+            mode,
+            amount,
+            cap,
+            account[1],
+            risk,
+            lot,
+            minimum,
+            clamp,
+            unit,
+            friction * 0.5 + unit * bps / 10000,
+            check_cash,
+        )
         if qty < 0:
             account[2], account[3], account[4] = 2, ei, -qty
             return

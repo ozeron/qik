@@ -148,17 +148,28 @@ class Instrument:
 
 @dataclass(frozen=True)
 class Costs:
-    """Post-fill valuation: adverse ticks, commission and per-side notional basis points."""
+    """Post-fill valuation: adverse ticks, commission and per-side notional basis points.
+
+    ``fee_basis`` says what the basis points apply to. ``"fill_notional"`` (default) charges each
+    fill its own notional. ``"entry_notional"`` charges both fills the entry fill's notional, so the
+    round trip is ``2 * |entry| * point_value * proportional_bps / 1e4`` per unit and does not
+    depend on the exit price (an author's "round-trip bps of the entry notional"). Research-only (A24).
+    """
 
     commission_per_side: float = 0.0
     slippage_ticks: float = 0.0
     proportional_bps: float = 0.0
+    fee_basis: Literal["fill_notional", "entry_notional"] = "fill_notional"
 
     def __post_init__(self) -> None:
         for name in ("commission_per_side", "slippage_ticks", "proportional_bps"):
             v = getattr(self, name)
             if not (np.isfinite(v) and v >= 0):
                 raise ValueError(f"{name} must be finite and non-negative, got {v!r}")
+        if self.fee_basis not in ("fill_notional", "entry_notional"):
+            raise ValueError(
+                f"fee_basis must be fill_notional or entry_notional, got {self.fee_basis!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -727,6 +738,8 @@ def _simulate(
         raise ValueError(f"initial_cash must be positive, got {initial_cash!r}")
     if sizing is not None and sizing.risk_fraction is not None and initial_cash is None:
         raise ValueError("Sizing(risk_fraction=...) needs initial_cash")
+    if sizing is not None and sizing.check_cash and initial_cash is None:
+        raise ValueError("Sizing(notional_usd=..., affordability='refuse') needs initial_cash")
     if rules.tick_round is not TickRound.NONE and instrument is None:
         raise ValueError("tick_round needs Instrument.tick")
     if instrument is not None and rules.tick_round is TickRound.NONE:
@@ -940,7 +953,13 @@ def _simulate(
         # the dispatchers for the same policy bodies.
         fill_cost = getattr(A.fill_cost, "py_func", A.fill_cost)
         settle = getattr(A.settle, "py_func", A.settle)
-        proportional = fill_cost(e_px, x_px, instrument.point_value, c.proportional_bps)
+        # entry_notional: both fills are charged the entry fill's notional (|e| + |e|, A24).
+        proportional = fill_cost(
+            e_px,
+            e_px if c.fee_basis == "entry_notional" else x_px,
+            instrument.point_value,
+            c.proportional_bps,
+        )
         net_1 = cast(
             np.ndarray,
             settle(
@@ -965,10 +984,19 @@ def _simulate(
                 submitted = sizing_risks[o_cfg, o_entry]
                 o_risk = np.where(np.isnan(submitted), o_risk, submitted * pv)
             cash = float(initial_cash) if initial_cash is not None else np.nan  # risk_usd: unused
+            # Fixed notional (A24): sized from the entry fill, not a stop. The entry fill's own
+            # costs are half the fixed round trip plus its proportional fee (both fee bases).
+            o_px = open_positions["entry_px"].to_numpy()
+            unit_notional, o_unit_notional = np.abs(e_px) * pv, np.abs(o_px) * pv
+            bps = costs.proportional_bps
+            unit_cost = per_contract_cost * 0.5 + unit_notional * bps / 10000
+            o_unit_cost = per_contract_cost * 0.5 + o_unit_notional * bps / 10000
             contracts, final_equity, err, row = S.size_trades(
                 cfg,
                 net_1,
                 risk,
+                unit_notional,
+                unit_cost,
                 sizing.mode,
                 sizing.amount,
                 sizing.cap,
@@ -977,6 +1005,7 @@ def _simulate(
                 sizing.lot_step,
                 sizing.min_qty,
                 sizing.min_qty_policy == "clamp",
+                sizing.check_cash,
             )
             if err:
                 _sizing_error(err, int(cfg[row]), int(e_i[row]))
@@ -984,12 +1013,15 @@ def _simulate(
                 o_cfg,
                 final_equity,
                 o_risk,
+                o_unit_notional,
+                o_unit_cost,
                 sizing.mode,
                 sizing.amount,
                 sizing.cap,
                 sizing.lot_step,
                 sizing.min_qty,
                 sizing.min_qty_policy == "clamp",
+                sizing.check_cash,
             )
             if (open_contracts < 0).any():
                 r = int(np.flatnonzero(open_contracts < 0)[0])
@@ -1036,6 +1068,9 @@ def _simulate(
         or rules.order_lifetime == "next_bar"
         or from_open_used
         or frac_used
+        # A24: V2 hosts fixed whole contracts and the venue's own fees only.
+        or (sizing is not None and sizing.notional_usd is not None)
+        or (costs is not None and costs.fee_basis != "fill_notional")
         or (
             slots
             and (
@@ -1261,6 +1296,13 @@ def _sizing_error(err: int, config: int, bar: int) -> None:
     if err == S.ERR_NO_STOP:
         raise ValueError(
             f"entry at bar {bar}, config {config} has no stop: risk sizing needs a stop on every entry"
+        )
+    if err == S.ERR_UNAFFORDABLE:
+        raise ValueError(
+            f"entry at bar {bar}, config {config} is unaffordable: its notional plus the entry "
+            f"fill's costs exceed the balance before the trade (Sizing affordability='refuse' "
+            f"never borrows; raise initial_cash, lower notional_usd, or use 'unchecked' for "
+            f"independent books)"
         )
     raise ValueError(
         f"sizing gives 0 contracts for the entry at bar {bar}, config {config}: Nautilus would not "
