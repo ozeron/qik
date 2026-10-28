@@ -126,6 +126,8 @@ from .slot_ring import (
     RW_PAIR,
     RW_VALUE,
     SCAP,
+    _event_masks,
+    _event_stored,
     _held_lifetime_crosses,
     _held_open_in_market,
     _held_pair,
@@ -134,6 +136,7 @@ from .slot_ring import (
     _held_pair_rests,
     _held_stop_pair,
     _pair_cols,
+    _pair_possible,
     _sbound,
     _sdrop,
     _spop,
@@ -358,6 +361,8 @@ def _slots_loop(
     has_open = _has_lane(force_open)
     has_expiry = _has_lane(expiry_days)
     has_pairs = _pair_cols(straddle) > 0
+    pair_masks = _event_masks(core)
+    event_stored = _event_stored(core)
     # Phase 0 (the open) settles only commands that can be due at an open.
     phase0 = next_open or exit_next_open or has_ioc or has_pairs
     has_straddle = False
@@ -662,7 +667,11 @@ def _slots_loop(
                     )
                     cmask = _close_at(core, force_close, i)
                     oflat = _open_at(core, force_open, i)
-                    cur_pair = has_pairs and _held_pair_any(core, straddle, cur)
+                    cur_pair = (
+                        has_pairs
+                        and _pair_possible(pair_masks, event_stored, cur)
+                        and _held_pair_any(core, straddle, cur)
+                    )
                 if (
                     pos == 0
                     and pend < 0

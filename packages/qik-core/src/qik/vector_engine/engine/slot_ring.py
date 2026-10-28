@@ -36,6 +36,7 @@ from .codes import (
     _SLOT_PROTECT,
     _SLOT_REPLACE,
     _SLOT_SUBMIT,
+    PAIR_BITS,
 )
 
 SCAP = 32
@@ -127,6 +128,38 @@ def _sbound(ring, qmask, gen, stop, pos):
         m >>= 1
         slot += 1
     return has, bound
+
+
+def _event_masks(core):
+    """The retained decisions' field masks (event storage); an empty array without a context."""
+    return np.empty(0, np.int64) if core is None else core.ev_mask
+
+
+@overload(_event_masks, inline="always")
+def _event_masks_type(core):
+    if isinstance(core, nb.types.NoneType):
+        return lambda core: np.empty(0, np.int64)
+    return lambda core: core.ev_mask
+
+
+def _event_stored(core):
+    """The callback publishes into retained event rows (the fixed engine's storage)."""
+    return core is not None and core.event_mode == 2
+
+
+@overload(_event_stored, inline="always")
+def _event_stored_type(core):
+    if isinstance(core, nb.types.NoneType):
+        return lambda core: False
+    return lambda core: core.event_mode == 2
+
+
+@nb.njit(cache=True, nogil=True, inline="always")
+def _pair_possible(masks, stored, ident):
+    """Whether the held decision can carry a straddle leg. In event storage a decision whose mask
+    has no pair bit has none, so a flat bar of a column that declares pairs reads one word, not
+    twelve legs; dense storage keeps no mask and always answers yes."""
+    return not stored or (ident >= 0 and (masks[ident] & PAIR_BITS) != 0)
 
 
 def _pair_cols(pair):
@@ -238,8 +271,11 @@ __all__ = [
     "RW_VALUE",
     "SCAP",
     "SLOT_FULL",
+    "_event_masks",
+    "_event_stored",
     "_held_pair",
     "_pair_cols",
+    "_pair_possible",
     "_held_lifetime_crosses",
     "_held_open_in_market",
     "_held_pair_any",

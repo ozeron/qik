@@ -152,6 +152,7 @@ C_ROUTE_SHIFT = 19
 C_ROUTE_MASK = 3 << C_ROUTE_SHIFT
 ROUTE_VENUE = 1
 ROUTE_SLOTS = 2
+C_ROUTE_VENUE_BIT = ROUTE_VENUE << C_ROUTE_SHIFT  # the venue route's bit; slots has its own
 _VENUE_IGNORES = F_NEXT_OPEN | F_EXIT_NEXT_OPEN | F_STALE_DROP
 # The slots route accepts protection at or through the entry price and applies A10/A11 (ERR 4, ERR 8
 # for a MIT target, or an immediate target trade), like the venue; it refuses a working order
@@ -330,7 +331,7 @@ def _rule_flags(rules, compat):
     ):
         if rules[index] != 0.0:
             flags |= bit
-    if (compat & C_ROUTE_MASK) >> C_ROUTE_SHIFT == ROUTE_VENUE:
+    if compat & C_ROUTE_VENUE_BIT:
         flags &= ~_VENUE_IGNORES  # the venue never reads these (R15 keeps them off its route)
     return flags
 
@@ -460,7 +461,7 @@ def _book_loop(
     """
     n = o.shape[0]
     flags = _rule_flags(rules, compat)
-    venue = (flags & C_ROUTE_MASK) >> C_ROUTE_SHIFT == ROUTE_VENUE
+    venue = flags & C_ROUTE_VENUE_BIT != 0
     lat = int(rules[R_LATENCY_BARS])
     adaptive = flags & F_ADAPTIVE != 0
     adverse_first = flags & F_ADVERSE_FIRST != 0
@@ -1248,6 +1249,7 @@ __all__ = [
     "C_NEW_DAY_MASK",
     "C_NEW_DAY_SHIFT",
     "C_ROUTE_MASK",
+    "C_ROUTE_VENUE_BIT",
     "C_ROUTE_SHIFT",
     "F_ADAPTIVE",
     "F_ADVERSE_FIRST",
