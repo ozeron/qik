@@ -6,6 +6,7 @@ The default declaration supports all fields and therefore chooses the slots body
 
 from __future__ import annotations
 
+import functools
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -83,6 +84,7 @@ def _refuse_native_exception(run: Any) -> Any:
     same event, so the same refusal.
     """
 
+    @functools.wraps(run)  # callers read the runner's signature (acceptance/candidate.py)
     def guarded(*args: Any) -> Any:
         try:
             return run(*args)
