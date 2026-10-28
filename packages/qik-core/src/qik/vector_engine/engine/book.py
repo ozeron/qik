@@ -145,13 +145,27 @@ NEW_DAY_REFUSE = 1
 # Which matcher's semantics own the column. The venue route (latency, or ONE_TICK without
 # next-open entries) runs a per-command settlement state machine: the protection 0..3 machine,
 # the limit slippage search, the IOC command. It never reads next-open fills and does not model
-# the stale quote (A13), so those rule bits are masked off for it in ``_rule_flags``.
+# the stale quote (A13), so those rule bits are masked off for it in ``_rule_flags``. The slots
+# route (``book_slots._slots_loop``) reads every rule; it differs from the other two in what it
+# accepts and refuses, and it is its own loop: see the slots values below.
 C_ROUTE_SHIFT = 19
-C_ROUTE_MASK = 1 << C_ROUTE_SHIFT
+C_ROUTE_MASK = 3 << C_ROUTE_SHIFT
 ROUTE_VENUE = 1
+ROUTE_SLOTS = 2
 _VENUE_IGNORES = F_NEXT_OPEN | F_EXIT_NEXT_OPEN | F_STALE_DROP
+# The slots route accepts protection at or through the entry price and applies A10/A11 (ERR 4, ERR 8
+# for a MIT target, or an immediate target trade), like the venue; it refuses a working order
+# across a New York date change only while a trigger, a limit or a resting straddle leg is
+# working, and not on the bar after a GTD stop was submitted (``order_lifetime=next_bar``).
+IN_MARKET_ACCEPT = 0
+NEW_DAY_REFUSE_RESTING = 2
 COMPAT_SINGLE = (IN_MARKET_REFUSE << C_IN_MARKET_SHIFT) | (NEW_DAY_REFUSE << C_NEW_DAY_SHIFT)
 COMPAT_VENUE = (NEW_DAY_REFUSE << C_NEW_DAY_SHIFT) | (ROUTE_VENUE << C_ROUTE_SHIFT)
+COMPAT_SLOTS = (
+    (IN_MARKET_ACCEPT << C_IN_MARKET_SHIFT)
+    | (NEW_DAY_REFUSE_RESTING << C_NEW_DAY_SHIFT)
+    | (ROUTE_SLOTS << C_ROUTE_SHIFT)
+)
 if (
     _RULE_BITS & (C_IN_MARKET_MASK | C_NEW_DAY_MASK | C_ROUTE_MASK)
     or C_IN_MARKET_MASK & (C_NEW_DAY_MASK | C_ROUTE_MASK)
@@ -316,7 +330,7 @@ def _rule_flags(rules, compat):
     ):
         if rules[index] != 0.0:
             flags |= bit
-    if compat & C_ROUTE_MASK:
+    if (compat & C_ROUTE_MASK) >> C_ROUTE_SHIFT == ROUTE_VENUE:
         flags &= ~_VENUE_IGNORES  # the venue never reads these (R15 keeps them off its route)
     return flags
 
@@ -446,7 +460,7 @@ def _book_loop(
     """
     n = o.shape[0]
     flags = _rule_flags(rules, compat)
-    venue = flags & C_ROUTE_MASK != 0
+    venue = (flags & C_ROUTE_MASK) >> C_ROUTE_SHIFT == ROUTE_VENUE
     lat = int(rules[R_LATENCY_BARS])
     adaptive = flags & F_ADAPTIVE != 0
     adverse_first = flags & F_ADVERSE_FIRST != 0
@@ -1227,6 +1241,7 @@ def _book_loop(
 
 __all__ = [
     "COMPAT_SINGLE",
+    "COMPAT_SLOTS",
     "COMPAT_VENUE",
     "C_IN_MARKET_MASK",
     "C_IN_MARKET_SHIFT",
@@ -1245,8 +1260,11 @@ __all__ = [
     "F_REENTER",
     "F_STALE_DROP",
     "F_TARGET_GAP",
+    "IN_MARKET_ACCEPT",
     "IN_MARKET_REFUSE",
     "NEW_DAY_REFUSE",
+    "NEW_DAY_REFUSE_RESTING",
+    "ROUTE_SLOTS",
     "ROUTE_VENUE",
     "VS_CHASING",
     "VS_CLOSING",

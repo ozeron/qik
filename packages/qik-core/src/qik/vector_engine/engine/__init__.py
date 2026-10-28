@@ -13,6 +13,8 @@ there is no cycle):
               arm's plain-call helpers
     book      the unified loop (single-matcher plan, stages 2-3): rule bits and compat fields,
               the transition ring, the single and venue arms, the callback sites
+    slot_ring the slots arm's command ring and its held-decision helpers (stage 4)
+    book_slots the slots arm: the slots matcher as a flat event-gated loop (stage 4)
     single    the single-order entry: pick the loop's route from the rules
     slots     the slots matcher (trigger/stop/target updates, straddle legs)
     batch     run_columns, the parallel column runner and its Python-boundary ABI
@@ -68,13 +70,15 @@ _ENGINE_MODULE_NAMES = (
     "decision",
     "ring",
     "book",
+    "slot_ring",
+    "book_slots",
     "single",
     "slots",
     "batch",
 )
 # Legacy matchers (differential oracles; production never imports them). They are still engine
 # sources: Numba's cache locator keys every file in this package by ``fingerprint()``.
-_LEGACY_FILES = ("legacy/__init__", "legacy/single", "legacy/venue")
+_LEGACY_FILES = ("legacy/__init__", "legacy/single", "legacy/venue", "legacy/slots")
 # Modules outside this package whose source the matchers bind.
 SHARED_MODULES = ("compiled", "protection", "account", "straddle", "types")
 # Names the facade re-binds under another identifier: alias -> (module, attribute).
@@ -304,6 +308,7 @@ _install_cache_locator()  # noqa: E402  (before the first ``cache=True`` dispatc
 from . import (  # noqa: E402
     batch,
     book,
+    book_slots,
     codes,
     decision,
     events,
@@ -312,6 +317,7 @@ from . import (  # noqa: E402
     pairs,
     ring,
     single,
+    slot_ring,
     slots,
 )
 
@@ -324,6 +330,8 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     decision,
     ring,
     book,
+    slot_ring,
+    book_slots,
     single,
     slots,
     batch,
