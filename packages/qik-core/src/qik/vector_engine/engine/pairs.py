@@ -7,7 +7,7 @@ import numpy as np
 
 from qik.vector_engine.protection import _in_market
 
-from .codes import _SLOT_REPLACE, _SLOT_SUBMIT, PAIR_BITS, PAIR_TRIGGER_BITS
+from .codes import _SLOT_REPLACE, _SLOT_SUBMIT
 from .events import _level_at, _pair_value, _side_at
 
 
@@ -87,66 +87,6 @@ def _open_in_market(triggers, pair, sides, d, opening, core=None):
     return _in_market(-_side_at(core, sides, d), _level_at(core, triggers, d, 5), opening, True)
 
 
-@nb.njit(cache=True)
-def _event_pair_at(masks, values, rows, row):
-    if row < 0:
-        return False
-    mask = masks[row] & PAIR_BITS
-    # The mask preserves raw decisions for captures/declaration checks. Only the
-    # two open-relative stop triggers can become NaN after publication (no next
-    # open on the last bar); those bits alone do not prove a live transformed pair.
-    return bool(mask) and (
-        bool(mask & ~PAIR_TRIGGER_BITS)
-        or not np.isnan(values[row, rows[11]])
-        or not np.isnan(values[row, rows[17]])
-    )
-
-
-@nb.njit(cache=True)
-def _event_pair_rests(masks, values, rows, row):
-    return _event_pair_at(masks, values, rows, row) and not (
-        np.isnan(values[row, rows[11]]) and np.isnan(values[row, rows[17]])
-    )
-
-
-@nb.njit(cache=True)
-def _event_pair_level(masks, values, rows, row, offset, active):
-    if not _event_pair_at(masks, values, rows, row):
-        return np.nan
-    stop = values[row, rows[11 + offset]]
-    if not np.isnan(stop):
-        return stop
-    return values[row, rows[12 + offset]] if active else np.nan
-
-
-@nb.njit(cache=True)
-def _event_stop_pair(masks, values, rows, row):
-    return (
-        _event_pair_rests(masks, values, rows, row)
-        and np.isnan(values[row, rows[12]])
-        and np.isnan(values[row, rows[18]])
-    )
-
-
-@nb.njit(cache=True)
-def _event_lifetime_crosses(next_bar, kind, trigger, masks, values, rows, row):
-    return (
-        next_bar
-        and (kind == _SLOT_SUBMIT or kind == _SLOT_REPLACE)
-        and (not np.isnan(trigger) or _event_stop_pair(masks, values, rows, row))
-    )
-
-
-@nb.njit(cache=True)
-def _event_open_in_market(trigger, side, masks, values, rows, row, opening):
-    if _event_pair_at(masks, values, rows, row):
-        long_stop, short_stop = values[row, rows[11]], values[row, rows[17]]
-        return (not np.isnan(long_stop) and opening >= long_stop) or (
-            not np.isnan(short_stop) and opening <= short_stop
-        )
-    return _in_market(-side, trigger, opening, True)
-
-
 __all__ = [
     "_has_pairs",
     "_lifetime_crosses",
@@ -156,10 +96,4 @@ __all__ = [
     "_pair_rests",
     "_stop_pair",
     "_straddle_column",
-    "_event_pair_at",
-    "_event_pair_rests",
-    "_event_pair_level",
-    "_event_stop_pair",
-    "_event_lifetime_crosses",
-    "_event_open_in_market",
 ]

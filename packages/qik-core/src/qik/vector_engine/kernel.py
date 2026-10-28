@@ -223,12 +223,6 @@ from .engine.levels import (
     _store_risk,
 )
 from .engine.pairs import (
-    _event_lifetime_crosses,
-    _event_open_in_market,
-    _event_pair_at,
-    _event_pair_level,
-    _event_pair_rests,
-    _event_stop_pair,
     _has_pairs,
     _lifetime_crosses,
     _open_in_market,
@@ -288,7 +282,7 @@ from .engine.slot_ring import (
     _spop,
     _spush,
 )
-from .engine.slots import SlotsState, _compiled_slots_column, _slots_column, _slots_column_advance
+from .engine.slots import _compiled_slots_column, _slots_column
 from .protection import (
     ERR_NONE,
     ERR_PROTECT_REJECTED,
@@ -400,7 +394,6 @@ __all__ = [
     "R_TARGET_GAP",
     "R_TICK",
     "R_TICK_ROUND",
-    "SlotsState",
     "V_ENTRY_I",
     "V_ENTRY_PX",
     "V_EQUITY",
@@ -465,7 +458,6 @@ __all__ = [
     "_round_price",
     "_run_columns",
     "_slots_column",
-    "_slots_column_advance",
     "_stop_pair",
     "_store_risk",
     "_straddle_column",
@@ -491,13 +483,7 @@ __all__ = [
     "_current_flag",
     "_empty_input",
     "_event_get",
-    "_event_lifetime_crosses",
-    "_event_open_in_market",
-    "_event_pair_at",
-    "_event_pair_level",
-    "_event_pair_rests",
     "_event_row",
-    "_event_stop_pair",
     "_flag_at",
     "_flag_at_type",
     "_level_at",

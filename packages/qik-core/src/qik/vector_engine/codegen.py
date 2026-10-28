@@ -23,238 +23,6 @@ def write_fixed_module(destination: Path) -> None:
     _write_module(destination, None, None)
 
 
-class _EventCommands(ast.NodeTransformer):
-    """Attach event rows to compiled pending/queued state; dense oracle stays unchanged."""
-
-    @staticmethod
-    def command_value(node: ast.expr) -> bool:
-        return (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in ("queue", "commands")
-        ) or (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in ("queue", "commands")
-            and node.func.attr == "pop"
-        )
-
-    @staticmethod
-    def retained_row(value: ast.expr, bar: str) -> ast.expr:
-        name = ast.unparse(value)
-        slot = {"i": 1, "pending": 3, "market_entry": 3, "d": 5, "cmd_d": 5, "gen": 8}.get(name)
-        if slot is not None:
-            return ast.parse(f"core.event_state[{slot}]", mode="eval").body
-        if name == "-1":
-            return ast.Constant(-1)
-        return ast.parse(f"_event_row(core, {bar})", mode="eval").body
-
-    def visit_Assign(self, node: ast.Assign) -> ast.stmt | list[ast.stmt]:
-        self.generic_visit(node)
-        target = node.targets[0]
-        if (
-            isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == "_slots_column_advance"
-        ):
-            return [node, *ast.parse("if core.account[2]:\n    break").body]
-        if isinstance(target, ast.Tuple) and self.command_value(node.value):
-            target.elts.append(ast.Name("command_row", ast.Store()))
-            decision_bar = target.elts[2]
-            assert isinstance(decision_bar, ast.Name)
-            bar = decision_bar.id
-            return [
-                node,
-                *ast.parse(f"core.event_state[4], core.event_state[5] = {bar}, command_row").body,
-            ]
-        if isinstance(node.value, ast.Name) and node.value.id == "state":
-            return node
-        pairs = (
-            list(zip(target.elts, node.value.elts, strict=True))
-            if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple)
-            else [(target, node.value)]
-        )
-        extra = []
-        for left, right in pairs:
-            if isinstance(left, ast.Name) and left.id in ("pending", "market_entry", "gen", "d"):
-                first = 7 if left.id == "gen" else 4 if left.id == "d" else 2
-                row = ast.unparse(self.retained_row(right, left.id))
-                extra += ast.parse(
-                    f"core.event_state[{first}], core.event_state[{first + 1}] = {left.id}, {row}"
-                ).body
-        if extra:
-            return [node, *extra]
-        # Seed commands with the extra scalar so Numba infers one tuple type.
-        if (
-            isinstance(target, ast.Name)
-            and target.id in ("queue", "commands")
-            and isinstance(node.value, ast.List)
-        ):
-            for value in node.value.elts:
-                if isinstance(value, ast.Tuple):
-                    value.elts.append(ast.Constant(-1))
-        return node
-
-    def visit_Expr(self, node: ast.Expr) -> ast.stmt | list[ast.stmt]:
-        self.generic_visit(node)
-        call = node.value
-        if (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Name)
-            and call.func.id == "_core_decision"
-        ):
-            return [
-                node,
-                *ast.parse("if core.account[2]:\n    return state, ERR_NONE, -1").body,
-            ]
-        return node
-
-    def visit_For(self, node: ast.For) -> ast.For:
-        self.generic_visit(node)
-        if (
-            isinstance(node.target, ast.Tuple)
-            and isinstance(node.iter, ast.Name)
-            and node.iter.id in ("queue", "commands")
-        ):
-            node.target.elts.append(ast.Name("command_row", ast.Store()))
-            decision_bar = node.target.elts[2]
-            assert isinstance(decision_bar, ast.Name)
-            bar = decision_bar.id
-            node.body[0:0] = ast.parse(
-                f"core.event_state[4], core.event_state[5] = {bar}, command_row"
-            ).body
-        return node
-
-    def visit_Call(self, node: ast.Call) -> ast.Call:
-        self.generic_visit(node)
-        if (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id in ("queue", "commands")
-            and node.func.attr == "append"
-        ):
-            value = node.args[0]
-            assert isinstance(value, ast.Tuple)
-            value.elts.append(self.retained_row(value.elts[2], ast.unparse(value.elts[2])))
-        return node
-
-
-class _EventAccess(ast.NodeTransformer):
-    """Resolve retained row indices once at creation; hot reads are array loads."""
-
-    @staticmethod
-    def row(bar: ast.expr) -> str:
-        name = ast.unparse(bar)
-        slot = {"pending": 3, "market_entry": 3, "gen": 8, "d": 5, "cmd_d": 5, "i": 1}.get(name)
-        return f"_event_state[{slot}]" if slot is not None else f"_event_row(core, {name})"
-
-    def visit_Call(self, node: ast.Call) -> ast.expr:
-        self.generic_visit(node)
-        if not isinstance(node.func, ast.Name):
-            return node
-        name, args = node.func.id, node.args
-        if name in ("_side_at", "_flag_at", "_level_at", "_pair_value"):
-            bar = args[3] if name == "_pair_value" else args[2]
-            text = ast.unparse(bar)
-            row = self.row(bar)
-            column = ast.unparse(args[1])
-            if name == "_side_at":
-                field, current = "_event_fields[0]", f"{column}[0]"
-            elif name == "_flag_at":
-                field, current = (
-                    f"_event_fields[{ast.unparse(args[3])}]",
-                    f"{column}[0]",
-                )
-            elif name == "_level_at":
-                level = ast.unparse(args[3])
-                field = f"_event_levels[{level}]"
-                current = f"{column}[0]"
-            else:
-                leg = ast.unparse(args[2])
-                field = f"_event_levels[11 + {leg}]"
-                current = f"{column}[{leg}, 0]"
-            # i-levels are read after the close callback. Flags also run before
-            # the callback and retain their publication guard.
-            # All retained decisions, including same-close orders, already own a
-            # row. The preinitialized -1 row/column supplies HOLD/absent defaults.
-            if name == "_flag_at":
-                value = f"({current} if {text} == _event_state[0] else 0.0)"
-            else:
-                value = current if text == "i" else f"_event_values[{row}, {field}]"
-            if name == "_side_at":
-                value = f"int({value})"
-            elif name == "_flag_at":
-                value = f"bool({value})"
-            return ast.parse(value, mode="eval").body
-        if name not in (
-            "_pair_at",
-            "_pair_rests",
-            "_pair_level",
-            "_stop_pair",
-            "_lifetime_crosses",
-            "_open_in_market",
-        ):
-            return node
-        bar = (
-            args[1]
-            if name.startswith("_pair_") or name == "_stop_pair"
-            else args[2]
-            if name == "_lifetime_crosses"
-            else args[3]
-        )
-        row = self.row(bar)
-        arrays = f"_event_masks, _event_values, _event_levels, {row}"
-        if name == "_pair_at":
-            value = f"_event_pair_at({arrays})"
-        elif name in ("_pair_rests", "_stop_pair"):
-            value = f"_event{name}({arrays})"
-        elif name == "_pair_level":
-            value = f"_event_pair_level({arrays}, {ast.unparse(args[2])}, {ast.unparse(args[3])} < {ast.unparse(bar)} + {ast.unparse(args[4])} + 1)"
-        else:
-            trigger = ast.unparse(
-                self.visit_Call(
-                    ast.Call(
-                        ast.Name("_level_at", ast.Load()),
-                        [
-                            ast.Name("core", ast.Load()),
-                            args[3] if name == "_lifetime_crosses" else args[0],
-                            bar,
-                            ast.Constant(5),
-                        ],
-                        [],
-                    )
-                )
-            )
-            if name == "_lifetime_crosses":
-                value = f"_event_lifetime_crosses({ast.unparse(args[0])}, {ast.unparse(args[1])}, {trigger}, {arrays})"
-            else:
-                side = ast.unparse(
-                    self.visit_Call(
-                        ast.Call(
-                            ast.Name("_side_at", ast.Load()),
-                            [ast.Name("core", ast.Load()), args[2], bar],
-                            [],
-                        )
-                    )
-                )
-                value = (
-                    f"_event_open_in_market({trigger}, {side}, {arrays}, {ast.unparse(args[4])})"
-                )
-        return ast.parse(value, mode="eval").body
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        self.generic_visit(node)
-        node.body[0:0] = ast.parse("""
-_event_state = core.event_state
-_event_values = core.ev_val
-_event_masks = core.ev_mask
-_event_fields = core.field_rows
-_event_levels = core.level_rows
-""").body
-        return node
-
-
 def _write_module(
     destination: Path,
     strategy_module: str | None,
@@ -409,14 +177,13 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
             ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
         ]
     functions.append(rare_decision)
-    # (matcher, whether it still reads decisions by the name-keyed event rewrites). The book loop
-    # owns its callback sites and retained-row reads, so it is emitted as written.
-    for module, name, event_rewrites in (
-        (engine.book, "_entry_levels", False),
-        (engine.book, "_book_loop", False),
-        (engine.slots, "_slots_column_advance", True),
-        (engine.single, "_column", False),
-        (engine.slots, "_slots_column", True),
+    # The loops own their callback sites and retained-row reads, so they are emitted as written.
+    for module, name in (
+        (engine.book, "_entry_levels"),
+        (engine.book, "_book_loop"),
+        (engine.book_slots, "_slots_loop"),
+        (engine.single, "_column"),
+        (engine.slots, "_slots_column"),
     ):
         node = source(getattr(module, name))
         BindGlobals().visit(node)
@@ -429,9 +196,6 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                     ast.keyword("no_cpython_wrapper", ast.Constant(True)),
                     ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
                 ]
-            if event_rewrites:
-                _EventCommands().visit(node)
-                _EventAccess().visit(node)
         functions.append(node)
     runner = ast.parse(_RUNNER_SOURCE).body[0]
     assert isinstance(runner, ast.FunctionDef)
