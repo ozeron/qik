@@ -9,14 +9,16 @@ there is no cycle):
     events    sparse event rows, retained decision access and current-bar scratch
     pairs     straddle pair legs: pair reads, resting/level lookups, lifetime triggers
     decision  _core_decision: the strategy callback into the level store and account
+    ring      the transition ring (single next-open staging, venue command list) and the venue
+              arm's plain-call helpers
     book      the unified loop (single-matcher plan, stages 2-3): rule bits and compat fields,
               the transition ring, the single and venue arms, the callback sites
     single    the single-order entry: pick the loop's route from the rules
     slots     the slots matcher (trigger/stop/target updates, straddle legs)
     batch     run_columns, the parallel column runner and its Python-boundary ABI
 
-``book`` and ``slots`` sit on ``decision``; ``batch`` runs both. ``legacy/`` holds
-the matchers a stage has replaced, kept as differential oracles: nothing here imports them.
+``book`` and ``slots`` sit on ``decision`` (``book`` also on ``ring``); ``batch`` runs both.
+``legacy/`` holds the matchers a stage has replaced, kept as differential oracles: nothing here imports them.
 ``qik.vector_engine.kernel`` re-exports every name for compatibility.
 
 The matchers cache to disk (``cache=True``) and Numba keys a cache entry by the source
@@ -64,6 +66,7 @@ _ENGINE_MODULE_NAMES = (
     "events",
     "pairs",
     "decision",
+    "ring",
     "book",
     "single",
     "slots",
@@ -307,6 +310,7 @@ from . import (  # noqa: E402
     fills,
     levels,
     pairs,
+    ring,
     single,
     slots,
 )
@@ -318,6 +322,7 @@ ENGINE_MODULES: tuple[ModuleType, ...] = (
     events,
     pairs,
     decision,
+    ring,
     book,
     single,
     slots,
