@@ -198,6 +198,8 @@ class _Walk:
             return
         self._seen.add(key)
         if isinstance(value, types.ModuleType):
+            if _first_party(value) is None:
+                return  # also keeps ``hasattr`` away from a library's deprecated lazy attributes
             if self._include(value):
                 # A module reached for the first time contributes everything it defines (over-
                 # inclusion is safe, a missed module is not): the functions it calls into other
