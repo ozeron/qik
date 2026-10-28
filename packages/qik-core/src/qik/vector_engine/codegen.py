@@ -427,8 +427,14 @@ _BORROWED_INPUTS = {
 }
 
 
-def check_borrowed(trades: tuple[np.ndarray, ...], **arrays: np.ndarray) -> None:
-    """Refuse arrays the pointer-table publisher would misread: wrong dtype, rank or layout."""
+def check_borrowed(trades: tuple[np.ndarray, ...], configs: int, **arrays: np.ndarray) -> None:
+    """Refuse arrays the pointer-table publisher would misread or write through unsafely: wrong
+    dtype, rank, extent or layout, or immutable storage.
+
+    The publisher rebuilds every one of these from a raw address, so Numba's readonly array type
+    no longer stops it from writing into them, and a view that disagrees with the array the loop
+    holds reads or writes out of bounds. The trade, event and store buffers are the engine's own
+    scratch: writeable, one row per config, and sized as ``compiled._Buffers`` sizes them."""
     expected: dict[str, tuple[str, int]] = dict(_BORROWED_INPUTS)
     expected |= {f"trades[{k}]": (dtype[3:], 2) for k, (_, _, dtype) in enumerate(_BORROWED_TRADES)}
     given = {f"trades[{k}]": array for k, array in enumerate(trades)} | arrays
@@ -436,12 +442,36 @@ def check_borrowed(trades: tuple[np.ndarray, ...], **arrays: np.ndarray) -> None
         raise ValueError(f"fixed engine: expected arrays {sorted(expected)}, got {sorted(given)}")
     for name, array in given.items():
         dtype, ndim = expected[name]
-        if array.dtype != np.dtype(dtype) or array.ndim != ndim or not array.flags.c_contiguous:
+        if (
+            array.dtype != np.dtype(dtype)
+            or array.ndim != ndim
+            or not array.flags.c_contiguous
+            or not array.flags.writeable
+        ):
             raise ValueError(
-                f"fixed engine: {name} must be a C-contiguous {ndim}-d {dtype} array (the "
-                f"publisher reads it through a raw view), got {array.ndim}-d {array.dtype}"
+                f"fixed engine: {name} must be a writeable C-contiguous {ndim}-d {dtype} array "
+                f"(the publisher writes it through a raw view), got {array.ndim}-d {array.dtype}"
                 f"{'' if array.flags.c_contiguous else ' non-contiguous'}"
+                f"{'' if array.flags.writeable else ' readonly'}"
             )
+    per_config = ("store", "ev_count", "ev_bar", "ev_mask", "ev_val", "risk_store")
+    wrong_rows = [
+        name
+        for name, array in given.items()
+        if (name in per_config or name.startswith("trades[")) and array.shape[0] != configs
+    ]
+    if wrong_rows:
+        raise ValueError(f"fixed engine: {wrong_rows} must have one row per config ({configs})")
+    width = {array.shape for array in trades}
+    capacity = given["ev_bar"].shape[1]
+    if (
+        len(width) != 1
+        or given["ev_mask"].shape[1] != capacity + 1
+        or given["ev_val"].shape[1] != capacity + 1
+    ):
+        raise ValueError(
+            "fixed engine: trade columns must share one shape and the event buffers one capacity"
+        )
 
 
 def _decision_scalars(decision: ast.FunctionDef) -> list[str]:

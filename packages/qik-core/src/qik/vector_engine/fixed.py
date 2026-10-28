@@ -204,6 +204,7 @@ class FixedRunner:
     ) -> tuple[Any, ...]:
         check_borrowed(
             trades,
+            len(states),
             store=store,
             ev_count=ev_count,
             ev_bar=ev_bar,
