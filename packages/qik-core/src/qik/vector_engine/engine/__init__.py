@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import atexit
 import hashlib
-import inspect
 import os
 import secrets
 import shutil
@@ -106,11 +105,15 @@ _throwaway: tuple[str, str] | None = None
 def fingerprint(*extra: Any) -> str:
     """Content identity of the engine: a source change anywhere invalidates it.
 
-    ``extra`` modules (a strategy) extend the identity to their own source.
+    ``extra`` modules (a strategy) extend the identity to their own source and to the source of
+    every first-party module their compiled code can reach (``reach.closure_digest``): an edited
+    helper under an unedited strategy module changes the build too.
     """
     if not extra:
         return _digest()
-    added = "\n".join(inspect.getsource(module) for module in extra)
+    from qik.vector_engine import reach
+
+    added = "\n".join(reach.closure_digest(module) for module in extra)
     return hashlib.sha256("\n".join((_digest(), added)).encode()).hexdigest()
 
 

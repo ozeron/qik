@@ -144,7 +144,10 @@ account = nb.carray(_pointer(ctx[12]), 6, dtype=np.float64)
         # Empty Records cannot be lowered by Numba.
         "if not _state_dtype.names: _state_dtype = np.dtype([('_empty', 'i1')])\n"
         "if not _params_dtype.names: _params_dtype = np.dtype([('_empty', 'i1')])\n"
-        "_strategy = nb.njit(cache=True)(_strategy)\n" + text + "\n"
+        # Not ``cache=True``: Numba stamps a cache entry by the file that defines the function, so a
+        # cached strategy would outlive an edit to a helper in another module. The callback below is
+        # cached under this module's content-keyed name, and carries the compiled strategy with it.
+        "_strategy = nb.njit(_strategy)\n" + text + "\n"
     )
 
 
