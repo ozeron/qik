@@ -9,8 +9,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import inspect
 import os
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any, get_type_hints
 from uuid import uuid4
@@ -163,12 +165,65 @@ def _writable(array: np.ndarray) -> np.ndarray:
     return view
 
 
+def _feature_write_risk(step: Any) -> str | None:
+    """Why the strategy may write a feature lane, or None when it provably only reads them.
+
+    The callback sees the caller's lanes through raw pointers, so a write is visible to the caller
+    and a copy would hide it. Reads are provable from the source: every use of the features
+    argument is ``f.name[index]`` as a load, with no slice (a slice is a view a helper could write
+    through). Anything else, or source that cannot be read, counts as a possible write.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(step)))
+    except (OSError, TypeError, SyntaxError):
+        return "its source is unavailable, so it cannot be shown to leave features unwritten"
+    function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    features = function.args.args[2].arg
+    reads: set[int] = set()
+    for node in ast.walk(function):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Load)
+            and isinstance(node.value, ast.Attribute)
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == features
+            and not any(isinstance(n, ast.Slice) for n in ast.walk(node.slice))
+        ):
+            reads.add(id(node.value.value))
+    for node in ast.walk(function):
+        if isinstance(node, ast.Name) and node.id == features and id(node) not in reads:
+            return f"line {node.lineno} uses `{features}` other than as `{features}.name[i]` reads"
+    return None
+
+
 class FixedRunner:
-    def __init__(self, engine: Any, callback: Any) -> None:
+    def __init__(
+        self, engine: Any, callback: Any, lanes: tuple[str, ...] = (), write_risk: str | None = None
+    ) -> None:
         self.engine = engine
         self.callback = callback
+        self.lanes = lanes
+        self.write_risk = write_risk
         self.functions = List.empty_list(FUNCTION)
         self.functions.append(callback)
+
+    def contiguous(self, lanes: tuple[np.ndarray, ...]) -> tuple[np.ndarray, ...]:
+        """Lanes the boundary can borrow: strided ones copied once, contiguous ones as they are.
+
+        A copy breaks aliasing with the caller's array, so a strategy that may write features
+        keeps the refusal.
+        """
+        strided = [i for i, lane in enumerate(lanes) if not lane.flags.c_contiguous]
+        if strided and self.write_risk is not None:
+            names = ", ".join(self.lanes[i] if i < len(self.lanes) else str(i) for i in strided)
+            raise ValueError(
+                f"features must be C-contiguous arrays ({names} are strided): this strategy may "
+                f"write features ({self.write_risk}), and copying breaks aliasing. "
+                "Pass np.ascontiguousarray lanes yourself."
+            )
+        return tuple(
+            np.ascontiguousarray(lane) if i in strided else lane for i, lane in enumerate(lanes)
+        )
 
     def run(
         self,
@@ -225,6 +280,7 @@ class FixedRunner:
         # through invoke; no normalization may copy feature lanes here.
         owners = tuple(feats[1:])
         if any(not a.flags.c_contiguous for a in owners):
+            # Normally copied or refused by ``contiguous`` before the run starts.
             raise ValueError("features must be C-contiguous arrays; copying breaks aliasing")
         owners = tuple(_writable(a) for a in owners)
         addresses = np.array([a.ctypes.data for a in owners], dtype=np.int64)
@@ -304,5 +360,7 @@ def runner(step: Any) -> FixedRunner:
         engine = _load(source, directory, "fixed")
         callback = _load(callback_source, directory, "callback").callback
         callback.compile(ABI)
-        _modules[key] = FixedRunner(engine, callback)
+        _modules[key] = FixedRunner(
+            engine, callback, tuple(get_type_hints(schema.features)), _feature_write_risk(step)
+        )
     return _modules[key]

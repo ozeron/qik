@@ -913,17 +913,21 @@ def _record_run(
         else np.zeros(len(params), dtype=[("_empty", "i1")]).view(np.recarray)
     )
     final: list[np.recarray] = []
+    lanes = tuple(getattr(values, name) for name in names)
     try:
         if jit and not getattr(nb.config, "DISABLE_JIT"):
             from .fixed import runner as fixed_runner
 
-            runner = fixed_runner(step).run
+            fixed = fixed_runner(step)
+            # Once per run: the fixed ABI borrows contiguous lanes, so a strided one is copied here.
+            lanes = fixed.contiguous(lanes)
+            runner = fixed.run
         else:
             runner = _python_runner(_python_module(step))
         results = _run_columns_typed(
             internal_states,
             internal_params,
-            (clock, *(getattr(values, name) for name in names)),
+            (clock, *lanes),
             bars,
             _bound_runner=runner,
             _event_storage=jit and not bool(getattr(nb.config, "DISABLE_JIT")),
