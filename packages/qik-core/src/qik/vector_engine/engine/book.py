@@ -82,7 +82,7 @@ from .codes import (
 )
 from .decision import _core_decision, _core_decision_rare
 from .events import _close_at, _open_at
-from .fills import _high_first, _no_reversal, _target_fill_price
+from .fills import _high_first, _no_reversal, _target_fill_price, _venue_record
 from .levels import _any_in
 
 # Rule bits, decoded once from the settings record: the low word of the flags.
@@ -253,6 +253,28 @@ def _held_level_type(core, lane, ident, level, default):
     return event
 
 
+@nb.njit(cache=True, nogil=True)
+def _entry_levels(
+    core, side, anchor, fill, held, entry_stop, entry_target, stop_pts, target_pts,
+    has_es, has_et, has_sp, has_tp, tick, tick_round, combine,
+):  # fmt: skip
+    """The protection levels of the held decision ``held`` for an entry of ``side`` that filled
+    at ``fill``. A plain call: the loop resolves them at several entry sites, and the retained-row
+    reads expand large in the callback build, so one compiled copy keeps the loop small."""
+    return levels(
+        side,
+        anchor,
+        _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
+        _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
+        _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
+        _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+        tick,
+        tick_round,
+        combine=combine,
+        fill=fill,
+    )
+
+
 @nb.njit(cache=True, nogil=True, inline="always")
 def _exit_flags(exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short):
     """The exit signals published at ``at``: any side, long only, short only."""
@@ -336,6 +358,13 @@ def _ring_push(ring, qmask, qhead, qtail, due, kind, bar, ident):
     slot = qtail & (CAP - 1)
     ring[0, slot], ring[1, slot], ring[2, slot], ring[3, slot] = due, kind, bar, ident
     return qmask | (1 << slot), qhead, qtail + 1, True
+
+
+@nb.njit(cache=True, nogil=True)
+def _cmd_push(ring, qmask, qhead, qtail, due, kind, bar, ident):
+    """``_ring_push`` as a plain call: the venue arm pushes from many cold sites, and one compiled
+    copy keeps the loop small."""
+    return _ring_push(ring, qmask, qhead, qtail, due, kind, bar, ident)
 
 
 @nb.njit(cache=True, nogil=True, inline="always")
@@ -681,17 +710,23 @@ def _book_loop(
                     pend = zero
                     vs[VS_RESTING], vs[VS_CHASING], vs[VS_CLOSING] = 0, 0, 0
                     continue
-                st, tg = levels(
+                st, tg = _entry_levels(
+                    core,
                     pend,
                     _anchor(bracket_anchor, c[vd], oi, oi),
-                    _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
-                    _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
-                    _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
-                    _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                    oi,
+                    held,
+                    entry_stop,
+                    entry_target,
+                    stop_pts,
+                    target_pts,
+                    has_es,
+                    has_et,
+                    has_sp,
+                    has_tp,
                     tick,
                     tick_round,
-                    combine=combine,
-                    fill=oi,
+                    combine,
                 )
                 pos, ei, ep, stop, target = pend, i, oi, st, tg
                 sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
@@ -723,17 +758,23 @@ def _book_loop(
                     vd = vs[VS_PD]
                     held = vs[VS_PIDENT]
                     px = _limit_fill_px(oi, h[i], lo[i], ci, hf, pend, slip, p_lim)
-                    st, tg = levels(
+                    st, tg = _entry_levels(
+                        core,
                         pend,
                         _anchor(bracket_anchor, c[vd], px, p_lim),
-                        _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
-                        _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
-                        _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
-                        _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                        px,
+                        held,
+                        entry_stop,
+                        entry_target,
+                        stop_pts,
+                        target_pts,
+                        has_es,
+                        has_et,
+                        has_sp,
+                        has_tp,
                         tick,
                         tick_round,
-                        combine=combine,
-                        fill=px,
+                        combine,
                     )
                     pos, ei, ep, stop, target = pend, i, px, st, tg
                     sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
@@ -854,17 +895,23 @@ def _book_loop(
                 if not np.isnan(cap) and sd * (oi - cap) > 0:
                     continue  # the IOC cap is through at the open: the entry is dropped
                 fill = oi + sd * slip
-                st, tg = levels(
+                st, tg = _entry_levels(
+                    core,
                     sd,
                     _anchor(bracket_anchor, c[d], fill, fill),
-                    _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
-                    _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
-                    _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
-                    _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                    fill,
+                    held,
+                    entry_stop,
+                    entry_target,
+                    stop_pts,
+                    target_pts,
+                    has_es,
+                    has_et,
+                    has_sp,
+                    has_tp,
                     tick,
                     tick_round,
-                    combine=combine,
-                    fill=fill,
+                    combine,
                 )
                 # Protection placed now is validated at the actual entry open (R1).
                 if refuse_in_market:
@@ -1003,7 +1050,7 @@ def _book_loop(
             fside = pos if pos != 0 else pend
             if ((cmask & 1) or (fside > 0 and cmask & 2) or (fside < 0 and cmask & 4)) or oflat:
                 if pos != 0:
-                    _put_trade(
+                    _venue_record(
                         count_only, base + cnt, ei, i, pos, ep, ci - pos * slip, REASON_SIGNAL,
                         stop, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
                         out_reason, out_stop,
@@ -1020,7 +1067,7 @@ def _book_loop(
             ):
                 vs[VS_CLOSING] = 0
             if vs[VS_CLOSING] != 0 and pos == 0 and vs[VS_PROT] == 2:
-                qmask, qhead, qtail, ok = _ring_push(
+                qmask, qhead, qtail, ok = _cmd_push(
                     ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
                 )
                 if not ok:
@@ -1030,7 +1077,7 @@ def _book_loop(
             exit_now = xg or (xside > 0 and xl) or (xside < 0 and xs)
             if pend != 0 and vs[VS_CLOSING] == 0 and not np.isnan(p_lim) and i == p_chase:
                 vs[VS_CHASING] = 1
-                qmask, qhead, qtail, ok = _ring_push(
+                qmask, qhead, qtail, ok = _cmd_push(
                     ring, qmask, qhead, qtail, i + lat, K_CANCEL, vs[VS_PD], -1
                 )
                 if not ok:
@@ -1039,7 +1086,7 @@ def _book_loop(
                 vs[VS_CHASING] = 0
                 if pend != 0:
                     if vs[VS_CLOSING] == 0 and not np.isnan(p_lim):
-                        qmask, qhead, qtail, ok = _ring_push(
+                        qmask, qhead, qtail, ok = _cmd_push(
                             ring, qmask, qhead, qtail, i + lat, K_CANCEL, vs[VS_PD], -1
                         )
                         if not ok:
@@ -1047,14 +1094,14 @@ def _book_loop(
                     vs[VS_CLOSING], vs[VS_REASON] = 1, REASON_SIGNAL
                 if pos != 0:
                     if vs[VS_PROT] == 2:
-                        qmask, qhead, qtail, ok = _ring_push(
+                        qmask, qhead, qtail, ok = _cmd_push(
                             ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
                         )
                         if not ok:
                             err, eb = ERR_RING_OVERFLOW, i
                         vs[VS_PROT] = 3
                     if vs[VS_CLOSING] == 0:
-                        qmask, qhead, qtail, ok = _ring_push(
+                        qmask, qhead, qtail, ok = _cmd_push(
                             ring, qmask, qhead, qtail, i + lat, K_CLOSE, vs[VS_GEN], -1
                         )
                         if not ok:
@@ -1087,11 +1134,11 @@ def _book_loop(
                             pos = swept
                         err, eb = ERR_NEXT_OPEN_SESSION_END, i
                         break
-                    qmask, qhead, qtail, ok = _ring_push(
+                    qmask, qhead, qtail, ok = _cmd_push(
                         ring, qmask, qhead, qtail, due, K_IOC, i, vs[VS_PIDENT]
                     )
                 else:
-                    qmask, qhead, qtail, ok = _ring_push(
+                    qmask, qhead, qtail, ok = _cmd_push(
                         ring, qmask, qhead, qtail, i + lat,
                         K_MARKET if np.isnan(lim) else K_LIMIT, i, vs[VS_PIDENT],
                     )  # fmt: skip
@@ -1111,17 +1158,23 @@ def _book_loop(
                     px = ci + pend * slip
                     if kind == K_MARKET or (pend > 0 and px <= p_lim) or (pend < 0 and px >= p_lim):
                         held = vs[VS_PIDENT]
-                        st, tg = levels(
+                        st, tg = _entry_levels(
+                            core,
                             pend,
                             _anchor(bracket_anchor, c[vd], px, px if kind == K_MARKET else p_lim),
-                            _held_level(core, entry_stop, held, 0, np.nan) if has_es else np.nan,
-                            _held_level(core, entry_target, held, 1, np.nan) if has_et else np.nan,
-                            _held_level(core, stop_pts, held, 3, np.nan) if has_sp else np.nan,
-                            _held_level(core, target_pts, held, 4, np.nan) if has_tp else np.nan,
+                            px,
+                            held,
+                            entry_stop,
+                            entry_target,
+                            stop_pts,
+                            target_pts,
+                            has_es,
+                            has_et,
+                            has_sp,
+                            has_tp,
                             tick,
                             tick_round,
-                            combine=combine,
-                            fill=px,
+                            combine,
                         )
                         pos, ei, ep, stop, target = pend, i, px, st, tg
                         sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
@@ -1129,7 +1182,7 @@ def _book_loop(
                         pend = zero
                         vs[VS_RESTING], vs[VS_CHASING], vs[VS_REJECTED] = 0, 0, 0
                         vs[VS_PROT] = 0 if vs[VS_CLOSING] != 0 else 1
-                        qmask, qhead, qtail, ok = _ring_push(
+                        qmask, qhead, qtail, ok = _cmd_push(
                             ring, qmask, qhead, qtail, i + lat,
                             K_CLOSE if vs[VS_CLOSING] != 0 else K_PROTECT, vd, -1,
                         )  # fmt: skip
@@ -1143,7 +1196,7 @@ def _book_loop(
                         if vs[VS_CHASING] != 0:
                             # The chase: the limit is gone, the entry goes in at market.
                             vs[VS_CHASING] = 0
-                            qmask, qhead, qtail, ok = _ring_push(
+                            qmask, qhead, qtail, ok = _cmd_push(
                                 ring, qmask, qhead, qtail, i + lat, K_MARKET, vd, -1
                             )
                             if not ok:
@@ -1163,7 +1216,7 @@ def _book_loop(
                                 vs[VS_PROT] = 0
                             if vs[VS_CLOSING] == 0:
                                 vs[VS_REASON] = REASON_PROTECT_FAIL
-                                qmask, qhead, qtail, ok = _ring_push(
+                                qmask, qhead, qtail, ok = _cmd_push(
                                     ring, qmask, qhead, qtail, i + lat, K_CLOSE, vd, -1
                                 )
                                 if not ok:
@@ -1171,14 +1224,14 @@ def _book_loop(
                             vs[VS_CLOSING] = 1
                         px = ci - pos * slip
                         if _in_market(pos, target, px, False):  # a marketable target fills (A11)
-                            _put_trade(
+                            _venue_record(
                                 count_only, base + cnt, ei, i, pos, ep, px, REASON_TARGET, stop,
                                 out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
                                 out_reason, out_stop,
                             )  # fmt: skip
                             cnt += 1
                             pos = zero
-                            qmask, qhead, qtail, ok = _ring_push(
+                            qmask, qhead, qtail, ok = _cmd_push(
                                 ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vd, -1
                             )
                             if not ok:
@@ -1187,7 +1240,7 @@ def _book_loop(
                 elif kind == K_UNPROTECT and vs[VS_GEN] == vd:
                     vs[VS_PROT] = 0
                 elif kind == K_CLOSE and pos != 0:
-                    _put_trade(
+                    _venue_record(
                         count_only, base + cnt, ei, i, pos, ep, ci - pos * slip, vs[VS_REASON],
                         stop, out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
                         out_reason, out_stop,
@@ -1376,6 +1429,8 @@ __all__ = [
     "_ring_push",
     "_routes_here",
     "_row_restore",
+    "_cmd_push",
+    "_entry_levels",
     "_row_save",
     "_rule_flags",
     "_scratch_at",

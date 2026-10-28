@@ -412,6 +412,7 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
     # (matcher, whether it still reads decisions by the name-keyed event rewrites). The book loop
     # owns its callback sites and retained-row reads, so it is emitted as written.
     for module, name, event_rewrites in (
+        (engine.book, "_entry_levels", False),
         (engine.book, "_book_loop", False),
         (engine.slots, "_slots_column_advance", True),
         (engine.single, "_column", False),
