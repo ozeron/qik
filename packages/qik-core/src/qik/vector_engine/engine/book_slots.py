@@ -135,6 +135,7 @@ from .slot_ring import (
     _held_pair_level,
     _held_pair_rests,
     _held_stop_pair,
+    _held_view,
     _pair_cols,
     _pair_possible,
     _sbound,
@@ -181,39 +182,39 @@ def _slot_flags(rules):
 
 @nb.njit(cache=True, nogil=True)
 def _pend_load(
-    core, ident, side_sig, triggers, entry_limit, from_open, straddle,
+    hv, ident, side_sig, triggers, entry_limit, from_open, straddle,
     has_trig, has_limit, has_from, has_pairs,
 ):  # fmt: skip
     """What a working entry needs again, read once from its decision: ``(side, trigger, limit,
     straddle, from_open)``. A plain call: it runs once per entry order."""
     return (
-        _held_side(core, side_sig, ident),
-        _held_level(core, triggers, ident, 5, np.nan) if has_trig else np.nan,
-        _held_level(core, entry_limit, ident, 2, np.nan) if has_limit else np.nan,
-        has_pairs and _held_pair_any(core, straddle, ident),
-        bool(_held_level(core, from_open, ident, 23, 0.0)) if has_from else False,
+        _held_side(hv, side_sig, ident),
+        _held_level(hv, triggers, ident, 5, np.nan) if has_trig else np.nan,
+        _held_level(hv, entry_limit, ident, 2, np.nan) if has_limit else np.nan,
+        has_pairs and _held_pair_any(hv, straddle, ident),
+        bool(_held_level(hv, from_open, ident, 23, 0.0)) if has_from else False,
     )
 
 
 @nb.njit(cache=True, nogil=True)
 def _entry_resolve(
-    core, side, anchor, fill, ident, paired, entry_stop, entry_target, stop_pts, target_pts,
+    hv, side, anchor, fill, ident, paired, entry_stop, entry_target, stop_pts, target_pts,
     stop_fracs, target_fracs, straddle, has_es, has_et, has_sp, has_tp, has_sf, has_tf,
     tick, tick_round, combine, fracs,
 ):  # fmt: skip
     """The protection levels of the held decision ``ident`` for an entry of ``side`` that filled
     at ``fill``: its own legs, or the leg of the straddle side that fired. ``fracs`` False leaves
     the fractional levels out (the R15b sizing risk is taken from the trigger geometry)."""
-    leg_stop = _held_level(core, entry_stop, ident, 0, np.nan) if has_es else np.nan
-    leg_target = _held_level(core, entry_target, ident, 1, np.nan) if has_et else np.nan
-    leg_sp = _held_level(core, stop_pts, ident, 3, np.nan) if has_sp else np.nan
-    leg_tp = _held_level(core, target_pts, ident, 4, np.nan) if has_tp else np.nan
+    leg_stop = _held_level(hv, entry_stop, ident, 0, np.nan) if has_es else np.nan
+    leg_target = _held_level(hv, entry_target, ident, 1, np.nan) if has_et else np.nan
+    leg_sp = _held_level(hv, stop_pts, ident, 3, np.nan) if has_sp else np.nan
+    leg_tp = _held_level(hv, target_pts, ident, 4, np.nan) if has_tp else np.nan
     if paired:
         offset = 0 if side > 0 else 6
-        leg_stop = _held_pair(core, straddle, offset + 2, ident)
-        leg_target = _held_pair(core, straddle, offset + 3, ident)
-        leg_sp = _held_pair(core, straddle, offset + 4, ident)
-        leg_tp = _held_pair(core, straddle, offset + 5, ident)
+        leg_stop = _held_pair(hv, straddle, offset + 2, ident)
+        leg_target = _held_pair(hv, straddle, offset + 3, ident)
+        leg_sp = _held_pair(hv, straddle, offset + 4, ident)
+        leg_tp = _held_pair(hv, straddle, offset + 5, ident)
     return levels(
         side,
         anchor,
@@ -225,19 +226,15 @@ def _entry_resolve(
         tick_round,
         combine=combine,
         fill=fill,
-        stop_frac=_held_level(core, stop_fracs, ident, 24, np.nan)
-        if (fracs and has_sf)
-        else np.nan,
-        target_frac=_held_level(core, target_fracs, ident, 25, np.nan)
+        stop_frac=_held_level(hv, stop_fracs, ident, 24, np.nan) if (fracs and has_sf) else np.nan,
+        target_frac=_held_level(hv, target_fracs, ident, 25, np.nan)
         if (fracs and has_tf)
         else np.nan,
     )
 
 
 @nb.njit(cache=True, nogil=True)
-def _session_end(
-    ring, qmask, i, n, new_day, cross_session, next_bar, core, triggers, has_trig, pair
-):
+def _session_end(ring, qmask, i, n, new_day, cross_session, next_bar, hv, triggers, has_trig, pair):
     """A next-open command still ahead at a close, with no following bar on the same New York
     date (and no session crossing allowed): the refusal ERR 6. Scans every ring entry."""
     m = qmask
@@ -248,7 +245,7 @@ def _session_end(
                 new_day[i + 1]
                 and not cross_session
                 and not _held_lifetime_crosses(
-                    core, next_bar, int(ring[RW_KIND, slot]), int(ring[RW_IDENT, slot]),
+                    hv, next_bar, int(ring[RW_KIND, slot]), int(ring[RW_IDENT, slot]),
                     triggers, has_trig, pair,
                 )
             ):  # fmt: skip
@@ -361,6 +358,7 @@ def _slots_loop(
     has_open = _has_lane(force_open)
     has_expiry = _has_lane(expiry_days)
     has_pairs = _pair_cols(straddle) > 0
+    hv = _held_view(core)
     pair_masks = _event_masks(core)
     event_stored = _event_stored(core)
     # Phase 0 (the open) settles only commands that can be due at an open.
@@ -404,7 +402,7 @@ def _slots_loop(
             cmask = _lane_at(force_close, i, 0) if has_close else 0
             oflat = _lane_at(force_open, i, False) if has_open else False
             cur = i
-            cur_pair = has_pairs and _held_pair_any(core, straddle, i)
+            cur_pair = has_pairs and _held_pair_any(hv, straddle, i)
             if (
                 pos == 0
                 and pend < 0
@@ -446,7 +444,7 @@ def _slots_loop(
                 and new_day[i]
                 and not day_cancel
                 and not (next_bar and i == pend + 1)
-                and ((pend_pair and _held_pair_rests(core, straddle, pident))
+                and ((pend_pair and _held_pair_rests(hv, straddle, pident))
                      or not np.isnan(ptrig) or not np.isnan(plim))
             ):  # fmt: skip
                 err, eb = ERR_PENDING_NEW_DAY, i
@@ -488,7 +486,7 @@ def _slots_loop(
                         high_first = _high_first(adaptive, oi, hi, li)
                         if pend >= 0 and resting and i == pend + 1 and pfrom and (
                             _held_open_in_market(
-                                core, triggers, has_trig, straddle, pside, pident, oi
+                                hv, triggers, has_trig, straddle, pside, pident, oi
                             )
                         ):  # fmt: skip
                             # The trigger is submitted at this open: at or through it is in the market.
@@ -517,7 +515,7 @@ def _slots_loop(
                                     for k in range(2):
                                         offset = 6 * k
                                         direction = 1 - 2 * k
-                                        trigger = _held_pair(core, straddle, offset, pident)
+                                        trigger = _held_pair(hv, straddle, offset, pident)
                                         if (
                                             not np.isnan(trigger)
                                             and direction * (pt - trigger) >= 0
@@ -552,7 +550,7 @@ def _slots_loop(
                                         plim if not np.isnan(plim) else px,
                                     )
                                     stop, target = _entry_resolve(
-                                        core, s_hit, anchor, px, pident, pend_pair, entry_stop,
+                                        hv, s_hit, anchor, px, pident, pend_pair, entry_stop,
                                         entry_target, stop_pts, target_pts, stop_fracs,
                                         target_fracs, straddle, has_es, has_et, has_sp, has_tp,
                                         has_sf, has_tf, tick, tick_round, combine, True,
@@ -560,7 +558,7 @@ def _slots_loop(
                                     if slip and next_open and stop_order:
                                         # Quantity is submitted against the trigger geometry, before slippage.
                                         submitted_stop, _ = _entry_resolve(
-                                            core, s_hit,
+                                            hv, s_hit,
                                             _anchor(bracket_anchor, c[d], level, level),
                                             level, pident, pend_pair, entry_stop, entry_target,
                                             stop_pts, target_pts, stop_fracs, target_fracs,
@@ -631,7 +629,7 @@ def _slots_loop(
                         and pend >= 0
                         and resting
                         and i > pend
-                        and (not np.isnan(ptrig) or (pend_pair and _held_pair_rests(core, straddle, pident)))
+                        and (not np.isnan(ptrig) or (pend_pair and _held_pair_rests(hv, straddle, pident)))
                     ):  # fmt: skip
                         # GTD next bar: an unfilled stop expires before this close's decision.
                         qmask = _sdrop(ring, qmask, pend)
@@ -648,10 +646,10 @@ def _slots_loop(
                         (ptrig if not np.isnan(ptrig) else plim) if pend >= 0 else np.nan,
                         risk_stop, cnt, out_entry_i, out_exit_i, out_side, out_entry_px,
                         out_exit_px, out_reason, out_stop,
-                        _held_pair_level(core, straddle, pident, 0, pend, i, latency)
+                        _held_pair_level(hv, straddle, pident, 0, pend, i, latency)
                         if (pend >= 0 and has_pairs)
                         else np.nan,
-                        _held_pair_level(core, straddle, pident, 6, pend, i, latency)
+                        _held_pair_level(hv, straddle, pident, 6, pend, i, latency)
                         if (pend >= 0 and has_pairs)
                         else np.nan,
                         o[i + 1] if i + 1 < n else np.nan,
@@ -660,7 +658,7 @@ def _slots_loop(
                         halt = True
                         break
                     # The decision just published is read back from the scratch.
-                    cur = _held_ident(core, i)
+                    cur = _held_ident(hv, i)
                     s = int(side_sig[at])
                     xg, xl, xs = _exit_flags(
                         exit_sig, long_exits, short_exits, at, has_exit, has_long, has_short
@@ -670,7 +668,7 @@ def _slots_loop(
                     cur_pair = (
                         has_pairs
                         and _pair_possible(pair_masks, event_stored, cur)
-                        and _held_pair_any(core, straddle, cur)
+                        and _held_pair_any(hv, straddle, cur)
                     )
                 if (
                     pos == 0
@@ -753,14 +751,14 @@ def _slots_loop(
                     if (
                         not be_done
                         and has_ba
-                        and not np.isnan(_held_level(core, ba, gident, 8, np.nan))
+                        and not np.isnan(_held_level(hv, ba, gident, 8, np.nan))
                     ):
-                        ba_gen = _held_level(core, ba, gident, 8, np.nan)
+                        ba_gen = _held_level(hv, ba, gident, 8, np.nan)
                         reached = hi >= ep + ba_gen if pos > 0 else li <= ep - ba_gen
                         if reached:
                             if not np.isnan(update):
                                 error = ERR_AMEND_REJECTED
-                            bo_gen = _held_level(core, bo, gident, 9, np.nan) if has_bo else np.nan
+                            bo_gen = _held_level(hv, bo, gident, 9, np.nan) if has_bo else np.nan
                             update = ep + pos * (0.0 if np.isnan(bo_gen) else bo_gen)
                             be_done = True
                     if not np.isnan(update):
@@ -835,7 +833,7 @@ def _slots_loop(
                     and (reenter or not exited)
                 ):
                     cur_ioc = (
-                        not np.isnan(_held_level(core, ioc_limits, cur, 10, np.nan))
+                        not np.isnan(_held_level(hv, ioc_limits, cur, 10, np.nan))
                         if has_ioc
                         else False
                     )
@@ -853,14 +851,14 @@ def _slots_loop(
                         error = ERR_REARM_BEFORE_CLOSE
                     pend, pident = i, cur
                     pside, ptrig, plim, pend_pair, pfrom = _pend_load(
-                        core, cur, side_sig, triggers, entry_limit, from_open, straddle,
+                        hv, cur, side_sig, triggers, entry_limit, from_open, straddle,
                         has_trig, has_limit, has_from, has_pairs,
                     )  # fmt: skip
                     if cur_pair or cur_ioc:
                         due = i + latency + 1
                         if due >= n or (
                             not cross_session
-                            and not (next_bar and cur_pair and _held_stop_pair(core, straddle, cur))
+                            and not (next_bar and cur_pair and _held_stop_pair(hv, straddle, cur))
                             and _any_in(new_day, i + 1, due + 1)
                         ):
                             error = ERR_NEXT_OPEN_SESSION_END
@@ -885,11 +883,11 @@ def _slots_loop(
                 if next_open and exit_now and pos != 0 and reenter and s != 0 and pend < 0:
                     pend, pident = i, cur
                     pside, ptrig, plim, pend_pair, pfrom = _pend_load(
-                        core, cur, side_sig, triggers, entry_limit, from_open, straddle,
+                        hv, cur, side_sig, triggers, entry_limit, from_open, straddle,
                         has_trig, has_limit, has_from, has_pairs,
                     )  # fmt: skip
                     cur_ioc = (
-                        not np.isnan(_held_level(core, ioc_limits, cur, 10, np.nan))
+                        not np.isnan(_held_level(hv, ioc_limits, cur, 10, np.nan))
                         if has_ioc
                         else False
                     )
@@ -908,7 +906,7 @@ def _slots_loop(
                     new_day,
                     cross_session,
                     next_bar,
-                    core,
+                    hv,
                     triggers,
                     has_trig,
                     straddle,
@@ -929,7 +927,7 @@ def _slots_loop(
                         continue
                     pend, pident, kind = d, dident, _SLOT_SUBMIT
                     pside, ptrig, plim, pend_pair, pfrom = _pend_load(
-                        core, dident, side_sig, triggers, entry_limit, from_open, straddle,
+                        hv, dident, side_sig, triggers, entry_limit, from_open, straddle,
                         has_trig, has_limit, has_from, has_pairs,
                     )  # fmt: skip
                 if kind == _SLOT_SUBMIT and pend == d:
@@ -937,13 +935,13 @@ def _slots_loop(
                         due = d + latency + 1
                         if due >= n or (
                             not cross_session
-                            and not (next_bar and _held_stop_pair(core, straddle, dident))
+                            and not (next_bar and _held_stop_pair(hv, straddle, dident))
                             and _any_in(new_day, d + 1, due + 1)
                         ):
                             error = ERR_NEXT_OPEN_SESSION_END
                             continue
-                        long_trigger = _held_pair(core, straddle, 0, dident)
-                        short_trigger = _held_pair(core, straddle, 6, dident)
+                        long_trigger = _held_pair(hv, straddle, 0, dident)
+                        short_trigger = _held_pair(hv, straddle, 6, dident)
                         if (
                             not (phase == 0 and next_open)
                             and not pfrom
@@ -962,8 +960,8 @@ def _slots_loop(
                         else:
                             resting = True
                             if not (
-                                np.isnan(_held_pair(core, straddle, 1, dident))
-                                and np.isnan(_held_pair(core, straddle, 7, dident))
+                                np.isnan(_held_pair(hv, straddle, 1, dident))
+                                and np.isnan(_held_pair(hv, straddle, 7, dident))
                             ):
                                 qmask, qseq, ok = _spush(
                                     ring, qmask, qseq, d + latency + 1, _SLOT_PAIR_IOC, d, dident,
@@ -972,7 +970,7 @@ def _slots_loop(
                                 ovf = ovf or not ok
                         continue
                     fs = pside
-                    cap = _held_level(core, ioc_limits, dident, 10, np.nan) if has_ioc else np.nan
+                    cap = _held_level(hv, ioc_limits, dident, 10, np.nan) if has_ioc else np.nan
                     if not np.isnan(cap) and fs * (cx - cap) > 0:
                         pend, resting, chasing, closing = unset, False, False, False
                         continue
@@ -1003,8 +1001,8 @@ def _slots_loop(
                         for k in range(2):
                             offset = 6 * k
                             direction = 1 - 2 * k
-                            trigger = _held_pair(core, straddle, offset, dident)
-                            cap = _held_pair(core, straddle, offset + 1, dident)
+                            trigger = _held_pair(hv, straddle, offset, dident)
+                            cap = _held_pair(hv, straddle, offset + 1, dident)
                             if not np.isnan(trigger) and direction * (cx - trigger) >= 0:
                                 break
                             if not np.isnan(cap) and direction * (cx - cap) <= 0:
@@ -1014,8 +1012,8 @@ def _slots_loop(
                         anchor = _anchor(bracket_anchor, c[d], px, px)
                         if (
                             fs == 0
-                            and np.isnan(_held_pair(core, straddle, 0, dident))
-                            and np.isnan(_held_pair(core, straddle, 6, dident))
+                            and np.isnan(_held_pair(hv, straddle, 0, dident))
+                            and np.isnan(_held_pair(hv, straddle, 6, dident))
                         ):
                             pend, resting = unset, False
                 elif kind == _SLOT_CHASE and pend == d:
@@ -1031,7 +1029,7 @@ def _slots_loop(
                         busy = False
                     pos, ei, ep, gen, gident = fs, i, px, d, dident
                     stop, target = _entry_resolve(
-                        core, fs, anchor, px, dident, dpair, entry_stop, entry_target, stop_pts,
+                        hv, fs, anchor, px, dident, dpair, entry_stop, entry_target, stop_pts,
                         target_pts, stop_fracs, target_fracs, straddle, has_es, has_et, has_sp,
                         has_tp, has_sf, has_tf, tick, tick_round, combine, True,
                     )  # fmt: skip
@@ -1145,7 +1143,7 @@ def _slots_loop(
                     new_day,
                     cross_session,
                     next_bar,
-                    core,
+                    hv,
                     triggers,
                     has_trig,
                     straddle,

@@ -23,6 +23,8 @@ stays under 24; ``SCAP`` is 32. A full ring is a refusal (``ERR_RING_OVERFLOW``)
 
 from __future__ import annotations
 
+from collections import namedtuple
+
 import numba as nb
 import numpy as np
 from numba.extending import overload
@@ -162,6 +164,31 @@ def _pair_possible(masks, stored, ident):
     return not stored or (ident >= 0 and (masks[ident] & PAIR_BITS) != 0)
 
 
+HeldView = namedtuple("HeldView", "event_mode level_rows ev_val field_rows event_state")
+
+
+def _held_view(core):
+    """The few context arrays the held-decision readers touch. Passing this to a plain call
+    copies five references; passing ``core`` copies every field of the context (28 atomic
+    refcount pairs per call site), which dominated the slots loop's compile and run time."""
+    return (
+        None
+        if core is None
+        else HeldView(
+            core.event_mode, core.level_rows, core.ev_val, core.field_rows, core.event_state
+        )
+    )
+
+
+@overload(_held_view, inline="always")
+def _held_view_type(core):
+    if isinstance(core, nb.types.NoneType):
+        return lambda core: None
+    return lambda core: HeldView(
+        core.event_mode, core.level_rows, core.ev_val, core.field_rows, core.event_state
+    )
+
+
 def _pair_cols(pair):
     """Columns of a straddle block: zero for an absent (None or ``(12, 0)``) one."""
     return 0 if pair is None else pair.shape[1]
@@ -174,92 +201,94 @@ def _pair_cols_type(pair):
     return lambda pair: pair.shape[1]
 
 
-def _held_pair(core, pair, leg, ident):
+def _held_pair(view, pair, leg, ident):
     """Leg ``leg`` of the straddle block of the held decision ``ident``; NaN when it has none."""
     if pair is None:
         return np.nan
-    if core is None or core.event_mode != 2:
+    if view is None or view.event_mode != 2:
         return pair[leg, ident] if 0 <= ident < pair.shape[1] else np.nan
-    row = core.level_rows[11 + leg]
-    return core.ev_val[ident, row] if ident >= 0 and row >= 0 else np.nan
+    row = view.level_rows[11 + leg]
+    return view.ev_val[ident, row] if ident >= 0 and row >= 0 else np.nan
 
 
 @overload(_held_pair, inline="always")
-def _held_pair_type(core, pair, leg, ident):
+def _held_pair_type(view, pair, leg, ident):
     if isinstance(pair, nb.types.NoneType):
-        return lambda core, pair, leg, ident: np.nan
-    if isinstance(core, nb.types.NoneType):
-        return lambda core, pair, leg, ident: pair[leg, ident] if ident < pair.shape[1] else np.nan
+        return lambda view, pair, leg, ident: np.nan
+    if isinstance(view, nb.types.NoneType):
+        return lambda view, pair, leg, ident: pair[leg, ident] if ident < pair.shape[1] else np.nan
 
-    def event(core, pair, leg, ident):
-        if core.event_mode != 2:
+    def event(view, pair, leg, ident):
+        if view.event_mode != 2:
             return pair[leg, ident] if 0 <= ident < pair.shape[1] else np.nan
-        row = core.level_rows[11 + leg]
-        return core.ev_val[ident, row] if ident >= 0 and row >= 0 else np.nan
+        row = view.level_rows[11 + leg]
+        return view.ev_val[ident, row] if ident >= 0 and row >= 0 else np.nan
 
     return event
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_pair_any(core, pair, ident):
+def _held_pair_any(view, pair, ident):
     """The held decision carries a straddle: any leg present (a plain call; only declared pairs)."""
     for leg in range(12):
-        if not np.isnan(_held_pair(core, pair, leg, ident)):
+        if not np.isnan(_held_pair(view, pair, leg, ident)):
             return True
     return False
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_pair_rests(core, pair, ident):
+def _held_pair_rests(view, pair, ident):
     """A DAY stop leg rests; an IOC-only pair attempts once and never crosses a session."""
-    return _held_pair_any(core, pair, ident) and not (
-        np.isnan(_held_pair(core, pair, 0, ident)) and np.isnan(_held_pair(core, pair, 6, ident))
+    return _held_pair_any(view, pair, ident) and not (
+        np.isnan(_held_pair(view, pair, 0, ident)) and np.isnan(_held_pair(view, pair, 6, ident))
     )
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_stop_pair(core, pair, ident):
+def _held_stop_pair(view, pair, ident):
     """A pair whose legs are all resting stops (no IOC leg attempts at an open)."""
     return (
-        _held_pair_rests(core, pair, ident)
-        and np.isnan(_held_pair(core, pair, 1, ident))
-        and np.isnan(_held_pair(core, pair, 7, ident))
+        _held_pair_rests(view, pair, ident)
+        and np.isnan(_held_pair(view, pair, 1, ident))
+        and np.isnan(_held_pair(view, pair, 7, ident))
     )
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_pair_level(core, pair, ident, offset, d, bar, latency):
+def _held_pair_level(view, pair, ident, offset, d, bar, latency):
     """The working level the strategy sees for one pair side: the stop leg, or the IOC cap while
     its attempt is still ahead (decision ``d``, observed at ``bar``)."""
-    value = _held_pair(core, pair, offset, ident)
+    value = _held_pair(view, pair, offset, ident)
     if not np.isnan(value):
         return value
-    return _held_pair(core, pair, offset + 1, ident) if bar < d + latency + 1 else np.nan
+    return _held_pair(view, pair, offset + 1, ident) if bar < d + latency + 1 else np.nan
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_open_in_market(core, triggers, has_trigger, pair, side, ident, opening):
+def _held_open_in_market(view, triggers, has_trigger, pair, side, ident, opening):
     """An open-relative trigger at or through its own activation open."""
-    if _held_pair_any(core, pair, ident):
-        long_stop = _held_pair(core, pair, 0, ident)
-        short_stop = _held_pair(core, pair, 6, ident)
+    if _held_pair_any(view, pair, ident):
+        long_stop = _held_pair(view, pair, 0, ident)
+        short_stop = _held_pair(view, pair, 6, ident)
         return (not np.isnan(long_stop) and opening >= long_stop) or (
             not np.isnan(short_stop) and opening <= short_stop
         )
-    trigger = _held_level(core, triggers, ident, 5, np.nan) if has_trigger else np.nan
+    trigger = _held_level(view, triggers, ident, 5, np.nan) if has_trigger else np.nan
     return _in_market(-side, trigger, opening, True)
 
 
 @nb.njit(cache=True, nogil=True)
-def _held_lifetime_crosses(core, next_bar, kind, ident, triggers, has_trigger, pair):
+def _held_lifetime_crosses(view, next_bar, kind, ident, triggers, has_trigger, pair):
     """order_lifetime=next_bar: a stop submission may reach the next session's bar."""
     if not (next_bar and (kind == _SLOT_SUBMIT or kind == _SLOT_REPLACE)):
         return False
-    trigger = _held_level(core, triggers, ident, 5, np.nan) if has_trigger else np.nan
-    return not np.isnan(trigger) or _held_stop_pair(core, pair, ident)
+    trigger = _held_level(view, triggers, ident, 5, np.nan) if has_trigger else np.nan
+    return not np.isnan(trigger) or _held_stop_pair(view, pair, ident)
 
 
 __all__ = [
+    "HeldView",
+    "_held_view",
     "RING_ROWS",
     "RW_D",
     "RW_DUE",
