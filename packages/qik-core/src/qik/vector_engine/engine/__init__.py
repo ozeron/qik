@@ -58,6 +58,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from qik._cache_identity import machine_cache_root, source_material, static_sources
+
 _ENGINE_DIR = Path(__file__).resolve().parent
 # Dependency order. ``fingerprint`` keys off these names, so a new engine module must join
 # both this tuple and ``ENGINE_MODULES`` below.
@@ -104,7 +106,7 @@ _throwaway: tuple[str, str] | None = None
 
 
 def fingerprint(*extra: Any) -> str:
-    """Content identity of the engine: a source change anywhere invalidates it.
+    """Semantic identity of the engine's transitive module closure.
 
     ``extra`` modules (a strategy) extend the identity to their own source and to the source of
     every first-party module their compiled code can reach (``reach.closure_digest``): an edited
@@ -121,12 +123,18 @@ def fingerprint(*extra: Any) -> str:
 def _engine_files() -> tuple[Path, ...]:
     """The source files compiled code in this package can see, named from the ``qik`` root."""
     package = _ENGINE_DIR.parent
-    return (
+    seeds = (
         _ENGINE_DIR / "__init__.py",
         *(_ENGINE_DIR / f"{name}.py" for name in _ENGINE_MODULE_NAMES),
         *(package / f"{name}.py" for name in SHARED_MODULES),
-        *(package / f"{name}.py" for name in EMITTER_MODULES),
+        *(package / f"{name}.py" for name in (*EMITTER_MODULES, "schema", "_numba_patches")),
     )
+    qik = package.parent
+    roots = tuple(
+        ".".join(("qik", *path.relative_to(qik).with_suffix("").parts)).removesuffix(".__init__")
+        for path in seeds
+    )
+    return tuple(static_sources(qik, roots))
 
 
 def _digest() -> str:
@@ -139,11 +147,7 @@ def _digest() -> str:
     global _engine_digest
     if _engine_digest is None:
         qik = _ENGINE_DIR.parent.parent
-        digest = hashlib.sha256()
-        for path in _engine_files():
-            digest.update(path.relative_to(qik).as_posix().encode())
-            digest.update(path.read_bytes())
-        _engine_digest = digest.hexdigest()
+        _engine_digest = hashlib.sha256(source_material(qik, _engine_files())).hexdigest()
     return _engine_digest
 
 
@@ -223,7 +227,20 @@ class EngineCacheLocator:
 
     @classmethod
     def from_function(cls, py_func: Any, py_file: str) -> Any:
-        if _ENGINE_DIR not in Path(py_file).resolve().parents:
+        path = Path(py_file).resolve()
+        generated = Path(
+            os.environ.get("QIK_VECTOR_CACHE", Path.home() / ".cache/qik/vector_engine")
+        ).resolve()
+        if path.parent == generated and path.stem.startswith("_qik_fixed_"):
+            if path.stem != f"_qik_fixed_{hashlib.sha256(path.read_bytes()).hexdigest()[:24]}":
+                return _ThrowawayLocator(py_func, py_file)
+            locator = _FixedCacheLocator(py_func, py_file)
+            try:
+                locator.ensure_cache_path()
+            except OSError:
+                return _ThrowawayLocator(py_func, py_file)
+            return locator
+        if _ENGINE_DIR not in path.parents:
             return None
         for variant in _content_variants:
             locator = variant.from_function(py_func, py_file)
@@ -235,14 +252,48 @@ class EngineCacheLocator:
         return _ThrowawayLocator(py_func, py_file)
 
 
+class _FixedCacheLocator:
+    """Bare processes share the fixed ABI warmed by the test runtime, with the same flags.
+
+    The locator belongs to the engine because a fresh child need not load conftest or
+    sitecustomize. Deferring generated modules to Numba's default locator would select
+    a different directory and recompile every fixed function despite an equal fingerprint.
+    """
+
+    def __init__(self, py_func: Any, py_file: str) -> None:
+        self._name = py_func.__qualname__
+        self._cache_path = machine_cache_root() / "qik-engine" / fingerprint()[:24] / "fixed"
+
+    def ensure_cache_path(self) -> None:
+        self._cache_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=self._cache_path):
+            pass
+
+    def get_cache_path(self) -> str:
+        return str(self._cache_path)
+
+    def get_source_stamp(self) -> str:
+        return fingerprint()
+
+    def get_disambiguator(self) -> str:
+        return self._name
+
+
 def _content_locator(base: Any) -> Any:
     """``base``, with the engine's content standing in for the defining file's mtime and size."""
 
     class ContentLocator(base):  # type: ignore[misc, valid-type]
         _qik_engine = True
 
+        def __init__(self, py_func: Any, py_file: str) -> None:
+            super().__init__(py_func, py_file)
+            self._function_name = py_func.__qualname__
+
         def get_source_stamp(self) -> str:
             return fingerprint()
+
+        def get_disambiguator(self) -> str:
+            return self._function_name
 
     ContentLocator.__name__ = ContentLocator.__qualname__ = f"Engine{base.__name__}"
     return ContentLocator
