@@ -77,6 +77,12 @@ _ENGINE_MODULE_NAMES = (
 )
 # Modules outside this package whose source the matchers bind.
 SHARED_MODULES = ("compiled", "protection", "account", "straddle", "types")
+# Modules that emit or shape the compiled engine without being imported by it: ``codegen`` writes
+# the generated module (the loops' source, the pointer table and the publisher), ``fixed`` its
+# transport and the callback module, ``kernel`` the names the generated imports are drawn from.
+# They key the cache and the freeze/battery identity like the matchers do, so an edit to what is
+# emitted cannot be served from an engine compiled before it.
+EMITTER_MODULES = ("codegen", "fixed", "kernel")
 # Names the facade re-binds under another identifier: alias -> (module, attribute).
 _ALIASES = {"_contracts_for": ("account", "quantity")}
 
@@ -115,6 +121,7 @@ def _engine_files() -> tuple[Path, ...]:
         _ENGINE_DIR / "__init__.py",
         *(_ENGINE_DIR / f"{name}.py" for name in _ENGINE_MODULE_NAMES),
         *(package / f"{name}.py" for name in SHARED_MODULES),
+        *(package / f"{name}.py" for name in EMITTER_MODULES),
     )
 
 
