@@ -57,7 +57,11 @@ def quantity(
         n = max(min_qty, n)
     if n < min_qty - 1e-10:
         return float(-ERR_ZERO)
-    if check_cash and n * (notional_per_unit + entry_cost_per_unit) > equity:
+    # Relative slack absorbs float rounding of an exact decimal cost (3 x 100.01 is
+    # 300.03000000000003); a real shortfall of a cent on any balance is still refused.
+    if check_cash and n * (notional_per_unit + entry_cost_per_unit) > equity + 1e-12 * max(
+        abs(equity), 1.0
+    ):
         return float(-ERR_UNAFFORDABLE)
     return n
 

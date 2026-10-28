@@ -288,6 +288,17 @@ def test_loss_then_next_entry_keeps_the_notional_and_the_cash_boundary_is_exact(
     both(rows, attempts, O.Rule(cash=11_081.0, **{**base, "affordability": "unchecked"}))
 
 
+def test_a_decimal_cost_equal_to_the_cash_is_affordable_and_a_cent_short_is_not() -> None:
+    """3 x 100.01 = 300.03 exactly, though float64 gives 300.03000000000003 (review r1)."""
+    rows: Rows = [(100.01, 100.01, 100.01, 100.01)] * 4
+    attempts = [O.Attempt(0, exit_bar=2)]
+    base = {"notional": 300.03, "affordability": "refuse"}
+    ok = both(rows, attempts, O.Rule(cash=300.03, **base))
+    assert [float(c.qty) for c in ok.closed] == [3]
+    short = both(rows, attempts, O.Rule(cash=300.02, **base))
+    assert short.refused is not None and short.refused.why == "unaffordable"
+
+
 def test_open_terminal_position_is_sized_from_its_entry_and_marked_at_the_last_close() -> None:
     rows: Rows = [
         (100.0, 100.0, 100.0, 100.0),
@@ -522,9 +533,12 @@ def test_existing_modes_are_bit_identical_to_the_pre_change_rule_and_the_referen
     specials = [math.nan, math.inf, -math.inf, 0.0, -1.0, 1e-12, 1e18]
     for _ in range(4000):
         mode = int(rng.integers(0, 3))
-        pick = lambda: (
-            float(rng.choice(specials)) if rng.random() < 0.2 else float(rng.uniform(0.01, 500))
-        )  # noqa: E731
+
+        def pick() -> float:
+            if rng.random() < 0.2:
+                return float(rng.choice(specials))
+            return float(rng.uniform(0.01, 500))
+
         args = (
             mode,
             pick(),
