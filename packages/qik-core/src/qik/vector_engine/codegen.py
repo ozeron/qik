@@ -155,27 +155,30 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                 return node
 
         DecisionInputs().visit(decision)
-        decision.body[0:0] = ast.parse(
-            "\n".join(f"_decision_{name} = core.{name}" for name in attributes)
-        ).body
+        publisher = _outlined_publisher(decision, attributes)
+        decision = _publisher_call(decision, publisher.name)
+        rare_decision = copy.deepcopy(decision)
+        rare_decision.name = "_core_decision_rare"
+    else:
+        # The book loop publishes at three points: the per-bar site calls ``_core_decision``, the
+        # two rare ones (a chase cancellation, a resting entry's fill) ``_core_decision_rare``.
+        # The typed module outlines the rare name so the publisher is expanded once, not three
+        # times; the undecorated Python module simply binds it to its own copy.
+        rare_decision = copy.deepcopy(decision)
+        rare_decision.name = "_core_decision_rare"
+        for decorator in rare_decision.decorator_list:
+            assert isinstance(decorator, ast.Call)
+            for keyword in decorator.keywords:
+                if keyword.arg == "inline":
+                    keyword.value = ast.Constant("never")
+            decorator.keywords += [
+                ast.keyword("no_cpython_wrapper", ast.Constant(True)),
+                ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
+            ]
     functions: list[ast.stmt] = [decision] if callback else [adapter, decision]
-    if field_writer is not None:
-        functions.insert(0, field_writer)
-    # The book loop publishes at three points: the per-bar site calls ``_core_decision``, the
-    # two rare ones (a chase cancellation, a resting entry's fill) ``_core_decision_rare``. The
-    # fixed module outlines the rare name so the publisher is expanded once, not three times;
-    # the undecorated Python module simply binds it to its own copy.
-    rare_decision = copy.deepcopy(decision)
-    rare_decision.name = "_core_decision_rare"
-    for decorator in rare_decision.decorator_list:
-        assert isinstance(decorator, ast.Call)
-        for keyword in decorator.keywords:
-            if keyword.arg == "inline":
-                keyword.value = ast.Constant("never")
-        decorator.keywords += [
-            ast.keyword("no_cpython_wrapper", ast.Constant(True)),
-            ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
-        ]
+    if callback:
+        assert field_writer is not None
+        functions[0:0] = [field_writer, _table_function()[0], publisher]
     functions.append(rare_decision)
     # The loops own their callback sites and retained-row reads, so they are emitted as written.
     for module, name in (
@@ -187,6 +190,9 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
     ):
         node = source(getattr(module, name))
         BindGlobals().visit(node)
+        if callback and name in ("_book_loop", "_slots_loop"):
+            # The publisher reads its context from the table; fill it once the column's arrays exist.
+            node.body.insert(1, _table_function()[1])
         if callback:
             # Only invoke crosses the Python boundary. Internal wide-context
             # wrappers are unused and dominate cold compilation.
@@ -238,13 +244,7 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                         isinstance(target, ast.Name) and target.id == "core"
                         for target in statement.targets
                     ):
-                        setup = ast.parse("""
-context = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
-                    feats[0].ctypes.data, feats[1].ctypes.data,
-                    o.ctypes.data, h.ctypes.data, lo.ctypes.data, c.ctypes.data,
-                    volume.ctypes.data, view.ctypes.data, decision.ctypes.data, n, account.ctypes.data], dtype=np.int64)
-""").body[0]
-                        node.body.insert(index, setup)
+                        node.body[index:index] = ast.parse(_CONTEXT_SOURCE).body
                         assert isinstance(statement.value, ast.Call)
                         statement.value.args[3] = ast.Name("context", ast.Load())
                         break
@@ -305,6 +305,176 @@ context = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
     if not destination.exists() or destination.read_text() != text:
         destination.write_text(text)
 
+
+# The fixed engine publishes every close decision through one outlined function. Handing it the
+# context by value copied ~28 array references per call (atomic refcounts), a fifth of a bar; so
+# each loop writes the address of every array the publisher touches, and the lengths it reads, into
+# the int64 table that already carries the callback's pointers (``core.feats`` in this build; the
+# runner sizes it and fills slots 0-12, which ``fixed``'s callback reads), and the publisher
+# rebuilds borrowed views from it.
+_CALLBACK_SLOTS = 13
+_TABLE_SIZE = 80
+# core attribute -> dtype, for the one-dimensional arrays; the length is stored beside the address.
+_BORROWED_VECTORS = (
+    ("sides", "np.int8"),
+    ("exits", "np.bool_"),
+    ("long_exits", "np.bool_"),
+    ("short_exits", "np.bool_"),
+    ("force_close", "np.int8"),
+    ("force_open", "np.int64"),
+    ("days", "np.bool_"),
+    ("ends", "np.bool_"),
+    ("economic", "np.float64"),
+    ("sizing_risks", "np.float64"),
+    ("ev_count", "np.int64"),
+    ("ev_bar", "np.int64"),
+    ("ev_mask", "np.int64"),
+    ("event_state", "np.int64"),
+    ("field_rows", "np.int64"),
+    ("level_rows", "np.int64"),
+    ("pair_scratch", "np.float64"),
+    ("leg_scratch", "np.float64"),
+)  # fmt: skip
+# The two-dimensional ones; both extents are stored.
+_BORROWED_MATRICES = (
+    ("levels", "np.float64"),
+    ("ev_val", "np.float64"),
+    ("masks", "np.int8"),
+)
+# The trade columns the publisher settles, in the matcher's order (``compiled._Buffers.take``).
+_BORROWED_TRADES = (
+    ("out_ei", "out_entry_i", "np.int64"), ("out_xi", "out_exit_i", "np.int64"),
+    ("out_sd", "out_side", "np.int8"), ("out_ep", "out_entry_px", "np.float64"),
+    ("out_xp", "out_exit_px", "np.float64"), ("out_why", "out_reason", "np.int8"),
+    ("out_st", "out_stop", "np.float64"),
+)  # fmt: skip
+# The context arrays the first 13 slots already carry, rebuilt where the publisher reads them.
+_CALLBACK_ARRAYS = {
+    "account": "nb.carray(_pointer(ptrs[12]), 6, dtype=np.float64)",
+    "position_view": "nb.carray(_pointer(ptrs[9]), 14, dtype=np.float64)",
+    "decision": "nb.carray(_pointer(ptrs[10]), 31, dtype=np.float64)",
+    "volume": "nb.carray(_pointer(ptrs[8]), ptrs[11], dtype=np.float64)",
+    "feats": "ptrs",
+}
+# Scalars the publisher reads from the context: passed as arguments, not through the table.
+_PUBLISHED_SCALARS = (
+    "tick", "rounding", "flatten_mode", "boundary", "exit_next_open", "pair_rules", "event_mode",
+)  # fmt: skip
+
+
+def _borrowed_table() -> tuple[list[str], dict[str, str]]:
+    """What ``_fill_table`` stores in each slot from 13, and the publisher's rebuild of each name."""
+    slots: list[str] = []
+    rebuild = dict(_CALLBACK_ARRAYS)
+
+    def slot() -> int:
+        return _CALLBACK_SLOTS + len(slots)
+
+    for name, dtype in _BORROWED_VECTORS:
+        k = slot()
+        slots += [f"core.{name}.ctypes.data", f"len(core.{name})"]
+        rebuild[name] = f"nb.carray(_pointer(ptrs[{k}]), ptrs[{k + 1}], dtype={dtype})"
+    for name, dtype in _BORROWED_MATRICES:
+        k = slot()
+        slots += [f"core.{name}.ctypes.data", f"core.{name}.shape[0]", f"core.{name}.shape[1]"]
+        rebuild[name] = (
+            f"nb.carray(_pointer(ptrs[{k}]), (ptrs[{k + 1}], ptrs[{k + 2}]), dtype={dtype})"
+        )
+    k = slot()
+    slots += [f"core.layout[{q}]" for q in range(6)]
+    rebuild["layout"] = "(" + ", ".join(f"ptrs[{k + q}]" for q in range(6)) + ")"
+    length = slot()
+    slots.append(f"len({_BORROWED_TRADES[0][1]})")
+    for name, argument, dtype in _BORROWED_TRADES:
+        k = slot()
+        slots.append(f"{argument}.ctypes.data")
+        rebuild[name] = f"nb.carray(_pointer(ptrs[{k}]), ptrs[{length}], dtype={dtype})"
+    assert _CALLBACK_SLOTS + len(slots) <= _TABLE_SIZE
+    return slots, rebuild
+
+
+def _table_function() -> tuple[ast.FunctionDef, ast.stmt]:
+    """``_fill_table``, a plain call run once per column at a loop's entry, and its call."""
+    slots, _ = _borrowed_table()
+    arguments = ", ".join(argument for _, argument, _ in _BORROWED_TRADES)
+    lines = [
+        "@nb.njit(cache=True, no_cpython_wrapper=True, no_cfunc_wrapper=True)",
+        f"def _fill_table(core, {arguments}):",
+        "    ptrs = core.feats",
+        *[f"    ptrs[{_CALLBACK_SLOTS + k}] = {expression}" for k, expression in enumerate(slots)],
+    ]
+    function = _parse_function("\n".join(lines))
+    return function, ast.parse(f"_fill_table(core, {arguments})").body[0]
+
+
+def _parse_function(source: str) -> ast.FunctionDef:
+    function = ast.parse(source).body[0]
+    assert isinstance(function, ast.FunctionDef)
+    return function
+
+
+def _decision_scalars(decision: ast.FunctionDef) -> list[str]:
+    """The decision's scalar parameters: not the context, the bar (unread by the callback) or the
+    trade columns."""
+    skipped = {"core", "o", "h", "lo", "c"} | {name for name, _, _ in _BORROWED_TRADES}
+    return [arg.arg for arg in decision.args.args if arg.arg not in skipped]
+
+
+def _outlined_publisher(decision: ast.FunctionDef, attributes: list[str]) -> ast.FunctionDef:
+    """``decision`` as a plain call that reads the context from the pointer table.
+
+    Its parameters are the decision's own scalars, the callback and the table; the trade columns
+    and every context array are rebuilt from the table, so a call passes no array reference.
+    """
+    _, rebuild = _borrowed_table()
+    publisher = copy.deepcopy(decision)
+    publisher.name = "_publish_decision"
+    scalars = _decision_scalars(decision)
+    stub = _parse_function(
+        f"@nb.njit(cache=True, no_cpython_wrapper=True, no_cfunc_wrapper=True)\n"
+        f"def f(step, ptrs, {', '.join(scalars + list(_PUBLISHED_SCALARS))}): pass"
+    )
+    publisher.args = stub.args
+    publisher.decorator_list = stub.decorator_list
+    prologue: list[str] = []
+    for name in attributes:
+        if name in _PUBLISHED_SCALARS:
+            prologue.append(f"_decision_{name} = {name}")
+        elif name == "step":
+            prologue.append("_decision_step = step")
+        else:
+            prologue.append(f"_decision_{name} = {rebuild[name]}")
+    prologue += [f"{name} = {rebuild[name]}" for name, _, _ in _BORROWED_TRADES]
+    publisher.body[0:0] = ast.parse("\n".join(prologue)).body
+    unseen = {
+        node.id
+        for node in ast.walk(publisher)
+        if isinstance(node, ast.Name) and node.id in {"core", "o", "h", "lo", "c"}
+    }
+    assert not unseen, f"the callback publisher still reads {sorted(unseen)}"
+    return publisher
+
+
+def _publisher_call(decision: ast.FunctionDef, publisher: str) -> ast.FunctionDef:
+    """The inlined face of the publisher: the loops' call signature, one plain call behind it."""
+    scalars = _decision_scalars(decision)
+    call = ast.parse(
+        f"return {publisher}(core.step, core.feats, "
+        + ", ".join(scalars + [f"core.{name}" for name in _PUBLISHED_SCALARS])
+        + ")"
+    ).body
+    wrapper = copy.deepcopy(decision)
+    wrapper.body = call
+    return wrapper
+
+
+_CONTEXT_SOURCE = f"""
+context = np.zeros({_TABLE_SIZE}, np.int64)
+context[:{_CALLBACK_SLOTS}] = np.array([init_state[j].ctypes.data, params_grid[j].ctypes.data,
+                    feats[0].ctypes.data, feats[1].ctypes.data,
+                    o.ctypes.data, h.ctypes.data, lo.ctypes.data, c.ctypes.data,
+                    volume.ctypes.data, view.ctypes.data, decision.ctypes.data, n, account.ctypes.data], dtype=np.int64)
+"""
 
 # Scheduler and typed Decision transport; matcher bodies come from kernel above.
 _ADAPTER_SOURCE = """@nb.njit(cache=True)
