@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import numba as nb
-import numpy as np
 
 
 @nb.njit(cache=True, nogil=True)
@@ -90,56 +89,6 @@ def _venue_record(
         out_reason[k], out_stop[k] = why, stop
 
 
-@nb.njit(cache=True, nogil=True)
-def _venue_peek(
-    count_only,
-    k,
-    out_entry_i,
-    out_exit_i,
-    out_side,
-    out_entry_px,
-    out_exit_px,
-    out_reason,
-    out_stop,
-):
-    """Row ``k`` as ``_venue_record`` would overwrite it (zeros where it would skip the write)."""
-    if not count_only and k < len(out_entry_i):
-        return (
-            np.int64(out_entry_i[k]),
-            np.int64(out_exit_i[k]),
-            np.int64(out_side[k]),
-            np.float64(out_entry_px[k]),
-            np.float64(out_exit_px[k]),
-            np.int64(out_reason[k]),
-            np.float64(out_stop[k]),
-        )
-    return (np.int64(0), np.int64(0), np.int64(0), 0.0, 0.0, np.int64(0), 0.0)
-
-
-@nb.njit(cache=True, nogil=True)
-def _venue_unrecord(
-    count_only,
-    k,
-    prior,
-    out_entry_i,
-    out_exit_i,
-    out_side,
-    out_entry_px,
-    out_exit_px,
-    out_reason,
-    out_stop,
-):
-    """Put back the row ``_venue_peek`` read, so a refused bar leaves nothing past the count.
-
-    Both helpers are plain calls: with ``inline="always"`` into the venue's inlined bar step,
-    numba compiles this restore to a no-op.
-    """
-    if not count_only and k < len(out_entry_i):
-        out_entry_i[k], out_exit_i[k], out_side[k] = prior[0], prior[1], prior[2]
-        out_entry_px[k], out_exit_px[k] = prior[3], prior[4]
-        out_reason[k], out_stop[k] = prior[5], prior[6]
-
-
 __all__ = [
     "_cancel_entry_commands",
     "_day_entry_expires",
@@ -148,7 +97,5 @@ __all__ = [
     "_high_first",
     "_no_reversal",
     "_target_fill_price",
-    "_venue_peek",
     "_venue_record",
-    "_venue_unrecord",
 ]

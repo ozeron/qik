@@ -1,9 +1,15 @@
-"""The unified matcher (single-matcher plan, stage 2): one flat, event-gated loop.
+"""The unified matcher (single-matcher plan, stages 2 and 3): one flat, event-gated loop.
 
-Single-route semantics, and the production single path: ``single._column`` routes a column here
-unless latency, or ONE_TICK without next-open entries, sends it to the venue matcher (R15). The
-loop takes the numeric ABI of the old matcher (``legacy.single._column``, the test oracle) and
-returns the same seven-field result, with or without a strategy callback.
+Two arms, picked by the route word ``compat`` (``COMPAT_SINGLE``, ``COMPAT_VENUE``). The single
+arm is the single-order matcher and the production single path: ``single._column`` routes a column
+to it unless latency, or ONE_TICK without next-open entries, sends it to the venue arm (R15). The
+venue arm is the per-command settlement matcher: commands are ring entries settling once their due
+bar has come, with the protection 0..3 machine, ``rejected_stop`` and protect-flatten, the limit
+slippage search and the IOC command. The loop takes the numeric ABI of the old matchers
+(``legacy.single._column`` and ``legacy.venue._venue_column``, the test oracles) and returns the
+same seven-field result, with or without a strategy callback. Both arms share the callback site
+and the refusal/ring helpers; they differ in everything between the bar's open and its close
+decision, which the route word selects once per column.
 
 Shape (docs/reviews/single-matcher-design/REPORT.md section 3):
 

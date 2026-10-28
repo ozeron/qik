@@ -1,7 +1,7 @@
 """Numba engine entry point: the matchers live in ``engine/``, re-exported here.
 
 ``qik.vector_engine.engine`` maps the modules (codes -> fills/levels/pairs -> decision ->
-venue -> book -> single/slots -> batch). This facade keeps the historic import surface
+book -> single/slots -> batch). This facade keeps the historic import surface
 ``qik.vector_engine.kernel.<name>`` used by ``api``, ``compiled``, ``codegen``, ``fixed``,
 ``reference`` and the tests: every name below is the same object its module defines.
 """
@@ -209,8 +209,7 @@ from .engine.fills import (
     _high_first,
     _no_reversal,
     _target_fill_price,
-    _venue_peek,
-    _venue_unrecord,
+    _venue_record,
 )
 from .engine.levels import (
     _any_in,
@@ -239,15 +238,6 @@ from .engine.pairs import (
 )
 from .engine.single import _column, _compiled_column
 from .engine.slots import SlotsState, _compiled_slots_column, _slots_column, _slots_column_advance
-from .engine.venue import (
-    VenueState,
-    _compiled_venue_column,
-    _venue_column,
-    _venue_column_advance,
-    _venue_driver,
-    _venue_driver_type,
-    _venue_record,
-)
 from .protection import (
     ERR_NONE,
     ERR_PROTECT_REJECTED,
@@ -330,7 +320,6 @@ __all__ = [
     "V_TARGET",
     "V_WORK_LEVEL",
     "V_WORK_SIDE",
-    "VenueState",
     "_EMPTY_BOOL_COLUMNS",
     "_EMPTY_DAYS",
     "_EMPTY_FLOAT_COLUMNS",
@@ -356,7 +345,6 @@ __all__ = [
     "_column_input",
     "_compiled_column",
     "_compiled_slots_column",
-    "_compiled_venue_column",
     "_contracts_for",
     "_core_decision",
     "_core_decision_rare",
@@ -389,13 +377,7 @@ __all__ = [
     "_store_risk",
     "_straddle_column",
     "_target_fill_price",
-    "_venue_column",
-    "_venue_column_advance",
-    "_venue_driver",
-    "_venue_driver_type",
-    "_venue_peek",
     "_venue_record",
-    "_venue_unrecord",
     "annotations",
     "fill_cost",
     "levels",

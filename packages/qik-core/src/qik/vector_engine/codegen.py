@@ -56,7 +56,7 @@ class _EventCommands(ast.NodeTransformer):
         if (
             isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Name)
-            and node.value.func.id in ("_slots_column_advance", "_venue_column_advance")
+            and node.value.func.id == "_slots_column_advance"
         ):
             return [node, *ast.parse("if core.account[2]:\n    break").body]
         if isinstance(target, ast.Tuple) and self.command_value(node.value):
@@ -285,12 +285,6 @@ def _write_module(
                 return ast.Name(node.attr.replace("_compiled_", "_"), ast.Load())
             return node
 
-        def visit_Call(self, node: ast.Call) -> ast.expr:
-            if isinstance(node.func, ast.Name) and node.func.id == "_venue_driver":
-                return ast.Name("_venue_column", ast.Load())
-            self.generic_visit(node)
-            return node
-
     adapter = ast.parse(_ADAPTER_SOURCE).body[0]
     assert isinstance(adapter, ast.FunctionDef)
     adapter.name = "_python_step"
@@ -418,10 +412,8 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
     # (matcher, whether it still reads decisions by the name-keyed event rewrites). The book loop
     # owns its callback sites and retained-row reads, so it is emitted as written.
     for module, name, event_rewrites in (
-        (engine.venue, "_venue_column_advance", True),
         (engine.book, "_book_loop", False),
         (engine.slots, "_slots_column_advance", True),
-        (engine.venue, "_venue_column", True),
         (engine.single, "_column", False),
         (engine.slots, "_slots_column", True),
     ):
