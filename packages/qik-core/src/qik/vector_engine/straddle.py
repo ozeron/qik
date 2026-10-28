@@ -99,32 +99,38 @@ def validate_pair(
     next_open: bool = False,
 ) -> bool:
     """Validate before an order can be sent: ``pair_refusal`` as an exception, for the array API
-    and the Python reference (``jit=False``). Returns whether there is a pair to admit."""
+    and the Python reference (``jit=False``). Returns whether there is a pair to admit.
+
+    The messages are literals, not ``PAIR_MESSAGES`` lookups: compiled, a raise takes constants
+    (a tuple lookup raised the first message for every code); the table is for Python callers,
+    and ``test_scalar_validation`` pins the two together."""
     code = pair_refusal(
         pair, legacy, side, commands, combine, oto, one_tick, arm_stop, day_cancel, next_open
     )
     if code == 2:
-        raise ValueError(PAIR_MESSAGES[0])
+        raise ValueError("straddle levels must be finite and positive or NaN")
     if code == 3:
-        raise ValueError(PAIR_MESSAGES[1])
+        raise ValueError(
+            "straddle cannot share a decision with single entry, protection or commands"
+        )
     if code == 4:
-        raise ValueError(PAIR_MESSAGES[2])
+        raise ValueError("straddle needs exactly one stop or IOC level per leg")
     if code == 5:
-        raise ValueError(PAIR_MESSAGES[3])
+        raise ValueError("straddle stop level and points need stop_combine=tighter")
     if code == 6:
-        raise ValueError(PAIR_MESSAGES[4])
+        raise ValueError("straddle target level and points need target_combine=tighter")
     if code == 7:
-        raise ValueError(PAIR_MESSAGES[5])
+        raise ValueError("straddle stop triggers must be ordered short < long")
     if code == 8:
-        raise ValueError(PAIR_MESSAGES[6])
+        raise ValueError("straddle arm_stop=next_bar composition is unproved")
     if code == 9:
-        raise ValueError(PAIR_MESSAGES[7])
+        raise ValueError("straddle day_order_expiry=cancel composition is unproved")
     if code == 10:
-        raise ValueError(PAIR_MESSAGES[8])
+        raise ValueError("straddle OTO composition is unproved; use callback protection")
     if code == 11:
-        raise ValueError(PAIR_MESSAGES[9])
+        raise ValueError("straddle ONE_TICK execution is unproved")
     if code == 12:
-        raise ValueError(PAIR_MESSAGES[10])
+        raise ValueError("straddle ONE_TICK IOC execution is unproved")
     if code == 13:
-        raise ValueError(PAIR_MESSAGES[11])
+        raise ValueError("straddle ONE_TICK targets execution is unproved")
     return code == 1
