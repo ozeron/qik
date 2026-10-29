@@ -527,6 +527,7 @@ def _simulate(
     sizing: Sizing[int] | Sizing[float] | None = None,
     initial_cash: float | None = None,
     _run_columns: Any = None,
+    _entry_quantities: np.ndarray | None = None,
 ) -> Result:
     """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
@@ -839,9 +840,15 @@ def _simulate(
                         )
     sizing_risks = (
         np.full((k, n), np.nan)
-        if sizing is not None and slots and next_open and rules.fill_model is FillModel.ONE_TICK
+        if sizing is not None
+        and sizing.qty_feature is None
+        and slots
+        and next_open
+        and rules.fill_model is FillModel.ONE_TICK
         else None
     )
+    if sizing is not None and sizing.qty_feature is not None and _entry_quantities is None:
+        raise ValueError("qty_feature needs a typed strategy feature lane")
     run_columns = K.run_columns if _run_columns is None else _run_columns
     out = run_columns(
         bars.open,
@@ -983,6 +990,10 @@ def _simulate(
             if sizing_risks is not None:
                 submitted = sizing_risks[o_cfg, o_entry]
                 o_risk = np.where(np.isnan(submitted), o_risk, submitted * pv)
+            if sizing.qty_feature is not None:
+                assert _entry_quantities is not None
+                risk = _entry_quantities[: len(trades)]
+                o_risk = np.full(len(o_cfg), _entry_quantities[len(trades)])
             cash = float(initial_cash) if initial_cash is not None else np.nan  # risk_usd: unused
             # Fixed notional (A24): sized from the entry fill, not a stop. The entry fill's own
             # costs are half the fixed round trip plus its proportional fee (both fee bases).
@@ -1069,7 +1080,10 @@ def _simulate(
         or from_open_used
         or frac_used
         # A24: V2 hosts fixed whole contracts and the venue's own fees only.
-        or (sizing is not None and sizing.notional_usd is not None)
+        or (
+            sizing is not None
+            and (sizing.notional_usd is not None or sizing.qty_feature is not None)
+        )
         or (costs is not None and costs.fee_basis != "fill_notional")
         or (
             slots
@@ -1293,6 +1307,17 @@ def _raise_kernel_error(
 
 
 def _sizing_error(err: int, config: int, bar: int) -> None:
+    if err == S.ERR_QTY_RANGE:
+        raise ValueError(
+            f"qty_feature quantity cannot be represented for the entry at bar {bar}, "
+            f"config {config}: whole contracts need int64 and lot counts must be finite; "
+            "set a representable max_contracts cap"
+        )
+    if err == S.ERR_INVALID_QTY:
+        raise ValueError(
+            f"qty_feature must be finite and positive for the entry decision at bar {bar}, "
+            f"config {config} (NaN, <=0 and infinity are refused)"
+        )
     if err == S.ERR_NO_STOP:
         raise ValueError(
             f"entry at bar {bar}, config {config} has no stop: risk sizing needs a stop on every entry"

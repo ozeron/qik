@@ -17,7 +17,7 @@ import numba as nb
 import numpy as np
 from numba.extending import overload
 
-from .account import fill_cost, settle
+from .account import MODE_QTY_FEATURE, fill_cost, settle
 from .account import quantity as _contracts_for
 from .engine.batch import (
     _EMPTY_BOOL_COLUMNS,
@@ -187,7 +187,7 @@ from .engine.codes import (
     CoreContext,
     rule_settings,
 )
-from .engine.decision import _core_decision, _core_decision_rare
+from .engine.decision import _core_decision, _core_decision_rare, _entry_quantity
 from .engine.entry import _column, _slots_column
 from .engine.events import (
     _close_at,
@@ -430,6 +430,8 @@ __all__ = [
     "_column",
     "_column_input",
     "_contracts_for",
+    "MODE_QTY_FEATURE",
+    "_entry_quantity",
     "_core_decision",
     "_core_decision_rare",
     "_empty_input",

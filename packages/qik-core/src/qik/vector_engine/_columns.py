@@ -61,6 +61,7 @@ class DecisionColumns:
         sizing: Sizing[int] | Sizing[float] | None,
         initial_cash: float | None,
         _run_columns: Callable[..., tuple],
+        _entry_quantities: np.ndarray | None = None,
     ) -> Result:
         """Apply shared checks/accounting to a validated or already-matched column.
 
@@ -78,4 +79,5 @@ class DecisionColumns:
             sizing=sizing,
             initial_cash=initial_cash,
             _run_columns=_run_columns,
+            _entry_quantities=_entry_quantities,
         )

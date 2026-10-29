@@ -48,6 +48,22 @@ from .api import (
 from .api import (
     Result as EngineResult,
 )
+from .economic import (
+    E_ADMISSION,
+    E_AMOUNT,
+    E_BPS,
+    E_CAP,
+    E_CHECK_CASH,
+    E_CLAMP_MIN,
+    E_ENTRY_NOTIONAL,
+    E_FRICTION,
+    E_LOT_STEP,
+    E_MIN_QTY,
+    E_MODE,
+    E_POINT_VALUE,
+    E_PROJECTED_OVERFLOW,
+    E_QTY_START,
+)
 from .schema import Features, Params, Scalar, State, StrategySpec
 from .straddle import PAIR_FIELDS, PAIR_MESSAGES
 from .types import Bar, Decision, Position
@@ -113,6 +129,9 @@ def _run_columns_typed(
     _bound_runner: Any = None,
     _event_storage: bool = False,
     _final_states: list[np.recarray] | None = None,
+    _qty_lane: np.ndarray | None = None,
+    _f0a_admission: str = "none",
+    _f0a_capture: list[np.ndarray] | None = None,
 ) -> list[EngineResult]:
     """Run independent compiled cores in parallel, returning one normal Result per config.
 
@@ -238,23 +257,26 @@ def _run_columns_typed(
     friction = (
         fixed_cost(costs.commission_per_side, costs.slippage_ticks, tick, pv, 2) if costs else 0.0
     )
-    economic = np.array(
-        [
-            pv,
-            friction,
-            costs.proportional_bps if costs else 0.0,
-            sizing.mode if sizing else 0,
-            sizing.amount if sizing else 1.0,
-            sizing.cap if sizing else 0.0,
-            sizing.lot_step if sizing else 1.0,
-            sizing.min_qty if sizing else 1.0,
-            sizing.min_qty_policy == "clamp" if sizing else False,
-            0.0,  # set per launch: the projected-overflow stop (the run's first launch only)
-            # A24: fee charged on the entry fill's notional; refuse unaffordable entries.
-            costs is not None and costs.fee_basis == "entry_notional",
-            sizing is not None and sizing.check_cash,
-        ]
-    )
+    if _f0a_admission not in ("none", "skip"):
+        raise ValueError("F0a admission must be none or skip")
+    economic = np.zeros(E_QTY_START)
+    economic[E_POINT_VALUE] = pv
+    economic[E_FRICTION] = friction
+    economic[E_BPS] = costs.proportional_bps if costs else 0.0
+    economic[E_MODE] = sizing.mode if sizing else 0
+    economic[E_AMOUNT] = sizing.amount if sizing else 1.0
+    economic[E_CAP] = sizing.cap if sizing else 0.0
+    economic[E_LOT_STEP] = sizing.lot_step if sizing else 1.0
+    economic[E_MIN_QTY] = sizing.min_qty if sizing else 1.0
+    economic[E_CLAMP_MIN] = sizing.min_qty_policy == "clamp" if sizing else False
+    economic[E_PROJECTED_OVERFLOW] = 0.0
+    economic[E_ENTRY_NOTIONAL] = costs is not None and costs.fee_basis == "entry_notional"
+    economic[E_CHECK_CASH] = sizing is not None and sizing.check_cash
+    economic[E_ADMISSION] = _f0a_admission == "skip"
+    if _qty_lane is not None:
+        # Fixed numeric transport: the named fixed prefix followed by the wanted
+        # quantity lane. Shared, read-only input; only accepted entries read this tail.
+        economic = np.concatenate((economic, _qty_lane))
     k, n = len(params), len(bars)
     declared = frozenset(SIGNAL_FIELDS.index(name) for name in fields)
     rounding = rules.tick_round is not TickRound.NONE
@@ -289,7 +311,8 @@ def _run_columns_typed(
             store, trades = buffers.take(
                 len(index), layout.nrows, 1 if _event_storage else n, width
             )
-            risk_store = buffers.risk(len(index), n if own_risk else 0)
+            risk_bars = width + 1 if _qty_lane is not None else n if own_risk else 0
+            risk_store = buffers.risk(len(index), risk_bars)
             event_bound = (
                 (n if layout is full and width == 2 * n else event_capacity)
                 if _event_storage
@@ -300,7 +323,7 @@ def _run_columns_typed(
             )
             # Later launches grow only on a real overflow: a projection must not stop
             # a retry whose capacity the batch budget already bounded.
-            economic[9] = attempts == 1
+            economic[E_PROJECTED_OVERFLOW] = attempts == 1
             raw = _bound_runner(
                 state[index],
                 params[index],
@@ -333,7 +356,13 @@ def _run_columns_typed(
                 ev_mask,
                 ev_val,
                 layout.rows,
-                *(() if not _event_storage else (risk_store,)),
+                *(
+                    (risk_store,)
+                    if _event_storage
+                    else (0, risk_store)
+                    if _qty_lane is not None
+                    else ()
+                ),
             )
             counts = raw[0]
             if np.any(counts == K.COLUMN_UNRUN):
@@ -351,11 +380,13 @@ def _run_columns_typed(
                     n,
                     ev_count[stopped],
                     raw[1][stopped, 9],
-                    _event_budget(len(index), layout.nrows, width, n if own_risk else 0),
+                    _event_budget(len(index), layout.nrows, width, risk_bars),
                 )
                 continue
             break
         meta = raw[1]
+        if _f0a_capture is not None:
+            _f0a_capture.append(meta[:, 10:].copy())
         configs = [
             _Config(
                 int(counts[p]),
@@ -435,7 +466,7 @@ def _run_columns_typed(
         # Per-config bytes; _event_budget inverts the sparse part for overflow reruns.
         width = (
             _event_row_bytes(compact.nrows) * event_capacity
-            + (8 * n if own_risk else 0)
+            + (8 * (capacity + 1) if _qty_lane is not None else 8 * n if own_risk else 0)
             + capacity * _TRADE_ROW_BYTES
             + (0 if _event_storage else (compact.nrows * 8 + 6) * n)
         )
@@ -804,6 +835,9 @@ def _matched_result(
         sizing=sizing,
         initial_cash=initial_cash,
         _run_columns=already_matched,
+        _entry_quantities=config.risks
+        if sizing is not None and sizing.qty_feature is not None
+        else None,
     )
     if cash_accumulation == "sequential" and initial_cash is not None:
         frame = result.trades
@@ -875,10 +909,11 @@ def _python_module(step: Any) -> Any:
 def _python_runner(module: Any) -> Callable[..., Any]:
     # Rebind every shared helper in a private namespace. No dispatcher or global
     # config is mutated: jit=False and JIT runs can coexist in one process.
-    from . import account, engine, protection
+    from . import account, economic, engine, protection
     from . import sizing as sizing_module
 
-    namespace = dict(vars(account))
+    namespace = dict(vars(economic))
+    namespace.update(vars(account))
     namespace.update(vars(protection))
     namespace.update(vars(sizing_module))
     namespace.update(vars(K))
@@ -926,6 +961,15 @@ def _record_run(
         values = spec.features(*(supplied[n] for n in names))
     else:
         values = spec.features(*(getattr(supplied, n) for n in names))
+    sizing = kwargs.get("sizing")
+    qty_lane = None
+    qty_feature = sizing.qty_feature if sizing is not None else None
+    if qty_feature is not None:
+        if qty_feature not in names:
+            raise ValueError(f"qty_feature={qty_feature!r} is not a declared strategy feature")
+        qty_lane = np.asarray(getattr(values, qty_feature))
+        if qty_lane.dtype.kind not in "fiu":
+            raise ValueError("qty_feature must be a numeric quantity lane")
     clock = (
         np.full(len(bars), -1, np.int64) if bars.index is None else bars.index.as_unit("ns").asi8
     )
@@ -960,6 +1004,9 @@ def _record_run(
             (clock, *lanes),
             bars,
             _bound_runner=runner,
+            # Snapshot from the normalized owner the callback's pointer table uses,
+            # after FixedRunner.contiguous has copied or refused strided lanes.
+            _qty_lane=lanes[names.index(qty_feature)] if qty_feature is not None else None,
             _event_storage=jit and not bool(getattr(nb.config, "DISABLE_JIT")),
             _final_states=final,
             _capture_columns=_capture_columns,

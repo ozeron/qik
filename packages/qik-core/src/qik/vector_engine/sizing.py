@@ -20,14 +20,21 @@ import numpy as np
 
 from ._checks import is_int
 from .account import (
+    ERR_INVALID_QTY as ERR_INVALID_QTY,
+)
+from .account import (
     ERR_NO_STOP as ERR_NO_STOP,
 )
 from .account import (
     ERR_NONE,
     MODE_CONTRACTS,
     MODE_NOTIONAL,
+    MODE_QTY_FEATURE,
     MODE_RISK_FRACTION,
     MODE_RISK_USD,
+)
+from .account import (
+    ERR_QTY_RANGE as ERR_QTY_RANGE,
 )
 from .account import (
     ERR_UNAFFORDABLE as ERR_UNAFFORDABLE,
@@ -45,7 +52,7 @@ __all__ = ["Sizing"]
 @dataclass(frozen=True)
 class Sizing[Quantity: int | float = int]:
     """Contracts per entry; set exactly one of ``contracts``, ``risk_usd``, ``risk_fraction`` or
-    ``notional_usd``.
+    ``notional_usd`` or ``qty_feature``.
 
     * ``contracts``: the same number for every trade.
     * ``risk_usd``: ``floor(risk_usd / (|entry - stop| * point_value))``; needs a stop on every entry.
@@ -58,6 +65,10 @@ class Sizing[Quantity: int | float = int]:
       balance before the trade, so fees are never borrowed; ``"unchecked"`` assumes no account
       (independent fixed-notional books). ``min_qty_policy="clamp"`` is refused: it would exceed
       the fixed notional.
+
+    * ``qty_feature``: wanted quantity from the named strategy feature at the entry's
+      decision bar, retained through next-open, resting and chase fills. Floors to the lot
+      step, caps at ``max_contracts`` and refuses invalid/below-minimum quantities; no clamp.
 
     The stop distance is in points from the entry fill; costs are not part of the risk.
     ``max_contracts`` caps the computed modes. Computed quantities floor to ``lot_step`` multiples
@@ -78,18 +89,30 @@ class Sizing[Quantity: int | float = int]:
 
     notional_usd: float | None = None
     affordability: Literal["refuse", "unchecked"] | None = None
+    qty_feature: str | None = None
 
     def __post_init__(self) -> None:
         if self.min_qty_policy not in ("refuse", "clamp"):
             raise ValueError("min_qty_policy must be refuse or clamp")
         set_ = [
             x is not None
-            for x in (self.contracts, self.risk_usd, self.risk_fraction, self.notional_usd)
+            for x in (
+                self.contracts,
+                self.risk_usd,
+                self.risk_fraction,
+                self.notional_usd,
+                self.qty_feature,
+            )
         ]
         if sum(set_) != 1:
             raise ValueError(
-                "Sizing needs exactly one of contracts, risk_usd, risk_fraction, notional_usd"
+                "Sizing needs exactly one of contracts, risk_usd, risk_fraction, notional_usd, qty_feature"
             )
+        if self.qty_feature is not None:
+            if not isinstance(self.qty_feature, str) or not self.qty_feature.strip():
+                raise ValueError("qty_feature must name a strategy feature lane")
+            if self.min_qty_policy == "clamp":
+                raise ValueError("min_qty_policy='clamp' is not supported with qty_feature")
         if self.notional_usd is None:
             if self.affordability is not None:
                 raise ValueError("affordability applies to notional_usd only")
@@ -133,6 +156,8 @@ class Sizing[Quantity: int | float = int]:
 
     @property
     def mode(self) -> int:
+        if self.qty_feature is not None:
+            return MODE_QTY_FEATURE
         if self.contracts is not None:
             return MODE_CONTRACTS
         if self.notional_usd is not None:
@@ -141,6 +166,8 @@ class Sizing[Quantity: int | float = int]:
 
     @property
     def amount(self) -> float:
+        if self.qty_feature is not None:
+            return 0.0  # the amount is supplied by the decision-bar feature lane
         for x in (self.contracts, self.risk_usd, self.risk_fraction, self.notional_usd):
             if x is not None:
                 return float(x)

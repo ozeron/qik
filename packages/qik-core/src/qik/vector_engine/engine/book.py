@@ -41,6 +41,8 @@ import numba as nb
 import numpy as np
 from numba.extending import overload
 
+from qik.vector_engine.account import MODE_QTY_FEATURE
+from qik.vector_engine.economic import E_MODE
 from qik.vector_engine.protection import (
     ERR_NONE,
     ERR_PROTECT_REJECTED,
@@ -79,7 +81,7 @@ from .codes import (
     REASON_STOP,
     REASON_STOP_GAP,
 )
-from .decision import _core_decision, _core_decision_rare
+from .decision import _core_decision, _core_decision_rare, _entry_quantity
 from .events import _close_at, _open_at
 from .fills import _high_first, _no_reversal, _venue_record
 from .levels import _any_in
@@ -600,6 +602,8 @@ def _book_loop(
                     tick_round,
                     combine,
                 )
+                if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                    _entry_quantity(core, vd, cnt)
                 pos, ei, ep, stop, target = pend, i, oi, st, tg
                 sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
                 vs[VS_GEN], vs[VS_GSIDE] = vd, pos
@@ -648,6 +652,8 @@ def _book_loop(
                         tick_round,
                         combine,
                     )
+                    if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                        _entry_quantity(core, vd, cnt)
                     pos, ei, ep, stop, target = pend, i, px, st, tg
                     sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
                     vs[VS_GEN], vs[VS_GSIDE] = vd, pos
@@ -793,6 +799,8 @@ def _book_loop(
                     if _in_market(sd, tg, oi, False):
                         err, eb = ERR_TARGET_IN_MARKET, i
                         break
+                if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                    _entry_quantity(core, d, cnt)
                 pos, ei, ep, stop, target = sd, i, fill, st, tg
                 sx, tx = _stop_sentinel(sd, st), _target_sentinel(sd, tg)
             if err != ERR_NONE:
@@ -833,6 +841,8 @@ def _book_loop(
                         combine=combine,
                         fill=px,
                     )
+                    if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                        _entry_quantity(core, p_chase - chase, cnt)
                     if core is not None and filled:
                         # The resting entry has printed, but its callback protection is a close
                         # command: the strategy observes the position before the legs are accepted.
@@ -1048,6 +1058,8 @@ def _book_loop(
                             tick_round,
                             combine,
                         )
+                        if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                            _entry_quantity(core, vd, cnt)
                         pos, ei, ep, stop, target = pend, i, px, st, tg
                         sx, tx = _stop_sentinel(pos, st), _target_sentinel(pos, tg)
                         vs[VS_GEN], vs[VS_GSIDE] = vd, pos
@@ -1197,6 +1209,8 @@ def _book_loop(
                         s, _anchor(bracket_anchor, ci, ci, lim), es, et, sp, tp, tick,
                         tick_round, combine=combine, fill=ci,
                     )  # fmt: skip
+                    if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                        _entry_quantity(core, i, cnt)
                     e, why = _fill_then_protect(
                         s, i, ci, st, tg, ci, protect_flatten, count_only, out_entry_i,
                         out_exit_i, out_side, out_entry_px, out_exit_px, out_reason, out_stop,
@@ -1234,6 +1248,8 @@ def _book_loop(
                     break
                 st = np.nan  # Nautilus rejects the stop and cancels the linked target (A13)
                 tg = np.nan
+            if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                _entry_quantity(core, i, cnt)
             pos, ei, ep, stop, target = s, i, ci, st, tg
             sx, tx = _stop_sentinel(s, st), _target_sentinel(s, tg)
     return cnt, err, eb, pos, ei, ep, stop

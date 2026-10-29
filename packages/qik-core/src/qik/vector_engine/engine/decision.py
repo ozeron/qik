@@ -5,8 +5,23 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 
-from qik.vector_engine.account import fill_cost, settle
+from qik.vector_engine.account import ERR_INVALID_QTY, MODE_QTY_FEATURE, fill_cost, settle
 from qik.vector_engine.account import quantity as _contracts_for
+from qik.vector_engine.economic import (
+    E_AMOUNT,
+    E_BPS,
+    E_CAP,
+    E_CHECK_CASH,
+    E_CLAMP_MIN,
+    E_ENTRY_NOTIONAL,
+    E_FRICTION,
+    E_LOT_STEP,
+    E_MIN_QTY,
+    E_MODE,
+    E_POINT_VALUE,
+    E_PROJECTED_OVERFLOW,
+    E_QTY_START,
+)
 from qik.vector_engine.protection import _round_price
 from qik.vector_engine.straddle import pair_refusal
 
@@ -29,6 +44,24 @@ from .codes import (
     V_WORK_SIDE,
 )
 from .levels import _put_level
+
+
+@nb.njit(cache=False, inline="never")
+def _entry_quantity(core, decision_bar, trade_index):
+    """Snapshot the wanted quantity at an accepted entry, using its retained submission bar.
+
+    The private sizing lane is indexed by trade ordinal, with the current open entry
+    at index cnt. Two entries can fill on the same bar from different decisions.
+    No tuple alias writes in an inlined function.
+    """
+    if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+        if trade_index >= len(core.sizing_risks):
+            core.account[2] = 9  # replay from pristine state with a larger trade buffer
+            return
+        wanted = core.economic[E_QTY_START + decision_bar]
+        core.sizing_risks[trade_index] = wanted
+        if not np.isfinite(wanted) or wanted <= 0:
+            core.account[2], core.account[3], core.account[4] = 1, decision_bar, ERR_INVALID_QTY
 
 
 @nb.njit(cache=False, inline="always")
@@ -72,20 +105,31 @@ def _core_decision(
         # The trade buffer is smaller than the worst case; the caller reruns this config.
         account[2] = 9
         return
-    pv, friction, bps, mode = core.economic[0], core.economic[1], core.economic[2], core.economic[3]
-    amount, cap, lot, minimum = (
-        core.economic[4],
-        core.economic[5],
-        core.economic[6],
-        core.economic[7],
+    pv, friction, bps, mode = (
+        core.economic[E_POINT_VALUE],
+        core.economic[E_FRICTION],
+        core.economic[E_BPS],
+        core.economic[E_MODE],
     )
-    clamp = len(core.economic) > 8 and bool(core.economic[8])
+    amount, cap, lot, minimum = (
+        core.economic[E_AMOUNT],
+        core.economic[E_CAP],
+        core.economic[E_LOT_STEP],
+        core.economic[E_MIN_QTY],
+    )
+    clamp = len(core.economic) > E_CLAMP_MIN and bool(core.economic[E_CLAMP_MIN])
     # A24 flags (entry-notional fees, cash check); older callers pass shorter arrays.
-    entry_fees = len(core.economic) > 10 and core.economic[10] != 0.0
-    check_cash = len(core.economic) > 11 and core.economic[11] != 0.0
+    entry_fees = len(core.economic) > E_ENTRY_NOTIONAL and core.economic[E_ENTRY_NOTIONAL] != 0.0
+    check_cash = len(core.economic) > E_CHECK_CASH and core.economic[E_CHECK_CASH] != 0.0
     for k in range(seen, cnt):
-        points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else out_ei[k]]
-        risk = (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
+        points = core.sizing_risks[
+            k if mode == MODE_QTY_FEATURE else (0 if len(core.sizing_risks) == 1 else out_ei[k])
+        ]
+        risk = (
+            points
+            if mode == MODE_QTY_FEATURE
+            else (points if not np.isnan(points) else abs(out_ep[k] - out_st[k])) * pv
+        )
         # A24: the fixed-notional unit and the entry fill's costs, as the array path's pass.
         unit = abs(out_ep[k]) * pv
         qty = _contracts_for(
@@ -121,8 +165,14 @@ def _core_decision(
     view[V_ENTRY_I], view[V_ENTRY_PX] = (ei if pos else -1), (ep if pos else np.nan)
     view[V_STOP], view[V_TARGET] = (stop if pos else np.nan), (target if pos else np.nan)
     if pos:
-        points = core.sizing_risks[0 if len(core.sizing_risks) == 1 else ei]
-        risk = (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
+        points = core.sizing_risks[
+            cnt if mode == MODE_QTY_FEATURE else (0 if len(core.sizing_risks) == 1 else ei)
+        ]
+        risk = (
+            points
+            if mode == MODE_QTY_FEATURE
+            else (points if not np.isnan(points) else abs(ep - risk_stop)) * pv
+        )
         unit = abs(ep) * pv
         qty = _contracts_for(
             mode,
@@ -184,14 +234,14 @@ def _core_decision(
     if len(core.ev_count):
         if mask:
             event, capacity, n = core.ev_count[0], len(core.ev_bar), len(core.volume)
-            # The run's first launch (economic[9]) stops once an eighth-full buffer,
+            # The run's first launch (economic[E_PROJECTED_OVERFLOW]) stops once an eighth-full buffer,
             # a sixty-fourth into the tape, projects past twice its capacity: the
             # whole batch reruns anyway, sized from the rate observed here.
             if event == capacity or (
                 event >= capacity >> 3
                 and 64 * (i + 1) >= n
-                and len(core.economic) > 9
-                and core.economic[9] != 0
+                and len(core.economic) > E_PROJECTED_OVERFLOW
+                and core.economic[E_PROJECTED_OVERFLOW] != 0
                 and (event + 1) * n > 2 * capacity * (i + 1)
             ):
                 account[2] = 13
@@ -324,4 +374,4 @@ def _core_decision(
 # outlined copy (``codegen``), so the publisher is expanded once per loop and shared by the rest.
 _core_decision_rare = _core_decision
 
-__all__ = ["_core_decision", "_core_decision_rare"]
+__all__ = ["_core_decision", "_core_decision_rare", "_entry_quantity"]

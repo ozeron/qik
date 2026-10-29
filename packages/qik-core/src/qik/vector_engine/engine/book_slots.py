@@ -32,6 +32,8 @@ from __future__ import annotations
 import numba as nb
 import numpy as np
 
+from qik.vector_engine.account import MODE_QTY_FEATURE
+from qik.vector_engine.economic import E_MODE
 from qik.vector_engine.protection import (
     ERR_NONE,
     ERR_PROTECT_REJECTED,
@@ -112,7 +114,7 @@ from .codes import (
     REASON_STOP,
     REASON_STOP_GAP,
 )
-from .decision import _core_decision
+from .decision import _core_decision, _entry_quantity
 from .events import _close_at, _open_at
 from .fills import _high_first, _target_fill_price, _venue_record
 from .levels import _any_in, _store_risk
@@ -567,8 +569,16 @@ def _slots_loop(
                                         )  # fmt: skip
                                         submitted_risk = abs(level - submitted_stop)
                                         _store_risk(sizing_risks, i, submitted_risk)
-                                        if core is not None:
+                                        if (
+                                            core is not None
+                                            and core.economic[E_MODE] != MODE_QTY_FEATURE
+                                        ):
                                             core.sizing_risks[i] = submitted_risk
+                                    if (
+                                        core is not None
+                                        and core.economic[E_MODE] == MODE_QTY_FEATURE
+                                    ):
+                                        _entry_quantity(core, d, cnt)
                                     pos, ei, ep, gen, risk_stop = s_hit, i, px, d, stop
                                     gident = pident
                                     be_done = False
@@ -1033,6 +1043,8 @@ def _slots_loop(
                     # decision. Resting limit/stop callbacks keep their A15 busy contract.
                     if completed_close and phase == 0 and np.isnan(plim) and np.isnan(ptrig):
                         busy = False
+                    if core is not None and core.economic[E_MODE] == MODE_QTY_FEATURE:
+                        _entry_quantity(core, d, cnt)
                     pos, ei, ep, gen, gident = fs, i, px, d, dident
                     stop, target = _entry_resolve(
                         hv, fs, anchor, px, dident, dpair, entry_stop, entry_target, stop_pts,
