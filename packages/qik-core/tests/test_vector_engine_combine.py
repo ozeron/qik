@@ -8,6 +8,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 import pytest
+import ve_reference as R
 from _typed_scripts import replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -32,7 +33,6 @@ from qik.vector_engine import (
     strategy,
 )
 from qik.vector_engine import protection as P
-from qik.vector_engine import reference as R
 from scripts.engine_test_tiers import engine_examples
 
 
