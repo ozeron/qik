@@ -39,9 +39,14 @@ def _round_price(value: float, tick: float, rounding: int, direction: float) -> 
 
 @nb.njit(cache=True, nogil=True)
 def _anchor(mode: int, decision: float, fill: float, legacy: float) -> float:
+    """Fill-relative protection by default; preserve the explicit signal geometry.
+
+    ``legacy`` remains in the matcher ABI, but a submitted limit only bounds
+    execution: price improvement must also move point stops and targets.
+    """
     if mode == 1:
         return decision
-    return fill if mode == 2 else legacy
+    return fill
 
 
 @nb.njit(cache=True, nogil=True)

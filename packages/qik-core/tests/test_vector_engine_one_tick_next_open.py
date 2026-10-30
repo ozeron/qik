@@ -13,6 +13,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from test_vector_engine import _case, _dense_case, _kernel_final, _nan_free, _ref_final, _ref_trades
 from ve_kernel_adapter import run_columns as kernel_columns
+from ve_reference import simulate_column_reference
 
 from qik.vector_engine import (
     HOLD,
@@ -40,7 +41,6 @@ from qik.vector_engine import (
     strategy,
 )
 from qik.vector_engine import kernel as K
-from qik.vector_engine.reference import simulate_column_reference
 from scripts.engine_test_tiers import engine_examples
 
 TICK = 0.25

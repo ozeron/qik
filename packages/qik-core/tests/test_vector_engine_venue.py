@@ -59,8 +59,7 @@ def test_venue_kernel_equals_independent_reference_dense(
         _ref_trades,
         _run_kernel,
     )
-
-    from qik.vector_engine.reference import simulate_column_reference
+    from ve_reference import simulate_column_reference
 
     rng = np.random.default_rng(6100 + latency + 10 * one_tick)
     errors: set[int] = set()

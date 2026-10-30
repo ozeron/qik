@@ -12,10 +12,10 @@ from _typed_scripts import Script, replay, script
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from ve_kernel_adapter import run_columns as kernel_columns
+from ve_reference import simulate_column_reference
 
 from qik.vector_engine import Bars, Costs, Instrument, MarketFill, Profile, Rules
 from qik.vector_engine import kernel as K
-from qik.vector_engine.reference import simulate_column_reference
 from scripts.engine_test_tiers import engine_examples
 
 TICK = 0.25

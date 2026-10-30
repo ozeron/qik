@@ -12,6 +12,7 @@ from _typed_scripts import Script, replay, script
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from ve_kernel_adapter import run_columns as kernel_columns
+from ve_reference import simulate_column_reference
 from vector_engine.lifecycle_fixtures import F, lifecycle_step
 
 from qik.vector_engine import (
@@ -25,7 +26,6 @@ from qik.vector_engine import (
     run,
 )
 from qik.vector_engine.api import _day_order_dates
-from qik.vector_engine.reference import simulate_column_reference
 from qik.vector_engine.testing import assert_python_jit_equal
 
 

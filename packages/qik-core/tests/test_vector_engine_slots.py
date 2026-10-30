@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 from _typed_scripts import infinite_stop_update_step, replay, script, stop_update_step
 from ve_kernel_adapter import run_columns as kernel_columns
+from ve_reference import simulate_column_reference
 
 from qik.vector_engine import (
     Bars,
@@ -23,7 +24,6 @@ from qik.vector_engine import (
     run,
 )
 from qik.vector_engine import kernel as K
-from qik.vector_engine.reference import simulate_column_reference
 from qik.vector_engine.testing import assert_causal
 
 
