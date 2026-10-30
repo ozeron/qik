@@ -209,6 +209,18 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
                     ast.keyword("no_cfunc_wrapper", ast.Constant(True)),
                 ]
         functions.append(node)
+    if callback:
+        from .account_codegen import outline_events
+
+        slots, rebuild = _borrowed_table()
+        orders_slot = _CALLBACK_SLOTS + len(slots)
+        assert orders_slot < _TABLE_SIZE
+        loops = [
+            node
+            for node in functions
+            if isinstance(node, ast.FunctionDef) and node.name in ("_book_loop", "_slots_loop")
+        ]
+        functions.extend(outline_events(loops, source, rebuild, _TABLE_SIZE, orders_slot))
     runner = ast.parse(_RUNNER_SOURCE).body[0]
     assert isinstance(runner, ast.FunctionDef)
     runner.name = "run"
@@ -290,7 +302,7 @@ def _decision_fields(d_addr, size, levels_addr, height, width, at, stored, decla
         + "\n".join(engine.imports(names))
         + "\n"
         "from qik.vector_engine.compiled import RULES_WIDTH, _raise_column_refusal\n"
-        "from qik.vector_engine.account import _f0a_entry, _f0a_exit, _f0a_submit, _f0a_release, _f0a_pending, _f0a_complete, _f0a_clear, _f0a_mask, MODE_QTY_FEATURE\n"
+        "from qik.vector_engine.account import _f0a_entry, _f0a_exit, _f0a_submit, _f0a_release, _f0a_pending, _f0a_complete, _f0a_clear, _f0a_mask, _account_reserves, _account_fill_reserve, _account_finish, quantity, fill_cost, settle, ERR_ZERO, ERR_UNAFFORDABLE, MODE_QTY_FEATURE, MODE_RISK_USD, MODE_RISK_FRACTION, ORDER_WIDTH, ACCOUNT_PREFIX, ORDER_MULTIPLIER, REGISTRY_ROWS, _account_clock, _account_submitted, _account_resolve_terminal, _account_attempt, _account_kernel\n"
         f"from qik.vector_engine.economic import {economic_names}\n"
         "_no_callback = None\n"
     )
@@ -397,6 +409,9 @@ def _borrowed_table() -> tuple[list[str], dict[str, str]]:
         k = slot()
         slots.append(f"{argument}.ctypes.data")
         rebuild[name] = f"nb.carray(_pointer(ptrs[{k}]), ptrs[{length}], dtype={dtype})"
+    account_length = slot()
+    slots.append("len(core.account)")
+    rebuild["account"] = f"nb.carray(_pointer(ptrs[12]), ptrs[{account_length}], dtype=np.float64)"
     assert _CALLBACK_SLOTS + len(slots) <= _TABLE_SIZE
     return slots, rebuild
 
@@ -596,6 +611,8 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
     k, n = (len(params_grid), len(c))
     counts = np.full(k, K.COLUMN_UNRUN, np.int64)
     meta = np.zeros((k, 28))
+    order_capacity = trades[0].shape[1] + 1
+    accounts = np.empty((k, ACCOUNT_PREFIX + order_capacity * (ORDER_MULTIPLIER * ORDER_WIDTH + 1)))
     a0s, a1s, a2s, a3s, a4s, a5s, a6s = trades
     rows = level_rows
     pairs = rows[11]
@@ -619,10 +636,12 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
         decision = np.empty(31)
         # seen trades, equity, refusal code, sizing refusal bar, sizing error code and
         # the bit set of undeclared fields the core emitted
-        account = np.zeros(24)
+        account = accounts[j]
+        account[:ACCOUNT_PREFIX + order_capacity] = 0.0
         account[1], account[3] = initial_cash, -1.0
         account[6], account[7], account[9] = initial_cash, initial_cash, initial_cash
         account[19], account[20], account[21] = -1.0, -1.0, -1.0
+        account[36] = int(economic[E_ON_REJECT]) & 1
         event_count = ev_count[j:j+1] if event_mode else ev_count[0:0]
         risks = risk_store[j] if economic[E_MODE] == MODE_QTY_FEATURE or (event_mode == 2 and risk_row >= 0) else K._level_row(levels, blank, risk_row)
         if risk_row >= 0 or economic[E_MODE] == MODE_QTY_FEATURE:
@@ -651,6 +670,6 @@ def _typed_runner_template(init_state, params_grid, feats, o, h, lo, c, volume, 
         meta[j, 7] = account[4]
         meta[j, 8] = account[5]
         meta[j, 9] = core.event_state[0] + 1
-        meta[j, 10:] = account[6:]
-    return (counts, meta)
+        meta[j, 10:] = account[6:24]
+    return (counts, meta, accounts[:, ACCOUNT_PREFIX:ACCOUNT_PREFIX+order_capacity], accounts)
 """

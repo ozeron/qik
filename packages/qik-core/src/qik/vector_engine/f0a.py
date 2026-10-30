@@ -1,7 +1,7 @@
-"""F0a measurement hooks, applied to emitted matchers only.
+"""Account event hooks applied to emitted matchers only.
 
-This is a spike, not the F0b policy/ledger API. Admission is reachable only by
-the private test adapter; ordinary runs always pass the no-check policy.
+The exact F0a site census still guards the shared matcher sources. Runtime
+policy records control entry refusals; no account code-generation families.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
     def statements(text: str) -> list[ast.stmt]:
         return ast.parse(text).body
 
-    def entry(side: str, price: str, stop: str, key: str, allow_skip: str) -> list[ast.stmt]:
+    def entry(side: str, price: str, stop: str, key: str, _allow_skip: str) -> list[ast.stmt]:
         cleanup = (
             (
                 "pend = zero\n"
@@ -132,12 +132,13 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
             )
         )
         return statements(
-            f"_f0a_complete(_f0a_state, _f0a_orders, {key}, i)\n"
+            f"_f0a_complete(_f0a_state, _f0a_orders, {key}, i, _account_fill_reserve(_f0a_state, core.economic, {price}, {stop}, np.nan, {key}), {side})\n"
             f"if not _f0a_entry(_f0a_state, core.economic, {side}, {price}, {stop}, "
             "(core.sizing_risks[cnt] if cnt < len(core.sizing_risks) else np.nan) if core.economic[E_MODE] == MODE_QTY_FEATURE "
             "else core.sizing_risks[0 if len(core.sizing_risks) == 1 else i], "
-            f"{allow_skip}):\n"
+            f"i, {key}, len(out_entry_i) + 1):\n"
             + "\n".join("    " + line for line in (cleanup + "continue").splitlines())
+            + "\nif cnt < len(out_entry_i) + 1:\n    _f0a_state[ACCOUNT_PREFIX + cnt] = _f0a_state[11]"
         )
 
     def mask(ident: str) -> str:
@@ -159,6 +160,25 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
         ),
         None,
     )
+
+    def reserves(
+        key: str,
+        ident: str,
+        pair: str,
+        market: str = "False",
+        side: str | None = None,
+        quote: str | None = None,
+    ) -> str:
+        trigger = "entry_limit" if book else "triggers"
+        pairs = "_account_view.ev_val" if book else "straddle"
+        held_side = side or f"_held_side({'core' if book else 'hv'}, side_sig, {ident})"
+        reservation_quote = quote or f"c[max(0, {key})]"
+        return (
+            f"_account_reserves(_f0a_state, core.economic, _account_view, {key}, {ident}, {pair}, "
+            f"{reservation_quote}, entry_stop, stop_pts, entry_limit, {trigger}, {pairs}, "
+            f"{held_side}, "
+            f"{'entry_stop[:0]' if book else 'stop_fracs'}, {market})"
+        )
 
     class Hooks(ast.NodeTransformer):
         def visit_Assign(self, node: ast.Assign) -> Any:
@@ -255,13 +275,26 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
                     )
                     key = ast.unparse(call.args[at + 1])
                     if book:
+                        ident = ast.unparse(call.args[7])
+                        # Only the chase market command has no retained packet
+                        # argument. Its source site supplies the saved context
+                        # directly, avoiding repeated runtime normalization.
+                        if kind == "K_MARKET" and ident == "-1":
+                            cash = reserves(key, "vs[VS_PIDENT]", "False", "True", "pend", "c[i]")
+                        else:
+                            cash = reserves(key, ident, "False")
                         action = (
-                            f"if venue:\n    _f0a_pending(_f0a_state, _f0a_orders, {key}, 1, i)\n"
-                            f"else:\n    _f0a_submit(_f0a_state, _f0a_orders, {key}, 1)"
+                            f"if venue:\n    _f0a_pending(_f0a_state, _f0a_orders, {key}, 1, i, {cash})\n"
+                            f"else:\n    _f0a_submit(_f0a_state, _f0a_orders, {key}, 1, {cash})"
                         )
                     else:
                         ident, pair = ast.unparse(call.args[6]), ast.unparse(call.args[9])
-                        action = f"_f0a_submit(_f0a_state, _f0a_orders, {key}, {mask(ident)} if {pair} else 1)"
+                        cash = (
+                            reserves(key, ident, pair, "True", quote="c[i]")
+                            if kind == "_SLOT_CHASE"
+                            else reserves(key, ident, pair)
+                        )
+                        action = f"_f0a_submit(_f0a_state, _f0a_orders, {key}, {mask(ident)} if {pair} else 1, {cash})"
                     result += statements(
                         f"if ok and {condition}:\n"
                         + "\n".join("    " + s for s in action.splitlines())
@@ -271,7 +304,7 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
                     result += statements(f"_f0a_release(_f0a_state, _f0a_orders, {key}, 3, i)")
                 if call.func.id == "_pend_load":
                     result += statements(
-                        f"_f0a_pending(_f0a_state, _f0a_orders, pend, {mask('pident')} if pend_pair else 1, i)"
+                        f"_f0a_pending(_f0a_state, _f0a_orders, pend, {mask('pident')} if pend_pair else 1, i, {reserves('pend', 'pident', 'pend_pair')})"
                     )
             targets = (
                 list(part.targets[0].elts)
@@ -287,10 +320,14 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
                     if value in ("zero", "unset"):
                         result += statements("_f0a_pending(_f0a_state, _f0a_orders, -1, 0, i)")
                     elif book:
-                        result += statements("_f0a_pending(_f0a_state, _f0a_orders, i, 1, i)")
-                    elif target == "pend":
                         result += statements(
-                            f"_f0a_pending(_f0a_state, _f0a_orders, pend, {mask('pident')} if pend_pair else 1, i)"
+                            f"_f0a_pending(_f0a_state, _f0a_orders, i, 1, i, {reserves('i', '_held_ident(core, i)', 'False')})"
+                        )
+                    # Scalar pend=d stages a chase: its subsequent _spush
+                    # registers the market replacement with the event quote.
+                    elif target == "pend" and value != "d":
+                        result += statements(
+                            f"_f0a_pending(_f0a_state, _f0a_orders, pend, {mask('pident')} if pend_pair else 1, i, {reserves('pend', 'pident', 'pend_pair')})"
                         )
                 if (
                     isinstance(t, ast.Name)
@@ -313,7 +350,7 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
             if book and ast.unparse(part.test) == "core is not None and filled":
                 key = "p_chase - chase"
                 restage = statements(
-                    f"if not filled:\n    _f0a_submit(_f0a_state, _f0a_orders, {key}, 1)"
+                    f"if not filled:\n    _f0a_state[28] = side\n    _f0a_submit(_f0a_state, _f0a_orders, {key}, 1, _account_fill_reserve(_f0a_state, core.economic, px, st, np.nan, {key}))"
                 )
                 return restage + entry("side", "px", "st", key, "not filled") + [part]
             test = ast.unparse(part.test)
@@ -348,15 +385,19 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
                 ) + [part]
             if call.func.id == "_row_save":
                 return statements(
-                    "for _f0a_q in range(6, 24):\n    _f0a_prior[_f0a_q] = _f0a_state[_f0a_q]\n"
+                    "for _f0a_q in range(6, ACCOUNT_PREFIX):\n    _f0a_prior[_f0a_q] = _f0a_state[_f0a_q]\n"
                     "for _f0a_q in range(32):\n    _f0a_order_prior[0, _f0a_q] = _f0a_orders[0, _f0a_q]\n"
-                    "    _f0a_order_prior[1, _f0a_q] = _f0a_orders[1, _f0a_q]"
+                    "    _f0a_order_prior[1, _f0a_q] = _f0a_orders[1, _f0a_q]\n"
+                    "    _f0a_order_prior[2, _f0a_q] = _f0a_orders[2, _f0a_q]\n"
+                    "    for _account_row in range(3, REGISTRY_ROWS):\n        _f0a_order_prior[_account_row, _f0a_q] = _f0a_orders[_account_row, _f0a_q]"
                 ) + [part]
             if call.func.id == "_row_restore":
                 return statements(
-                    "for _f0a_q in range(6, 24):\n    _f0a_state[_f0a_q] = _f0a_prior[_f0a_q]\n"
+                    "for _f0a_q in range(6, ACCOUNT_PREFIX):\n    _f0a_state[_f0a_q] = _f0a_prior[_f0a_q]\n"
                     "for _f0a_q in range(32):\n    _f0a_orders[0, _f0a_q] = _f0a_order_prior[0, _f0a_q]\n"
-                    "    _f0a_orders[1, _f0a_q] = _f0a_order_prior[1, _f0a_q]"
+                    "    _f0a_orders[1, _f0a_q] = _f0a_order_prior[1, _f0a_q]\n"
+                    "    _f0a_orders[2, _f0a_q] = _f0a_order_prior[2, _f0a_q]\n"
+                    "    for _account_row in range(3, REGISTRY_ROWS):\n        _f0a_orders[_account_row, _f0a_q] = _f0a_order_prior[_account_row, _f0a_q]"
                 ) + [part]
             return part
 
@@ -364,17 +405,24 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
     loop = next(p for p in node.body if isinstance(p, ast.For) and ast.unparse(p.target) == "i")
     Hooks().visit(loop)
     setup = (
-        "_f0a_state = nb.carray(_pointer(core.feats[12]), 24, dtype=np.float64)\n"
+        "_f0a_state = nb.carray(_pointer(core.feats[12]), ACCOUNT_PREFIX + (1 + len(out_entry_i)) * (ORDER_MULTIPLIER * ORDER_WIDTH + 1), dtype=np.float64)\n"
         if callback
         else "_f0a_state = core.account\n"
     )
     node.body[node.body.index(loop) : node.body.index(loop)] = statements(
-        setup + "_f0a_prior = np.empty(24)\n_f0a_orders = np.full((2, 32), -1, np.int64)\n"
-        "_f0a_order_prior = np.empty((2, 32), np.int64)"
+        setup
+        + "_account_view = _held_view(core)\n_f0a_prior = np.empty(ACCOUNT_PREFIX)\n_f0a_orders = np.full((REGISTRY_ROWS, 32), -1, np.int64)\n"
+        "_f0a_order_prior = np.empty((REGISTRY_ROWS, 32), np.int64)"
+    )
+    node.body[node.body.index(loop) : node.body.index(loop)] = statements(
+        "_f0a_state[29] = len(out_entry_i) + 1\n_f0a_state[33] = -1\n"
+        "_f0a_state[40] = tick\n_f0a_state[41] = tick_round\n"
+        "_f0a_state[42] = bracket_anchor\n_f0a_state[43] = combine\n"
+        "_f0a_state[44] = int(core.economic[E_ON_REJECT]) & 2"
     )
     # Independently derive actual open entry orders from matcher state at return.
     # This is a per-config diagnostic, never a hold-bar account read or write.
-    finish = "if err != ERR_NONE or core.account[2] != 0:\n    _f0a_clear(_f0a_state, _f0a_orders, n - 1)\n    _f0a_expected = 0\nelse:\n"
+    finish = "if err != ERR_NONE:\n    _account_kernel(_f0a_state, _f0a_orders, err, eb, s, pos)\n    _f0a_expected = 0\nelif core.account[2] != 0:\n    _f0a_clear(_f0a_state, _f0a_orders, n - 1)\n    _f0a_expected = 0\nelse:\n"
     if book:
         expected = (
             "_f0a_expected = int(pend != 0)\nif not venue:\n"
@@ -398,3 +446,181 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
     finish += "\n_f0a_state[23] = _f0a_expected"
     at_return = next(q for q, p in enumerate(node.body) if isinstance(p, ast.Return))
     node.body[at_return:at_return] = statements(finish)
+
+    class TypedEventCalls(ast.NodeTransformer):
+        """One native signature per event, including constant cancel/clear sites."""
+
+        integer_args = {
+            "_f0a_entry": (2, 6, 7, 8),
+            "_f0a_exit": (2,),
+            "_f0a_submit": (2, 3),
+            "_f0a_pending": (2, 3, 4),
+            "_f0a_release": (2, 3, 4),
+            "_f0a_complete": (2, 3, 5),
+            "_account_clock": (2, 4, 5),
+            "_account_attempt": (1, 2),
+            "_account_kernel": (2, 3, 4, 5),
+            "_f0a_clear": (2,),
+            "_account_fill_reserve": (5,),
+            "_account_reserves": (3, 4, 12),
+        }
+
+        def visit_Call(self, node: ast.Call) -> ast.Call:
+            call = node
+            self.generic_visit(call)
+            if not isinstance(call.func, ast.Name):
+                return call
+            name = call.func.id
+            if name == "_f0a_pending" and len(call.args) == 5:
+                call.args.append(ast.Tuple([ast.Constant(0.0), ast.Constant(0.0)], ast.Load()))
+            for index in self.integer_args.get(name, ()):
+                call.args[index] = ast.Call(
+                    ast.Attribute(ast.Name("np", ast.Load()), "int64", ast.Load()),
+                    [call.args[index]],
+                    [],
+                )
+            if name == "_account_attempt":
+                call.args[3] = ast.Call(
+                    ast.Attribute(ast.Name("np", ast.Load()), "bool_", ast.Load()),
+                    [call.args[3]],
+                    [],
+                )
+            if name == "_account_reserves":
+                call.args[14] = ast.Call(
+                    ast.Attribute(ast.Name("np", ast.Load()), "bool_", ast.Load()),
+                    [call.args[14]],
+                    [],
+                )
+                call.args[5] = ast.Call(
+                    ast.Attribute(ast.Name("np", ast.Load()), "bool_", ast.Load()),
+                    [call.args[5]],
+                    [],
+                )
+            return call
+
+    class EventClocks(ast.NodeTransformer):
+        depth = 0
+        quote: str | None = None
+        close_phase = False
+        status = 4
+        reason = 6
+
+        def attempt(self) -> Any:
+            paired = "False" if book else "cur_pair"
+            return statements(
+                f"if (s != 0 or {paired}) and _f0a_state[33] != i:\n"
+                "    _account_clock(_f0a_state, core.economic, i, c[i], 3, 10)\n"
+                f"    {reserves('i', '_held_ident(core, i)', paired)}\n"
+                f"    _account_attempt(_f0a_state, i, s, {paired})"
+            )
+
+        def prefix(self, part: ast.stmt, expression: ast.AST) -> Any:
+            calls = [
+                q
+                for q in ast.walk(expression)
+                if isinstance(q, ast.Call)
+                and isinstance(q.func, ast.Name)
+                and q.func.id
+                in (
+                    "_f0a_submit",
+                    "_f0a_release",
+                    "_f0a_pending",
+                    "_f0a_complete",
+                    "_f0a_clear",
+                    "_f0a_entry",
+                    "_f0a_exit",
+                    "_account_kernel",
+                )
+            ]
+            if not calls:
+                return [part]
+            quote = self.quote or ("c[i]" if self.close_phase or not book else "o[i]")
+            for call in calls:
+                assert isinstance(call.func, ast.Name)
+                if call.func.id == "_f0a_entry":
+                    quote = ast.unparse(call.args[3])
+                elif call.func.id == "_f0a_exit":
+                    quote = ast.unparse(call.args[4])
+                elif call.func.id == "_f0a_complete":
+                    reserve = call.args[4]
+                    assert isinstance(reserve, ast.Call)
+                    quote = ast.unparse(reserve.args[2])
+            return statements(
+                f"_account_clock(_f0a_state, core.economic, i, {quote}, {self.status}, {self.reason})"
+            ) + [part]
+
+        def visit_Assign(self, node: ast.Assign) -> Any:
+            part = node
+            # Refusals at an open retain that open's mark, never its later close.
+            value = part.value.elts[0] if isinstance(part.value, ast.Tuple) else part.value
+            target = ast.unparse(part.targets[0])
+            if (
+                target in ("(err, eb)", "error")
+                and isinstance(value, ast.Name)
+                and value.id.startswith("ERR_")
+                and value.id != "ERR_NONE"
+            ):
+                quote = self.quote or ("c[i]" if self.close_phase or not book else "o[i]")
+                return statements(
+                    f"_account_clock(_f0a_state, core.economic, i, {quote}, 2, 100 + {value.id})"
+                ) + [part]
+            return self.prefix(part, part.value)
+
+        def visit_Expr(self, node: ast.Expr) -> Any:
+            part = node
+            if (
+                isinstance(part.value, ast.Call)
+                and isinstance(part.value.func, ast.Name)
+                and part.value.func.id == "_core_decision"
+            ):
+                self.close_phase = True
+            return self.prefix(part, part.value)
+
+        def visit_If(self, node: ast.If) -> Any:
+            part = node
+            old = self.quote, self.status, self.reason
+            test = ast.unparse(part.test)
+            if "day_cancel" in test:
+                self.quote, self.status, self.reason = "o[i]", 5, 7
+            elif "stop_skip" in test:
+                self.status, self.reason = 3, 11
+            elif test == "oflat":
+                self.quote = "o[i]"
+            elif "cap" in test and "oi" in test:
+                self.quote, self.status, self.reason = "o[i]", 5, 12
+            elif test == "kind == _SLOT_PAIR_IOC":
+                self.status, self.reason = 5, 12
+            elif test == "pos != 0 or pend >= 0":
+                self.status, self.reason = 3, 10
+            self.generic_visit(part)
+            self.quote, self.status, self.reason = old
+            return self.prefix(part, part.test)
+
+        def visit_For(self, node: ast.For) -> Any:
+            part = node
+            old = self.quote
+            target = ast.unparse(part.target)
+            self.depth += 1
+            if target == "phase":
+                self.quote = "cx"
+            elif target == "m":
+                self.quote = "pt"
+            self.generic_visit(part)
+            if target == "i":
+                part.body += self.attempt()
+            self.depth -= 1
+            self.quote = old
+            return part
+
+        def visit_Continue(self, node: ast.Continue) -> Any:
+            part = node
+            return self.attempt() + [part] if self.depth == 1 else [part]
+
+    # Loop clocks are source-local expressions; the final error site uses eb.
+    EventClocks().visit(loop)
+    at_return = next(q for q, p in enumerate(node.body) if isinstance(p, ast.Return))
+    for statement in node.body[:at_return]:
+        if isinstance(statement, ast.If) and ast.unparse(statement.test) == "err != ERR_NONE":
+            statement.body[:0] = statements(reserves("eb", "_held_ident(core, eb)", "False"))
+
+    TypedEventCalls().visit(node)

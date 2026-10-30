@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from itertools import accumulate
 from pathlib import Path
 from types import FunctionType
-from typing import Any, NamedTuple, cast, get_type_hints
+from typing import Any, Literal, NamedTuple, cast, get_type_hints
 from typing import overload as typing_overload
 
 import numba as nb
@@ -23,6 +23,7 @@ from numba.core.errors import NumbaError
 
 from . import kernel as K
 from ._columns import DecisionColumns
+from .account import ACCOUNT_PREFIX, ORDER_MULTIPLIER, ORDER_WIDTH
 from .api import (
     ONE_TICK_SLOTS,
     SIGNAL_FIELDS,
@@ -50,7 +51,6 @@ from .api import (
     Result as EngineResult,
 )
 from .economic import (
-    E_ADMISSION,
     E_AMOUNT,
     E_BPS,
     E_CAP,
@@ -61,10 +61,12 @@ from .economic import (
     E_LOT_STEP,
     E_MIN_QTY,
     E_MODE,
+    E_ON_REJECT,
     E_POINT_VALUE,
     E_PROJECTED_OVERFLOW,
     E_QTY_START,
 )
+from .execution import ExecutionSpec, normalize_execution
 from .schema import Features, Params, Scalar, State, StrategySpec
 from .straddle import PAIR_FIELDS, PAIR_MESSAGES
 from .types import Bar, Decision, Position
@@ -131,8 +133,8 @@ def _run_columns_typed(
     _event_storage: bool = False,
     _final_states: list[np.recarray] | None = None,
     _qty_lane: np.ndarray | None = None,
-    _f0a_admission: str = "none",
-    _f0a_capture: list[np.ndarray] | None = None,
+    on_reject: Literal["raise", "record"] = "raise",
+    orders: Literal["full", "terminal"] = "full",
 ) -> list[EngineResult]:
     """Run independent compiled cores in parallel, returning one normal Result per config.
 
@@ -259,8 +261,6 @@ def _run_columns_typed(
     friction = (
         fixed_cost(costs.commission_per_side, costs.slippage_ticks, tick, pv, 2) if costs else 0.0
     )
-    if _f0a_admission not in ("none", "skip"):
-        raise ValueError("F0a admission must be none or skip")
     economic = np.zeros(E_QTY_START)
     economic[E_POINT_VALUE] = pv
     economic[E_FRICTION] = friction
@@ -274,7 +274,7 @@ def _run_columns_typed(
     economic[E_PROJECTED_OVERFLOW] = 0.0
     economic[E_ENTRY_NOTIONAL] = costs is not None and costs.fee_basis == "entry_notional"
     economic[E_CHECK_CASH] = sizing is not None and sizing.check_cash
-    economic[E_ADMISSION] = _f0a_admission == "skip"
+    economic[E_ON_REJECT] = int(on_reject == "record") | (2 if orders == "terminal" else 0)
     if _qty_lane is not None:
         # Fixed numeric transport: the named fixed prefix followed by the wanted
         # quantity lane. Shared, read-only input; only accepted entries read this tail.
@@ -387,8 +387,6 @@ def _run_columns_typed(
                 continue
             break
         meta = raw[1]
-        if _f0a_capture is not None:
-            _f0a_capture.append(meta[:, 10:].copy())
         configs = [
             _Config(
                 int(counts[p]),
@@ -403,6 +401,8 @@ def _run_columns_typed(
                 ev_val[p],
                 _event_storage,
                 risk_store[p],
+                raw[2][p],
+                raw[3][p],
             )
             for p in range(len(index))
         ]
@@ -465,11 +465,14 @@ def _run_columns_typed(
     rearm_refused = False
     lo = 0
     while lo < k:
-        # Per-config bytes; _event_budget inverts the sparse part for overflow reruns.
+        # Leave room for sparse-event growth within the same batch budget.
+        # Using only the initial sparse capacity can strand a dense replay behind
+        # the larger account log, forcing a second almost-complete replay.
         width = (
-            _event_row_bytes(compact.nrows) * event_capacity
+            _event_row_bytes(compact.nrows) * (n if _event_storage else event_capacity)
             + (8 * (capacity + 1) if _qty_lane is not None else 8 * n if own_risk else 0)
-            + capacity * _TRADE_ROW_BYTES
+            + (capacity + 1) * _TRADE_ROW_BYTES
+            + ACCOUNT_PREFIX * 8
             + (0 if _event_storage else (compact.nrows * 8 + 6) * n)
         )
         hi = min(k, lo + max(nb.get_num_threads(), _BATCH_BYTES // width))
@@ -522,7 +525,7 @@ def _run_columns_typed(
 _BATCH_BYTES = 256 << 20
 # Bytes a config needs per trade row (the seven trade columns), shared by the batch-size
 # choice and the event budget so the two cannot drift.
-_TRADE_ROW_BYTES = 42
+_TRADE_ROW_BYTES = 42 + 8 * (1 + ORDER_MULTIPLIER * ORDER_WIDTH)
 
 
 def _event_row_bytes(nrows: int) -> int:
@@ -537,7 +540,12 @@ def _initial_event_capacity(n: int) -> int:
 
 def _event_budget(m: int, nrows: int, trade_capacity: int, risk_bars: int) -> int:
     """Event rows per config that fit a batch of ``m`` in _BATCH_BYTES (the batch-size bytes)."""
-    spare = _BATCH_BYTES // m - 8 * risk_bars - _TRADE_ROW_BYTES * trade_capacity
+    spare = (
+        _BATCH_BYTES // m
+        - ACCOUNT_PREFIX * 8
+        - 8 * risk_bars
+        - _TRADE_ROW_BYTES * (trade_capacity + 1)
+    )
     return max(0, spare) // _event_row_bytes(nrows)
 
 
@@ -667,6 +675,8 @@ class _Config(NamedTuple):
     ev_val: np.ndarray
     sparse: bool
     risks: np.ndarray
+    quantities: np.ndarray
+    account_buffer: np.ndarray
 
 
 class _Buffers:
@@ -766,6 +776,8 @@ def _matched_result(
                 row[config.ev_bar[: config.ev_count]] = config.ev_val[: config.ev_count, rows[q]]
             return row
         row = config.levels[rows[q]]
+        if meta[0] and config.account_buffer[36] and q in (0, 1, 12, 13, 14, 28):
+            row = np.nan_to_num(row, nan=0.0)
         if dtype is not None:
             return row.astype(dtype)
         # Buffers are reused by the next batch: captured columns own their arrays.
@@ -773,7 +785,7 @@ def _matched_result(
 
     # Unvisited rows contain NaNs, not boolean decisions. Surface the matcher
     # refusal first, retaining complete terminal captures for causality checks.
-    if meta[0] and (captured is None or int(meta[9]) < len(bars)):
+    if meta[0] and not config.account_buffer[36] and (captured is None or int(meta[9]) < len(bars)):
         bar = int(meta[1])
         next_open = rules.effective_entry_fill is FillTiming.NEXT_OPEN
         price = float(bars.open[bar] if next_open else bars.close[bar])
@@ -820,7 +832,13 @@ def _matched_result(
     values = (
         np.array([cnt]),
         np.array([0, cnt]),
-        *(np.array([meta[q]], dtype=np.int64 if q < 4 else float) for q in range(6)),
+        *(
+            np.array(
+                [0 if q == 0 and config.account_buffer[36] else meta[q]],
+                dtype=np.int64 if q < 4 else float,
+            )
+            for q in range(6)
+        ),
         *(a.copy() for a in config.trades),
     )
 
@@ -837,6 +855,8 @@ def _matched_result(
         sizing=sizing,
         initial_cash=initial_cash,
         _run_columns=already_matched,
+        _loop_quantities=config.quantities,
+        _record_rejections=bool(config.account_buffer[36]),
         _entry_quantities=config.risks
         if sizing is not None and sizing.qty_feature is not None
         else None,
@@ -847,6 +867,14 @@ def _matched_result(
             frame["equity_usd"] = np.fromiter(
                 accumulate(frame["pnl_usd"], initial=initial_cash), dtype=float
             )[1:]
+    from .account import ACCOUNT_PREFIX, ORDER_WIDTH
+
+    start, count = ACCOUNT_PREFIX + 1 + config.width, int(meta[26])
+    result.__dict__["_order_rows"] = (
+        config.account_buffer[start : start + count * ORDER_WIDTH]
+        .reshape(count, ORDER_WIDTH)
+        .copy()
+    )
     return result
 
 
@@ -863,6 +891,17 @@ class GridResult[S: State]:
     results: tuple[Result[S], ...]
     params: pd.DataFrame
     states: np.recarray
+
+    @property
+    def orders(self) -> pd.DataFrame:
+        """Order rows in configuration order with stable grid row identities."""
+        frames = [result.orders.assign(config=i) for i, result in enumerate(self.results)]
+        if not frames:
+            from .account import ORDER_WIDTH
+            from .orders import order_frame
+
+            return order_frame(np.empty((0, ORDER_WIDTH)), None)
+        return pd.concat(frames, ignore_index=True)
 
     def __len__(self) -> int:
         """Number of configurations."""
@@ -1023,7 +1062,11 @@ def _record_run(
     if not states.dtype.names:
         final[0] = states
     for i, result in enumerate(results):
+        result.__dict__["_orders_terminal"] = kwargs.get("orders") == "terminal"
         result.states = cast(np.recarray, final[0][i : i + 1])
+    if kwargs.get("on_reject") == "record":
+        for result in results:
+            result.research_only = True
     typed = tuple(results)
     if grid is None:
         return typed[0]
@@ -1050,6 +1093,9 @@ def run[S: State, P: Params, F: Features](
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
+    on_reject: Literal["raise", "record"] = "raise",
+    orders: Literal["full", "terminal"] = "full",
+    execution: ExecutionSpec | None = None,
 ) -> Result[S]: ...
 
 
@@ -1068,6 +1114,9 @@ def run[S: State, P: Params, F: Features](
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
+    on_reject: Literal["raise", "record"] = "raise",
+    orders: Literal["full", "terminal"] = "full",
+    execution: ExecutionSpec | None = None,
 ) -> GridResult[S]: ...
 
 
@@ -1086,6 +1135,9 @@ def run[S: State, P: Params, F: Features](
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
+    on_reject: Literal["raise", "record"] = "raise",
+    orders: Literal["full", "terminal"] = "full",
+    execution: ExecutionSpec | None = None,
 ) -> Result[S] | GridResult[S]: ...
 
 
@@ -1103,6 +1155,9 @@ def run(
     jit: bool = True,
     signal_fields: Sequence[str] = SIGNAL_FIELDS,
     cash_accumulation: str = "batch",
+    on_reject: Literal["raise", "record"] = "raise",
+    orders: Literal["full", "terminal"] = "full",
+    execution: ExecutionSpec | None = None,
 ) -> Result[State] | GridResult[State]:
     """Execute a typed strategy through the shared fixed-ABI engine.
 
@@ -1111,8 +1166,19 @@ def run(
 
     No grid returns Result[S]; an explicit grid (including {}) returns GridResult[S].
     """
+    normalize_execution(execution)
+    if orders not in ("full", "terminal"):
+        raise ValueError("orders must be full or terminal")
+    if on_reject not in ("raise", "record"):
+        raise ValueError("on_reject must be raise or record")
     kwargs: dict[str, Any] = dict(
-        rules=rules, instrument=instrument, costs=costs, sizing=sizing, initial_cash=initial_cash
+        rules=rules,
+        instrument=instrument,
+        costs=costs,
+        sizing=sizing,
+        initial_cash=initial_cash,
+        on_reject=on_reject,
+        orders=orders,
     )
     if hasattr(step, "__strategy__"):
         return _record_run(

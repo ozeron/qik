@@ -28,6 +28,7 @@ from .api import (  # noqa: E402
     require_nautilus,
 )
 from .compiled import NAUTILUS, GridResult, run  # noqa: E402
+from .execution import AccountSpec, AdmissionSpec, ExecutionSpec  # noqa: E402
 from .grid import grid  # noqa: E402
 from .htf import htf, htf_align  # noqa: E402
 from .kernel import (  # noqa: E402
@@ -71,6 +72,9 @@ from .types import (  # noqa: E402
 )
 
 __all__ = [
+    "AccountSpec",
+    "AdmissionSpec",
+    "ExecutionSpec",
     "NAUTILUS",
     "GridResult",
     "Bar",

@@ -487,6 +487,19 @@ class Result[S = Any]:
     research_only: bool = False
 
     @property
+    def orders(self) -> pd.DataFrame:
+        """Entry order outcomes and event-time account snapshots."""
+        if "_orders" not in self.__dict__:
+            from .account import ORDER_WIDTH
+            from .orders import order_frame
+
+            rows = self.__dict__.get("_order_rows", np.empty((0, ORDER_WIDTH)))
+            self.__dict__["_orders"] = order_frame(
+                rows, self.index, terminal=self.__dict__.get("_orders_terminal", False)
+            )
+        return self.__dict__["_orders"]
+
+    @property
     def states(self) -> np.recarray:
         """Final strategy states; present only on results produced by typed run."""
         if "_states" not in self.__dict__:
@@ -561,6 +574,8 @@ def _simulate(
     initial_cash: float | None = None,
     _run_columns: Any = None,
     _entry_quantities: np.ndarray | None = None,
+    _loop_quantities: np.ndarray | None = None,
+    _record_rejections: bool = False,
 ) -> Result:
     """Run every config under the selected execution profile; defaults are Nautilus-compatible."""
 
@@ -1077,7 +1092,19 @@ def _simulate(
             if (open_contracts < 0).any():
                 r = int(np.flatnonzero(open_contracts < 0)[0])
                 _sizing_error(int(-open_contracts[r]), int(o_cfg[r]), int(o_entry[r]))
-        if sizing is not None and sizing.lot_step == 1.0 and sizing.min_qty == 1.0:
+        if _loop_quantities is not None:
+            # The closed-trade pass above is an equality witness. Quantities used
+            # for the result were fixed by the engine at the accepted entry fill.
+            actual = _loop_quantities[: len(trades)]
+            opened = np.full(len(open_positions), _loop_quantities[len(trades)])
+            if not np.array_equal(actual.view(np.uint64), contracts.astype(float).view(np.uint64)):
+                raise RuntimeError("in-loop sizing differs from closed-trade sizing witness")
+            if not np.array_equal(
+                opened.view(np.uint64), open_contracts.astype(float).view(np.uint64)
+            ):
+                raise RuntimeError("in-loop open sizing differs from closed-trade sizing witness")
+            contracts, open_contracts = actual.copy(), opened
+        if sizing is None or (sizing.lot_step == 1.0 and sizing.min_qty == 1.0):
             contracts = contracts.astype(np.int64)
             open_contracts = open_contracts.astype(np.int64)
         _check_liquidity(bars, e_i, x_i, cfg, contracts, instrument)
@@ -1095,7 +1122,7 @@ def _simulate(
         if initial_cash is not None:
             trades["equity_usd"] = initial_cash + trades.groupby("config")["pnl_usd"].cumsum()
             blown = np.flatnonzero(trades["equity_usd"].to_numpy() <= 0)
-            if blown.size:
+            if blown.size and not _record_rejections:
                 r = int(blown[0])
                 raise ValueError(
                     f"config {int(cfg[r])} runs out of cash at bar {int(x_i[r])} (equity "
