@@ -181,8 +181,11 @@ class Rules:
     ``"nautilus"`` reproduces Nautilus: entry fills, stop rejected, linked target cancelled, the
     position runs with no levels. The second is a venue-simulation artifact, not market behaviour.
 
-    NEXT_OPEN is available under Profile.TRADINGVIEW or Profile.REPRO for author reproduction;
-    it requires timezone-aware Bars.index and excludes limit-then-market entries.
+    Explicit NEXT_OPEN entry/exit clocks are qualified for Nautilus research with
+    DEFAULT fills, zero latency, callback protection and limit targets. They remain
+    non-deployable until V2 hosting is qualified. The market_fill NEXT_OPEN alias
+    requires Profile.TRADINGVIEW or Profile.REPRO. NEXT_OPEN requires timezone-aware
+    Bars.index and excludes limit-then-market entries on next-open entry clocks.
     ``latency_bars=1`` delays each command until the next bar's settlement. ``ONE_TICK``
     changes venue liquidity and needs Instrument.tick. Latency never combines with NEXT_OPEN;
     ONE_TICK does only with next-open entries (R15): each market, stop and flatten fill moves
@@ -283,8 +286,30 @@ class Rules:
             raise ValueError("bracket_policy must be a BracketPolicy enum")
         if self.bracket_anchor is not None and not isinstance(self.bracket_anchor, BracketAnchor):
             raise ValueError("bracket_anchor must be a BracketAnchor enum")
+        # Explicit clocks admit scheduled orders at the next observed open.
+        # The legacy market_fill alias remains reproduction-only.
+        native_next_open = self.market_fill is MarketFill.CLOSE and (
+            self.entry_fill is FillTiming.NEXT_OPEN or self.exit_fill is FillTiming.NEXT_OPEN
+        )
+        if (
+            self.profile is Profile.NAUTILUS
+            and native_next_open
+            and (
+                self.fill_model is not FillModel.DEFAULT
+                or self.latency_bars
+                or self.protection != "callback"
+                or self.target_order != "limit"
+            )
+        ):
+            raise ValueError(
+                "native NEXT_OPEN requires DEFAULT fills, zero latency, callback protection and limit targets"
+            )
         if self.profile is Profile.NAUTILUS and (
-            self.bracket_policy is not BracketPolicy.STOP_FIRST or self.bracket_anchor is not None
+            self.bracket_policy is not BracketPolicy.STOP_FIRST
+            or (
+                self.bracket_anchor is not None
+                and not (native_next_open and self.bracket_anchor is BracketAnchor.FILL)
+            )
         ):
             raise ValueError("non-default bracket rules require a repro profile")
         for name, enum in (
@@ -298,7 +323,10 @@ class Rules:
         if self.profile is Profile.NAUTILUS and (
             self.target_gap is not TargetGap.AT_LIMIT
             or self.tick_round is not TickRound.NONE
-            or self.flatten is not Flatten.NEXT_OPEN
+            or (
+                self.flatten is not Flatten.NEXT_OPEN
+                and not (native_next_open and self.flatten is Flatten.LAST_BAR_CLOSE)
+            )
             or self.session_boundary is not SessionBoundary.REFUSE
         ):
             raise ValueError("non-default target_gap/tick_round require a repro profile")
@@ -349,9 +377,14 @@ class Rules:
             raise ValueError(f"profile must be a Profile enum, got {self.profile!r}")
         if not isinstance(self.market_fill, MarketFill):
             raise ValueError(f"market_fill must be a MarketFill enum, got {self.market_fill!r}")
-        if (next_open or self.market_fill is MarketFill.NEXT_OPEN) and self.profile not in (
-            Profile.TRADINGVIEW,
-            Profile.REPRO,
+        if (
+            (next_open or self.market_fill is MarketFill.NEXT_OPEN)
+            and not (self.profile is Profile.NAUTILUS and native_next_open)
+            and self.profile
+            not in (
+                Profile.TRADINGVIEW,
+                Profile.REPRO,
+            )
         ):
             raise ValueError(
                 "MarketFill.NEXT_OPEN requires Profile.TRADINGVIEW or Profile.REPRO (repro only)"
@@ -537,6 +570,12 @@ def _simulate(
         signals.flatten is not None
         and np.asarray(signals.flatten).any()
         and rules.profile is Profile.NAUTILUS
+        and not (
+            rules.flatten is Flatten.LAST_BAR_CLOSE
+            and (
+                rules.entry_fill is FillTiming.NEXT_OPEN or rules.exit_fill is FillTiming.NEXT_OPEN
+            )
+        )
     ):
         raise ValueError("flatten intents require a repro profile")
     if rules.fill_model is FillModel.ONE_TICK and instrument is None:
@@ -883,6 +922,7 @@ def _simulate(
             arm_stop=rules.arm_stop == "next_bar",
             day_cancel=rules.day_order_expiry == "cancel",
             exit_next_open=exit_next_open,
+            native_open_priority=rules.profile is Profile.NAUTILUS,
             target_gap=rules.target_gap is TargetGap.GAP_IMPROVED,
             tick_round=tuple(TickRound).index(rules.tick_round),
             next_bar=rules.order_lifetime == "next_bar",
@@ -1073,6 +1113,13 @@ def _simulate(
     # V2 leaves a DAY limit resting across the NY date (A15): civil-date expiry is research-only.
     research_only = (
         rules.exit_and_rearm
+        or (
+            rules.profile is Profile.NAUTILUS
+            and (
+                rules.effective_entry_fill is FillTiming.NEXT_OPEN
+                or rules.effective_exit_fill is FillTiming.NEXT_OPEN
+            )
+        )
         or pair_used
         or ioc_used
         or rules.day_order_expiry == "cancel"

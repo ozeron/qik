@@ -39,6 +39,10 @@ R_DAY_CANCEL = 26
 R_NEXT_BAR = 27
 R_EXIT_AND_REARM = 28
 
+EXIT_CLOCK_CLOSE = 0
+EXIT_CLOCK_REPRO_OPEN = 1
+EXIT_CLOCK_NATIVE_OPEN = 2
+
 
 def rule_settings(
     *,
@@ -49,6 +53,7 @@ def rule_settings(
     protect_flatten: bool = False,
     next_open: bool = False,
     exit_next_open: bool | None = None,
+    native_open_priority: bool = False,
     latency_bars: int = 0,
     one_tick: bool = False,
     tick: float = 0.0,
@@ -87,7 +92,11 @@ def rule_settings(
     settings[R_STALE_DROP] = stale_drop
     settings[R_PROTECT_FLATTEN] = protect_flatten
     settings[R_NEXT_OPEN] = next_open
-    settings[R_EXIT_NEXT_OPEN] = exit_next_open
+    settings[R_EXIT_NEXT_OPEN] = (
+        (EXIT_CLOCK_NATIVE_OPEN if native_open_priority else EXIT_CLOCK_REPRO_OPEN)
+        if exit_next_open
+        else EXIT_CLOCK_CLOSE
+    )
     settings[R_LATENCY_BARS] = latency_bars
     settings[R_ONE_TICK] = one_tick
     settings[R_TICK] = tick
@@ -201,6 +210,9 @@ __all__ = [
     "REASON_STOP",
     "REASON_STOP_GAP",
     "RULES_WIDTH",
+    "EXIT_CLOCK_CLOSE",
+    "EXIT_CLOCK_REPRO_OPEN",
+    "EXIT_CLOCK_NATIVE_OPEN",
     "R_ADAPTIVE",
     "R_ADVERSE_FIRST",
     "R_AMEND_CLOSE",

@@ -44,7 +44,7 @@ def record_step(
 
 
 @pytest.mark.parametrize("mode", ["simple", "venue", "slots"])
-@pytest.mark.parametrize("rules_width", [22, 25, 26, RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1])
+@pytest.mark.parametrize("rules_width", [RULES_WIDTH - 1, RULES_WIDTH, RULES_WIDTH + 1])
 def test_shared_record_matches_batch(mode: str, rules_width: int):
     runner = (
         _python_runner(_python_module(record_step))

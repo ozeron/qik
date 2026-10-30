@@ -60,6 +60,7 @@ from .codes import (
     ERR_STALE_BOOK,
     ERR_STOP_IN_MARKET,
     ERR_TARGET_IN_MARKET,
+    EXIT_CLOCK_NATIVE_OPEN,
     R_ADAPTIVE,
     R_ADVERSE_FIRST,
     R_BRACKET_ANCHOR,
@@ -408,6 +409,20 @@ def _sweep(oi, hi, li, pos, stop, target, adaptive, adverse_first, target_gap):
     return 0, 0.0, 0, high_first
 
 
+@nb.njit(cache=True, nogil=True)
+def _native_open_close(side, open_px, stop, target):
+    """Resting protection sees the open quote before a scheduled market close.
+
+    Native qualification witnesses this on a real Nautilus quote stream. Repro
+    keeps its historical command-first convention. The settings width is fixed.
+    """
+    if not np.isnan(stop) and side * (open_px - stop) <= 0:
+        return REASON_STOP_GAP, open_px
+    if not np.isnan(target) and side * (open_px - target) >= 0:
+        return REASON_TARGET, target
+    return REASON_SIGNAL, open_px
+
+
 @nb.njit(cache=True, nogil=True, inline="always")
 def _stop_sentinel(side, level):
     """A stop that never touches when absent: -inf for a long, +inf for a short."""
@@ -472,6 +487,7 @@ def _book_loop(
     protect_flatten = flags & F_PROTECT_FLATTEN != 0
     next_open = flags & F_NEXT_OPEN != 0
     exit_next_open = flags & F_EXIT_NEXT_OPEN != 0
+    native_open_priority = rules[R_EXIT_NEXT_OPEN] == EXIT_CLOCK_NATIVE_OPEN
     cross_session = flags & F_CROSS_SESSION != 0
     day_cancel = flags & F_DAY_CANCEL != 0
     refuse_in_market = (flags & C_IN_MARKET_MASK) >> C_IN_MARKET_SHIFT == IN_MARKET_REFUSE
@@ -758,8 +774,11 @@ def _book_loop(
                     break
                 d = ring[2, ready]
                 if ring[1, ready] == K_OPEN_EXIT:
+                    why, close_px = REASON_SIGNAL, oi
+                    if native_open_priority:
+                        why, close_px = _native_open_close(pos, oi, stop, target)
                     _put_trade(
-                        count_only, base + cnt, ei, i, pos, ep, oi - pos * slip, REASON_SIGNAL, stop,
+                        count_only, base + cnt, ei, i, pos, ep, close_px - pos * slip, why, stop,
                         out_entry_i, out_exit_i, out_side, out_entry_px, out_exit_px,
                         out_reason, out_stop,
                     )  # fmt: skip
@@ -1295,6 +1314,7 @@ __all__ = [
     "VS_RESTING",
     "VS_SIZE",
     "_book_loop",
+    "_native_open_close",
     "_exit_flags",
     "_has_lane",
     "_held_ident",

@@ -67,6 +67,7 @@ from .book import (
     _held_level,
     _held_side,
     _lane_at,
+    _native_open_close,
     _rule_flags,
     _scratch_at,
 )
@@ -94,6 +95,7 @@ from .codes import (
     ERR_STOP_ENTRY_IN_MARKET,
     ERR_STOP_REPLACE_LATENCY,
     ERR_STRADDLE_SIDE_CANCEL,
+    EXIT_CLOCK_NATIVE_OPEN,
     R_AMEND_CLOSE,
     R_AMEND_KEEP,
     R_ARM_STOP,
@@ -102,6 +104,7 @@ from .codes import (
     R_COMBINE,
     R_COMPLETED_CLOSE,
     R_EXIT_AND_REARM,
+    R_EXIT_NEXT_OPEN,
     R_LATENCY_BARS,
     R_MIT,
     R_NEXT_BAR,
@@ -317,6 +320,7 @@ def _slots_loop(
     protect_flatten = flags & F_PROTECT_FLATTEN != 0
     next_open = flags & F_NEXT_OPEN != 0
     exit_next_open = flags & F_EXIT_NEXT_OPEN != 0
+    native_open_priority = rules[R_EXIT_NEXT_OPEN] == EXIT_CLOCK_NATIVE_OPEN
     cross_session = flags & F_CROSS_SESSION != 0
     day_cancel = flags & F_DAY_CANCEL != 0
     refuse_new_day = (flags & C_NEW_DAY_MASK) >> C_NEW_DAY_SHIFT == NEW_DAY_REFUSE_RESTING
@@ -1111,6 +1115,8 @@ def _slots_loop(
                                 reason = REASON_TARGET
                     elif kind == _SLOT_CLOSE or kind == _SLOT_PROTECT_FAIL:
                         reason = REASON_SIGNAL if kind == _SLOT_CLOSE else REASON_PROTECT_FAIL
+                        if native_open_priority and phase == 0 and live and kind == _SLOT_CLOSE:
+                            reason, q = _native_open_close(pos, q, stop, target)
                     elif kind == _SLOT_ARM_STOP:
                         if _in_market(pos, value, q, True):
                             if not protect_flatten:

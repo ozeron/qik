@@ -49,7 +49,9 @@ def test_one_tick_needs_instrument_and_keeps_compliance() -> None:
 
 
 @pytest.mark.parametrize("latency,one_tick", [(1, False), (0, True), (1, True)])
-def test_venue_kernel_equals_independent_reference_dense(latency: int, one_tick: bool) -> None:
+def test_venue_kernel_equals_independent_reference_dense(
+    latency: int, one_tick: bool, cases: int = 2000
+) -> None:
     from test_vector_engine import (
         _dense_limit_case,
         _kernel_final,
@@ -63,7 +65,7 @@ def test_venue_kernel_equals_independent_reference_dense(latency: int, one_tick:
     rng = np.random.default_rng(6100 + latency + 10 * one_tick)
     errors: set[int] = set()
     reasons: set[int] = set()
-    for _ in range(2000):
+    for _ in range(cases):
         a, side, exit_, stop, target, limit, sp, tp, chase, day = _dense_limit_case(rng)
         adaptive, reenter, flatten = (bool(rng.integers(2)) for _ in range(3))
         adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))

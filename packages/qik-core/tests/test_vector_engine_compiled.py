@@ -356,8 +356,34 @@ def test_replay_original_hypothesis_corpus(monkeypatch, slots, entry_clock, exit
     test_kernel_equals_reference(next_open=entry_clock, exit_next_open=exit_clock, slots=slots)
 
 
+# One case per dense corpus, so a parallel run spreads them over its workers (as one test they
+# ran back to back: 605 s on one devbox worker while the others idled). The replay runs the first
+# tenth of each non-slots corpus, and a fifth of each slots corpus to retain rare ERR9/ERR6
+# refusals. The full corpus tests independently check every kernel case; the replay path
+# (decisions rebuilt from the 15 feature lanes) retains each corpus's outcome-coverage asserts.
+REPLAY_SHARE = 10
+_CLOCKS = ((False, False), (True, True), (True, False), (False, True))
+DENSE_CORPORA = [
+    *(("both_stale_modes", clocks) for clocks in _CLOCKS),
+    ("limit_entries", ()),
+    *(
+        case
+        for latency in (0, 1)
+        for one_tick in (False, True)
+        for case in (
+            *((("venue", (latency, one_tick)),) if latency or one_tick else ()),
+            *(("slots", (latency, one_tick, oto, False, False)) for oto in (False, True)),
+        )
+    ),
+    *(("slots", (0, False, oto, *clocks)) for oto in (False, True) for clocks in _CLOCKS[1:]),
+]
+
+
 @pytest.mark.final
-def test_replay_original_dense_corpora(monkeypatch):
+@pytest.mark.parametrize(
+    "corpus,args", DENSE_CORPORA, ids=[f"{k}-{'-'.join(map(str, a))}" for k, a in DENSE_CORPORA]
+)
+def test_replay_original_dense_corpora(monkeypatch, corpus, args):
     import test_vector_engine as base
     import test_vector_engine_slots as slots_module
     from test_vector_engine import (
@@ -369,22 +395,14 @@ def test_replay_original_dense_corpora(monkeypatch):
 
     monkeypatch.setattr(base, "kernel_columns", compare)
     monkeypatch.setattr(slots_module, "kernel_columns", compare)
-    for entry_clock, exit_clock in ((False, False), (True, True), (True, False), (False, True)):
-        test_kernel_equals_reference_dense_both_stale_modes(entry_clock, exit_clock)
-    test_kernel_equals_reference_dense_limit_entries()
-    for latency in (0, 1):
-        for one_tick in (False, True):
-            if latency or one_tick:
-                test_venue_kernel_equals_independent_reference_dense(latency, one_tick)
-            for oto in (False, True):
-                test_slots_kernel_equals_independent_reference_dense(
-                    latency, one_tick, oto, False, False
-                )
-    for oto in (False, True):
-        for entry_clock, exit_clock in ((True, True), (True, False), (False, True)):
-            test_slots_kernel_equals_independent_reference_dense(
-                0, False, oto, entry_clock, exit_clock
-            )
+    replay = {
+        "both_stale_modes": test_kernel_equals_reference_dense_both_stale_modes,
+        "limit_entries": test_kernel_equals_reference_dense_limit_entries,
+        "venue": test_venue_kernel_equals_independent_reference_dense,
+        "slots": test_slots_kernel_equals_independent_reference_dense,
+    }[corpus]
+    full = inspect.signature(replay).parameters["cases"].default
+    replay(*args, cases=full // (5 if corpus == "slots" else REPLAY_SHARE))
 
 
 class CaptureFeatures(Features):

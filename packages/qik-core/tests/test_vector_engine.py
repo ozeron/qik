@@ -302,12 +302,12 @@ def test_next_open_equals_shifted_close_for_unprotected_markets(
 @pytest.mark.parametrize("exit_next_open", [False, True])
 @pytest.mark.parametrize("next_open", [False, True])
 def test_kernel_equals_reference_dense_both_stale_modes(
-    next_open: bool, exit_next_open: bool
+    next_open: bool, exit_next_open: bool, cases: int = 2500
 ) -> None:
     rng = np.random.default_rng(11)
     stale_hits = 0
     for stale_drop in (False, True):
-        for _ in range(2500):
+        for _ in range(cases):
             arrays, side, exit_, stop, target = _dense_case(rng)
             adverse_first, bracket_anchor = bool(rng.integers(2)), int(rng.integers(3))
             adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)
@@ -350,7 +350,8 @@ def test_kernel_equals_reference_dense_both_stale_modes(
                 assert trades == _ref_trades(ref)
                 assert _kernel_final(final) == _ref_final(ref)
     if not next_open:
-        assert stale_hits > 10  # the stale-book branch is really exercised in error mode
+        # the stale-book branch is really exercised in error mode (> 10 in the full 2500)
+        assert stale_hits > cases // 250
     else:
         assert stale_hits == 0  # next-open entries never use the preceding close's stale book
 
@@ -422,10 +423,10 @@ LIMIT_OUTCOMES = ("limit_fill", "chase", "marketable", "same_bar_target", "err_p
                   "protect_fail")  # fmt: skip
 
 
-def test_kernel_equals_reference_dense_limit_entries() -> None:
+def test_kernel_equals_reference_dense_limit_entries(cases: int = 6000) -> None:
     rng = np.random.default_rng(23)
     seen = dict.fromkeys(LIMIT_OUTCOMES, 0)
-    for _ in range(6000):
+    for _ in range(cases):
         (arrays, side, exit_, stop, target, limit, stop_pts, target_pts, chase,
          new_day) = _dense_limit_case(rng)  # fmt: skip
         adaptive, reenter = bool(rng.random() < 0.5), bool(rng.random() < 0.8)

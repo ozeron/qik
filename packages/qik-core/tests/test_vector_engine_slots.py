@@ -215,14 +215,19 @@ def test_invalid_core_slot_is_not_silently_dropped() -> None:
     ],
 )
 def test_slots_kernel_equals_independent_reference_dense(
-    latency: int, one_tick: bool, oto: bool, next_open: bool, exit_next_open: bool
+    latency: int,
+    one_tick: bool,
+    oto: bool,
+    next_open: bool,
+    exit_next_open: bool,
+    cases: int = 1000,
 ) -> None:
     from test_vector_engine import _nan_free
 
     rng = np.random.default_rng(18000 + latency + 10 * one_tick + 100 * oto)
     errors: set[int] = set()
     reasons: set[int] = set()
-    for case_i in range(1000):
+    for case_i in range(cases):
         n = int(rng.integers(6, 65))
         o = 100 + rng.integers(-12, 13, n) * 0.25
         c = o + rng.integers(-4, 5, n) * 0.25

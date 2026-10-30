@@ -108,8 +108,8 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
         raise ValueError(f"F0a site census changed: {node.name}: {dict(before)}")
     digest = _digest([(r["marker"], r["shape"], r["enclosing"]) for r in census(node)])
     pinned = {
-        "_book_loop": "9162ba843b0a83cbc4699b3fab9187685a8299903489bb0b64a55276b7b11ad5",
-        "_slots_loop": "1eaf2a800c1a93682a00f80b8b9a19b3ef2fb03a193b099c159ed6b405c54c84",
+        "_book_loop": "04046e4fcc092313f79d302ce53e4719d6b10fb61dd435ce6c9b7700370c3bbd",
+        "_slots_loop": "23270d31e06a9e93d905b4de322212fd84ee483e2a746f2aae2dd9c762e85573",
     }
     if digest != pinned[node.name]:
         raise ValueError(f"F0a enclosing AST changed: {node.name}: {digest}")
