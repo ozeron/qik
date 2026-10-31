@@ -1,7 +1,7 @@
 """Opt-in shared 1-D feature preparation, independent of the engine runner.
 
-Builders receive declared, immutable Series at the base decision clock. F1 has
-no external-clock adapters or config grouping; pass one explicit scalar binding.
+Builders receive declared, immutable Series at the base decision clock. The opt-in
+run wrapper streams parameter groups through the unchanged engine runner.
 """
 
 from __future__ import annotations
@@ -23,8 +23,9 @@ import pandas as pd
 
 from . import _identity
 from ._identity import array_identity, code_identity, digest, function_identity, normalize, scalar
+from ._runner import run
 
-__all__ = ["FeaturePlan", "feature", "param", "with_features"]
+__all__ = ["FeaturePlan", "feature", "param", "with_features", "run", "quantity_from_risk"]
 
 Array = np.ndarray
 Verification = Literal["sampled", "exhaustive"] | None
@@ -37,7 +38,7 @@ class Param:
 
 
 def param(name: str) -> Param:
-    """Declare a scalar dependency; F1 resolves one explicit binding, never a grid."""
+    """Declare a scalar dependency, resolved from a binding or managed grid row."""
     if not name.isidentifier():
         raise ValueError(f"invalid param name {name!r}")
     return Param(name)
@@ -95,6 +96,9 @@ class FeaturePlan[T]:
             raise ValueError(f"{schema.__name__}: plan/schema fields differ")
         if any(not isinstance(n, Feature) for n in nodes.values()):
             raise TypeError("plan outputs must be declared features")
+        getattr(schema, "validate_values")(
+            {k: np.empty(0, dtype=n.dtype) for k, n in nodes.items()}, 0
+        )
         self.schema = schema
         self.nodes = MappingProxyType(nodes)
         self._ordered()  # detect cycles before any builder runs
@@ -130,6 +134,7 @@ class FeaturePlan[T]:
         source_manifest: Mapping[str, object] | None = None,
         verify_features: Verification = None,
         cache: Path | Literal[False] | None = None,
+        _shared: dict[Feature, tuple[Array, str]] | None = None,
     ) -> T:
         """Prepare one scalar binding. Verification always bypasses cached prefix outputs.
 
@@ -219,7 +224,14 @@ class FeaturePlan[T]:
                 ),
             )
         ]
+        independent: dict[Feature, bool] = {}
         for node in ordered:
+            independent[node] = not any(
+                isinstance(v, Param) for v in node.bindings.values()
+            ) and all(independent[v] for v in node.inputs.values() if isinstance(v, Feature))
+            if _shared is not None and node in _shared:
+                values[node], identities[node] = _shared[node]
+                continue
             label = labels[node]
             identity = {
                 "version": 2,
@@ -234,7 +246,12 @@ class FeaturePlan[T]:
                     k: identities[v] if isinstance(v, Feature) else source_keys[v]
                     for k, v in node.inputs.items()
                 },
-                "runtime": [sys.version, np.__version__, pd.__version__],
+                "runtime": [
+                    sys.version,
+                    np.__version__,
+                    pd.__version__,
+                    _identity.backend_identity(),
+                ],
                 "planner": planner,
             }
             provenance[node] = identity
@@ -246,6 +263,8 @@ class FeaturePlan[T]:
                 missed.add(node)
                 value = _compute(node, sources, values, index, bound[node], label)
             values[node] = value
+            if _shared is not None and independent[node]:
+                _shared[node] = (value, key)
         # Recompute the ENTIRE graph for each prefix, not a slice of cached dependencies.
         for cut in cuts:
             prefix: dict[Feature, Array] = {}
@@ -272,7 +291,7 @@ class FeaturePlan[T]:
         # Publish only after all validation/verification succeeds.
         if root is not None:
             for node in ordered:
-                if node not in missed and verify_features is None:
+                if node not in provenance or (node not in missed and verify_features is None):
                     continue
                 _write(
                     root / f"{identities[node]}.npz",
@@ -433,7 +452,7 @@ def _publish(
 
 
 def with_features(plan: FeaturePlan[Any]) -> Callable[[Any], Any]:
-    """Attach metadata only; F1 callers explicitly materialize and pass features=."""
+    """Attach a plan for qik.features.run; the raw engine runner stays unchanged."""
 
     def attach(step: Any) -> Any:
         if hasattr(step, "feature_plan"):
@@ -445,3 +464,31 @@ def with_features(plan: FeaturePlan[Any]) -> Callable[[Any], Any]:
         return step
 
     return attach
+
+
+def quantity_from_risk(
+    distance: Feature,
+    *,
+    risk_usd: object,
+    multiple: object,
+    point_value: object,
+    minimum: object = 0.0,
+) -> Feature:
+    """Decision-known desired quantity; Q1 owns lot rounding, min/cap admission."""
+    return feature(inputs={"distance": distance}, dtype="float64", warmup=0, allow_nan=True)(
+        _quantity
+    )(risk_usd=risk_usd, multiple=multiple, point_value=point_value, minimum=minimum)
+
+
+def _quantity(
+    x: Any, *, risk_usd: float, multiple: float, point_value: float, minimum: float
+) -> Array:
+    if not all(np.isfinite(v) and v > 0 for v in (risk_usd, multiple, point_value)):
+        raise ValueError("quantity risk_usd, multiple and point_value must be positive finite")
+    if not np.isfinite(minimum) or minimum < 0:
+        raise ValueError("quantity minimum must be nonnegative finite")
+    distance = x.distance.to_numpy()
+    out = np.full(len(distance), np.nan)
+    good = np.isfinite(distance) & (distance > 0)
+    out[good] = np.maximum(minimum, risk_usd / (distance[good] * multiple * point_value))
+    return out

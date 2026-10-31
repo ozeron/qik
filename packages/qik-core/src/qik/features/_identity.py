@@ -5,6 +5,7 @@ from __future__ import annotations
 import dis
 import hashlib
 import json
+import struct
 import types
 from typing import Any
 
@@ -49,7 +50,7 @@ def scalar(value: Any) -> object:
     if type(value) in (str, bool, int):
         return [type(value).__name__, value]
     if type(value) is float:
-        return ["float", value.hex()]
+        return ["float", struct.pack(">d", value).hex()]
     if type(value) in (tuple, list):
         return [type(value).__name__, [scalar(v) for v in value]]
     if isinstance(value, dict) and all(type(k) is str for k in value):
@@ -169,3 +170,57 @@ def function_identity(fn: Any) -> object:
         return scalar(obj)
 
     return visit(fn)
+
+
+def backend_identity() -> object:
+    """Numerical backend build/selection, independent of checkout/install paths.
+
+    Accelerate reports no library version: the OS build binds that implementation.
+    Directory hints in NumPy's build report describe build locations, not semantics.
+    """
+    import importlib.metadata
+    import os
+    import platform
+
+    def version(name: str) -> str | None:
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def content(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                k: content(v)
+                for k, v in value.items()
+                if k != "Python Information" and "directory" not in k.lower()
+            }
+        if isinstance(value, list):
+            return [content(v) for v in value]
+        return value
+
+    return {
+        "numpy_build": content(np.__config__.show(mode="dicts")),
+        "os_build": [platform.system(), platform.release(), platform.version(), platform.machine()],
+        "bottleneck": version("bottleneck"),
+        "numexpr": version("numexpr"),
+        "pandas_compute": {
+            name: pd.get_option("compute." + name) for name in ("use_bottleneck", "use_numexpr")
+        },
+        "numpy_errors": np.geterr(),
+        "selection": {
+            name: os.environ.get(name)
+            for name in (
+                "OPENBLAS_CORETYPE",
+                "NPY_DISABLE_CPU_FEATURES",
+                "OPENBLAS_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "MKL_CBWR",
+                "MKL_DEBUG_CPU_TYPE",
+                "OMP_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+                "NUMEXPR_MAX_THREADS",
+            )
+        },
+    }
