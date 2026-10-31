@@ -90,7 +90,7 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
             "ORDER_SUBMIT_RELEASE": 17,
             "SAVE": 1,
             "RESTORE": 1,
-            "ORDER_SUBMIT": 16,
+            "ORDER_SUBMIT": 17,
             "ORDER_RELEASE": 1,
             "ENTRY_QUANTITY": 7,
         },
@@ -108,7 +108,7 @@ def instrument(node: ast.FunctionDef, callback: bool) -> None:
         raise ValueError(f"F0a site census changed: {node.name}: {dict(before)}")
     digest = _digest([(r["marker"], r["shape"], r["enclosing"]) for r in census(node)])
     pinned = {
-        "_book_loop": "04046e4fcc092313f79d302ce53e4719d6b10fb61dd435ce6c9b7700370c3bbd",
+        "_book_loop": "ac977bc3fedae67f568768e6e0b4013d643a281afa2d7d02a8fa5146b28357b1",
         "_slots_loop": "23270d31e06a9e93d905b4de322212fd84ee483e2a746f2aae2dd9c762e85573",
     }
     if digest != pinned[node.name]:

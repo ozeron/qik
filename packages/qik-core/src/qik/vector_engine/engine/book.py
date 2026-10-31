@@ -994,7 +994,7 @@ def _book_loop(
                             err, eb = ERR_RING_OVERFLOW, i
                     vs[VS_CLOSING], vs[VS_REASON] = 1, REASON_SIGNAL
                 if pos != 0:
-                    if vs[VS_PROT] == 2:
+                    if vs[VS_PROT] == 1 or vs[VS_PROT] == 2:
                         qmask, qhead, qtail, ok = _cmd_push(
                             ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vs[VS_GEN], -1
                         )
@@ -1107,7 +1107,8 @@ def _book_loop(
                         else:
                             pend = zero
                 elif kind == K_PROTECT and vs[VS_GEN] == vd:
-                    vs[VS_PROT] = 2
+                    if vs[VS_PROT] != 3:
+                        vs[VS_PROT] = 2
                     if pos != 0:
                         if _in_market(pos, stop, ci, True):
                             # The venue rejects a stop at or through the market (A10).
@@ -1117,6 +1118,15 @@ def _book_loop(
                             vs[VS_REJECTED] = 1
                             if np.isnan(target):
                                 vs[VS_PROT] = 0
+                            else:
+                                # The rejection callback clears the owned target even
+                                # while its submission is in flight (V2 11e1a204e).
+                                qmask, qhead, qtail, ok = _cmd_push(
+                                    ring, qmask, qhead, qtail, i + lat, K_UNPROTECT, vd, -1
+                                )
+                                if not ok:
+                                    err, eb = ERR_RING_OVERFLOW, i
+                                vs[VS_PROT] = 3
                             if vs[VS_CLOSING] == 0:
                                 vs[VS_REASON] = REASON_PROTECT_FAIL
                                 qmask, qhead, qtail, ok = _cmd_push(
