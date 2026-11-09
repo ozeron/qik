@@ -49,7 +49,7 @@ def session_masks(
     Missing terminal bars never move end/cutoff backwards. Early-close is a
     calendar attribute on all rows of that date, not inferred from tape length.
 
-    Admitted: P019 and P021 load_data session clipping; calendar shortening
+    Admitted: legacy load_data session clipping; calendar shortening
     is explicit caller input rather than their fixed-clock assumption.
     """
     if not 0 <= cutoff_min < 1440 or bar_minutes < 1:
@@ -127,7 +127,7 @@ def session_range(
     within each unique session. Missing minutes are never synthesized; min_bars
     is an explicit admission choice. Empty/underfilled windows stay NaN/unready.
     Bounds can feed range_breakout directly; flat ranges remain caller policy.
-    Admitted: P012 strategy.build_opening_ranges and P064 repro.prepare_days.
+    Admitted: legacy opening-range builders.
     """
     h, lo = np.asarray(high, dtype=np.float64), np.asarray(low, dtype=np.float64)
     key, clock = np.asarray(session), np.asarray(clock_min)
@@ -166,7 +166,7 @@ def anchored_vwap(
     cumulative volume is positive output is NaN; later zero-volume bars hold.
     Nonfinite inputs/negative volume are refused. Reuses qik.indicators sums:
     naive (sequential) or kahan (pandas compensated), never subtract global sums.
-    Admitted: P012 features.add_session_vwap, P100 repro.features (kahan).
+    Admitted: legacy session-VWAP features (naive and kahan).
     """
     px, vol, rst = (
         np.asarray(price, dtype=np.float64),

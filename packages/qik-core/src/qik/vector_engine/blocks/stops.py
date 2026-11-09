@@ -19,7 +19,7 @@ def _side(side: int) -> None:
 def atr_stop(anchor: float, side: int, atr: float, multiple: float) -> float:
     """Raw ATR stop; caller selects anchor, ATR seed/freeze and tick conversion.
 
-    Admitted: P059 BreakoutCore and C001 vector.signals.
+    Admitted: a breakout core and a crypto trend strategy's signals.
     NaN ATR propagates during indicator warmup, as in both original cores.
     """
     _side(side)
@@ -34,7 +34,7 @@ def atr_stop(anchor: float, side: int, atr: float, multiple: float) -> float:
 def _trailing_stop(anchor: float, side: int, distance: float, tick: float) -> Decision:
     """Outward tick-rounded candidate from a caller-owned anchor and distance.
 
-    Admitted: P059 high-water/frozen-ATR and C001 close/refreshing-ATR trails.
+    Admitted: high-water/frozen-ATR and close/refreshing-ATR trails.
     Select ``Rules(stop_update_mode="ratchet")`` to ratchet in execution. This
     helper retains no position state and does not filter candidates against fills.
     """

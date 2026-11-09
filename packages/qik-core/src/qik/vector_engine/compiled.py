@@ -556,7 +556,7 @@ def _grow_event_capacity(
 
     A stopped config stored ``events`` and stopped at the next one, after ``reached`` bars
     (a full buffer, or a first-launch projection past twice the capacity). Every overflow
-    reruns the whole batch, so doubling from three percent cost a dense strategy (P059:
+    reruns the whole batch, so doubling from three percent cost a dense strategy (a breakout core:
     ~0.45 events a bar) four wasted reruns. An extrapolated rate may not reserve more than
     the batch's ``budget`` rows (the bytes the batch size was chosen for); only doubling,
     after a real overflow, grows past it.

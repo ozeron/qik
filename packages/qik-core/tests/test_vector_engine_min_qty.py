@@ -120,7 +120,7 @@ def test_rounding_boundary(lot: float, offset: float) -> None:
 
 
 def test_batch_clamp_matches_floor_to_one_projects() -> None:
-    # P025 qty_for_stop and P051 _qty_for_risk: max(1, min(max_qty, floor(risk / (stop * pv)))).
+    # Legacy risk sizing: max(1, min(max_qty, floor(risk / (stop * pv)))).
     n = 2000
     rng = np.random.default_rng(11)
     c = (16000 + np.cumsum(rng.integers(-3, 4, n))) * 0.25

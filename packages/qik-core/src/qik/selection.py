@@ -21,7 +21,7 @@ statistics and give different numbers; keep them apart and say which one a repor
 Moments are z-score moments (``mean(z**3)``, ``mean(z**4)`` with ``z = (r - mean) / std(ddof=0)``).
 ``mean(c**3) / m2**1.5`` differs by an ulp; copies using it are not covered.
 
-Not covered: P081 ``n_eff_from_paths`` answers ``float(k)`` (``None`` for ``k = 0``) with a note when it
+Not covered: a legacy ``n_eff_from_paths`` answers ``float(k)`` (``None`` for ``k = 0``) with a note when it
 has fewer than 3 rows or fewer than 2 usable paths; ``n_eff_participation`` raises instead.
 """
 
@@ -68,10 +68,10 @@ def dsr_inputs(returns: Any, *, constant: Literal["none"]) -> DsrInputs | None: 
 def dsr_inputs(returns: Any, *, constant: Literal["raise", "none"]) -> DsrInputs | None:
     """Sharpe (mean / sample SD, not annualized), n, z-score skew and raw kurtosis of ``returns``.
 
-    NaN entries are dropped first (P079 instead calls a column with any NaN undefined: callers matching
+    NaN entries are dropped first (one legacy copy instead calls a column with any NaN undefined: callers matching
     it must drop such columns themselves). A series with fewer than two observations, zero sample SD or a
     NaN sample SD (an infinite entry) has an undefined Sharpe: ``constant="raise"`` raises ``ValueError``,
-    ``"none"`` returns ``None`` (as P079 does for a constant series). P076/P105/P097 raise for such
+    ``"none"`` returns ``None`` (as that copy does for a constant series). The other legacy copies raise for such
     a series too, from ``deflated_sharpe``.
     """
     if constant not in ("raise", "none"):
@@ -250,7 +250,7 @@ def n_eff_participation(
     * ``constant``: constant columns are dropped or raise. Constant means a population SD (``np.nanstd``
       over the matrix, axis 0) of exactly float zero, with no tolerance, so equal copies of a value are
       constant only if the reduction rounds to 0.0: ``np.full((10, 2), 0.1)`` gives 1.4e-17 per column
-      and is kept, while ``DataFrame.std(ddof=0)`` gives 0.0 for it (P097 uses the latter, so it
+      and is kept, while ``DataFrame.std(ddof=0)`` gives 0.0 for it (one legacy copy uses the latter, so it
       drops such a column where this function keeps it).
     * ``nonfinite``: columns with any non-finite value are dropped (they count in ``n_dropped``) or
       kept. A kept column still has NaN correlations, handled by ``nan_corr``; its constancy is then

@@ -78,9 +78,7 @@ def test_dedupe_skips_same_and_raises_on_change(tmp_path: Path) -> None:
     path = tmp_path / "trials.csv"
     append_ledger(path, [row(1), row(2)], project="P900", when=WHEN)
     before = path.read_bytes()
-    again = append_ledger(
-        path, [row(1), row(2), row(3), row(3)], project="P900", when="2026-10-22"
-    )
+    again = append_ledger(path, [row(1), row(2), row(3), row(3)], project="P900", when="2026-10-22")
     assert again == LedgerReport(1, 3)  # other date is still the same trial
     with pytest.raises(LedgerError, match="other content"):
         append_ledger(path, [row(1, note="changed")], project="P900", when=WHEN)
@@ -285,7 +283,7 @@ def test_race_creating_missing_ledger_writes_one_header(tmp_path: Path) -> None:
 # The writers' code is copied here on purpose: frozen projects are neither imported nor edited.
 
 
-def _p076(path: Path, r: dict) -> None:  # screen_run.py: append_trials
+def _p076(path: Path, r: dict) -> None:  # legacy writer A: append_trials
     with path.open("a", newline="") as fh:
         w = csv.writer(fh, quoting=csv.QUOTE_NONNUMERIC, lineterminator="\n")
         sh = r["sharpe"]
@@ -303,7 +301,7 @@ def _p076(path: Path, r: dict) -> None:  # screen_run.py: append_trials
         )
 
 
-def _p097(path: Path, r: dict) -> None:  # screen.py: append_trials_csv
+def _p097(path: Path, r: dict) -> None:  # legacy writer B: append_trials_csv
 
     def q(s: str) -> str:
         return '"' + s.replace('"', '""') + '"'
@@ -315,7 +313,7 @@ def _p097(path: Path, r: dict) -> None:  # screen.py: append_trials_csv
         )
 
 
-def _p105(path: Path, r: dict) -> None:  # screen.py: append_trials_csv
+def _p105(path: Path, r: dict) -> None:  # legacy writer C: append_trials_csv
     with path.open("a", newline="") as fh:
         w = csv.writer(fh, quoting=csv.QUOTE_NONNUMERIC)
         w.writerows(
@@ -334,9 +332,7 @@ def _p105(path: Path, r: dict) -> None:  # screen.py: append_trials_csv
         )
 
 
-@pytest.mark.parametrize(
-    ("project", "legacy"), [("P076", _p076), ("P097", _p097), ("P105", _p105)]
-)
+@pytest.mark.parametrize(("project", "legacy"), [("P076", _p076), ("P097", _p097), ("P105", _p105)])
 def test_parsed_fields_equal_legacy_writers(tmp_path: Path, project: str, legacy) -> None:
     sample = {
         "cell": "A1-L2",

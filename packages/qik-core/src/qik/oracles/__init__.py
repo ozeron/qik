@@ -24,7 +24,7 @@ COLUMNS = ("entry_ts", "exit_ts", "side", "qty", "entry_px", "exit_px", "pnl", "
 class TradeFrame:
     """Canonical trades; source carries provenance, clock and P&L units.
 
-    Row order is significant: matching follows P063's first-unused candidate
+    Row order is significant: matching follows the reference oracle's first-unused candidate
     policy. Missing qty/P&L/reason are permitted; an open trade has null exit clock
     and price. Entry clock and price are required.
     Extra input columns are retained. Side is +1 (long) or -1 (short).
@@ -129,7 +129,7 @@ def parse_tradingview_list_of_trades(path: str | Path) -> TradeFrame:
 
 
 def parse_pyne(path: str | Path) -> TradeFrame:
-    """P063 PyneCore list-of-trades CSV; Date/Time is the runtime's UTC clock."""
+    """PyneCore list-of-trades CSV; Date/Time is the runtime's UTC clock."""
     return _parse_list(Path(path), platform="pyne", utc=True)
 
 

@@ -1,4 +1,4 @@
-"""R15: ONE_TICK with next-open entries (P025, P024): hand cases, refusals, kernel == reference."""
+"""R15: ONE_TICK with next-open entries: hand cases, refusals, kernel == reference."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def test_entry_slips_and_protection_anchors_on_the_slipped_fill(side: int) -> No
     t = trade(RULES, side, entry(side, stop_points=2.0))
     assert (t.entry_i, t.exit_i, t.reason) == (1, 2, "stop")
     assert t.entry_px == mirror(side, 101.25)
-    assert t.stop == mirror(side, 99.25)  # slipped fill minus the distance (legacy P025/P024)
+    assert t.stop == mirror(side, 99.25)  # slipped fill minus the distance (legacy)
     assert t.exit_px == mirror(side, 99.0)  # the stop price, one tick worse
 
 

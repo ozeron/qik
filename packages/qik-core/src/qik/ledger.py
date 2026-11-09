@@ -12,12 +12,12 @@ Existing rows may use CRLF or LF; they are accepted as they are, new rows are al
 
 Differences from the legacy per-project writers (parsed fields are what matters, not bytes):
 
-* P076 (``screen_run.append_trials``): same dialect and same parsed fields; NaN sharpe is
+* writer A (``append_trials``): same dialect and same parsed fields; NaN sharpe is
   ``""``. It dedupes on ``variant_id`` among ``stage == "optimize"`` rows only; here the
   id is unique across the whole file.
-* P097 (``screen.append_trials_csv``): hand-quoted, so the note's ``"`` is doubled exactly as
+* writer B (``append_trials_csv``, hand-quoted): hand-quoted, so the note's ``"`` is doubled exactly as
   csv does; no NaN guard (would write ``"nan"``); date from ``time.strftime``. Parsed fields equal.
-* P105 (``screen.append_trials_csv``): QUOTE_NONNUMERIC with the platform default ``\\r\\n``
+* writer C (``append_trials_csv``, csv module): QUOTE_NONNUMERIC with the platform default ``\\r\\n``
   terminator, writes ``"nan"`` for a NaN sharpe, repairs a missing trailing newline and writes the
   header into an empty file. Here NaN is ``""``, a missing trailing newline raises, and the header
   is written only when the file is new or empty.

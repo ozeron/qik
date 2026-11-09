@@ -1,4 +1,4 @@
-"""Close submission and post-open-fill close decisions (P024 and P020)."""
+"""Close submission and post-open-fill close decisions."""
 
 from __future__ import annotations
 

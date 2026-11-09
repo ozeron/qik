@@ -14,7 +14,7 @@ from .stops import _side
 def _time_exit(clock, cutoff, at_or_after=False) -> bool:
     """Compare a caller-supplied completed-bar clock (time or integer offset).
 
-    Admitted: P060 OvernightCore (exact) and P063 StreakCore (at-or-after).
+    Admitted: an overnight-session core (exact) and a streak core (at-or-after).
     No timezone conversion, session discovery or terminal-bar inference occurs.
     """
     return clock >= cutoff if at_or_after else clock == cutoff
@@ -24,7 +24,7 @@ def _time_exit(clock, cutoff, at_or_after=False) -> bool:
 def r_target(anchor: float, side: int, risk: float, reward: float) -> float:
     """Raw R target, with positive risk units and caller-owned tick conversion.
 
-    Admitted: P063 native brackets and P073 plan. ATR is also a valid risk unit.
+    Admitted: native brackets and a planned-exit strategy. ATR is also a valid risk unit.
     This is a target specification, never a signal to exit on an observed touch.
     """
     _side(side)

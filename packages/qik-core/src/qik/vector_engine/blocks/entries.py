@@ -11,7 +11,7 @@ from numpy.typing import ArrayLike, NDArray
 def side_of(value: float, reference: float) -> int:
     """Strict side of an MA/indicator; equality and an unready NaN are neutral.
 
-    Admitted: P060 OvernightCore and C001 Seykota EMA bias.
+    Admitted: an overnight-session core and a Seykota EMA bias.
     """
     return 1 if value > reference else -1 if value < reference else 0
 
@@ -26,7 +26,7 @@ def side_of_array(value: ArrayLike, reference: ArrayLike) -> NDArray[np.int8]:
 def range_breakout(close: float, high: float, low: float) -> int:
     """Strict close breakout, long first; pass completed range bounds only.
 
-    Admitted: P059 BreakoutCore features and P063 StreakCore confirmation.
+    Admitted: breakout-core features and streak-core confirmation.
     NaN bounds disable their own side. Infinite bounds can explicitly disable a side.
     """
     return 1 if close > high else -1 if close < low else 0
